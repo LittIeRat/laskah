@@ -1,0 +1,415 @@
+# Laskah 服务器部署手册
+
+Laskah 是单文件 Go 程序：没有运行时依赖，不需要 Python / Node.js / Java，也不需要数据库。
+一个二进制 + 一个 JSON 数据文件 + 一个主密钥文件就是全部。
+
+- 监听：默认 `127.0.0.1:8787`，公网流量经 Nginx / Caddy 反向代理进来
+- 数据：`/var/lib/laskah/db.json`（上游 API Key、访问令牌、网关密钥均 AES-256-GCM 加密）
+- 主密钥：`MASTER_KEY` 环境变量（推荐）或 `/var/lib/laskah/db.master.key`
+- 健康检查：`GET /health`
+
+> **只想快点跑起来**：服务器上一条命令即可，不必读本文。
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/OWNER/laskah/main/scripts/deploy-from-github.sh | sudo bash
+> ```
+>
+> 细节见 [QUICKSTART-LINUX.md](QUICKSTART-LINUX.md)。
+> 本文是逐步手册，解释每一步在做什么、为什么这么设，适合要自定义或排障时读。
+
+---
+
+## 1. 编译
+
+### 在服务器上直接编译（推荐）
+
+```bash
+git clone --depth 1 https://github.com/OWNER/laskah.git
+cd laskah
+bash scripts/build.sh                                     # 当前架构
+TARGETS="linux/amd64 linux/arm64" bash scripts/build.sh    # 交叉编译
+```
+
+### 在 Windows 开发机上交叉编译
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1
+```
+
+产物在 `bin\`：
+
+| 文件 | 用途 |
+| --- | --- |
+| `laskah.exe` | 本机预览 |
+| `laskah-linux-amd64` | 绝大多数云主机（Intel / AMD） |
+| `laskah-linux-arm64` | ARM 机型（AWS Graviton、阿里云 ARM、树莓派） |
+
+脚本会打印每个产物的 SHA256，上传后请在服务器上比对。
+
+手动编译等价命令：
+
+```powershell
+$env:CGO_ENABLED='0'; $env:GOOS='linux'; $env:GOARCH='amd64'
+go build -trimpath -ldflags '-s -w' -o bin/laskah-linux-amd64 ./cmd/laskah
+```
+
+`-trimpath` 去掉源码绝对路径，`-s -w` 去掉符号表与调试信息：
+既减小体积，也让二进制更难被反编译还原结构。
+前端资源（HTML / CSS / JS / logo）通过 `go:embed` 编进二进制，服务器上不需要静态目录。
+
+---
+
+## 2. 上传
+
+在服务器上直接 `git clone` 编译的话跳过本节。
+从开发机推二进制上去时：
+
+```powershell
+scp bin\laskah-linux-amd64 root@YOUR_SERVER:/tmp/laskah
+scp deploy\laskah.service  root@YOUR_SERVER:/tmp/
+scp deploy\laskah.env.example root@YOUR_SERVER:/tmp/
+```
+
+服务器上校验：
+
+```bash
+sha256sum /tmp/laskah   # 与 build 脚本打印的哈希一致才继续
+```
+
+---
+
+## 3. 系统准备
+
+```bash
+# 专用系统账户，不给登录 shell
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin laskah
+
+# 程序目录（只读）与数据目录（可写）
+sudo install -d -o root  -g root  -m 0755 /opt/laskah
+sudo install -d -o laskah -g laskah -m 0700 /var/lib/laskah
+sudo install -d -o root  -g root  -m 0750 /etc/laskah
+
+# 安装二进制
+sudo install -o root -g root -m 0755 /tmp/laskah /opt/laskah/laskah
+```
+
+数据目录必须是 `0700` 且属主为 `laskah`：`db.json` 里是加密后的凭据，
+`db.master.key` 是解密它们的钥匙，两者都不能让其他本地用户读到。
+
+---
+
+## 4. 环境配置
+
+```bash
+sudo cp /tmp/laskah.env.example /etc/laskah/laskah.env
+sudo chown root:root /etc/laskah/laskah.env
+sudo chmod 600 /etc/laskah/laskah.env
+
+# 生成主密钥与管理令牌，填进配置文件
+openssl rand -base64 48   # -> MASTER_KEY
+openssl rand -hex 24      # -> ADMIN_TOKEN
+
+sudo nano /etc/laskah/laskah.env
+```
+
+必改项：
+
+| 变量 | 说明 |
+| --- | --- |
+| `MASTER_KEY` | 数据加密主密钥。设置后主密钥不落盘，**丢失等于所有已存凭据不可解密** |
+| `ADMIN_TOKEN` | 管理 API 的 Bearer 令牌，等价超级管理员权限，仅脚本调用需要 |
+| `ALLOW_ORIGIN` | 收紧到自己的域名，别留 `*` |
+| `TRUST_PROXY` | 反向代理后必须为 `true`，否则登录限速会把所有访客算作同一个 IP |
+
+其余可调项（`HOST` / `PORT` / `DATA_FILE` / `STRATEGY` / `MAX_RETRIES` /
+`COOLDOWN_MS` / `FAILURE_THRESHOLD` / `BALANCE_INTERVAL_MS`）见
+`deploy/laskah.env.example` 内注释。
+
+**超级管理员账号不在配置文件里。** 服务首次启动处于「待初始化」状态，
+只有 `/setup` 可用，账号密码由你在浏览器里亲手创建（见第 7 节）。
+仅在无人值守批量部署时才使用 `ADMIN_USER` / `ADMIN_PASSWORD` 跳过引导，
+用完请立刻从 env 文件里删除并重启。
+
+---
+
+## 5. systemd 托管
+
+```bash
+sudo cp /tmp/laskah.service /etc/systemd/system/laskah.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now laskah
+sudo systemctl status laskah --no-pager
+```
+
+单元文件已经收紧权限：`NoNewPrivileges`、`ProtectSystem=strict`、
+`CapabilityBoundingSet=`（清空）、`MemoryDenyWriteExecute`，只有
+`ReadWritePaths=/var/lib/laskah` 可写。如果改了 `DATA_FILE` 位置，
+必须同步改 `ReadWritePaths`，否则启动会因为无法写盘而失败。
+
+验证：
+
+```bash
+curl -s http://127.0.0.1:8787/health
+# {"ok":true,"groups":0,"accounts":0,"providers":0,"keys":0}
+```
+
+日志：
+
+```bash
+sudo journalctl -u laskah -f
+```
+
+---
+
+## 6. 反向代理与 TLS
+
+两份现成配置任选其一：
+
+- `deploy/nginx-laskah.conf` → `/etc/nginx/sites-available/laskah`
+- `deploy/Caddyfile` → `/etc/caddy/Caddyfile`（自动签发续期证书，省一步 certbot）
+
+### Nginx
+
+```bash
+sudo cp deploy/nginx-laskah.conf /etc/nginx/sites-available/laskah
+sudo ln -sf /etc/nginx/sites-available/laskah /etc/nginx/sites-enabled/laskah
+sudo sed -i 's/laskah.example.com/your-domain.com/g' /etc/nginx/sites-available/laskah
+sudo certbot --nginx -d your-domain.com
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+### Caddy
+
+```bash
+sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+sudo sed -i 's/laskah.example.com/your-domain.com/g' /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+```
+
+两份配置都做了三件关键事：
+
+1. **管理面限网段**：`/admin/*` 只允许可信 IP 段。把 `203.0.113.0/24`
+   换成你的办公网或 VPN 网段；不想限制就删掉 `allow/deny` 段，但登录页会直接暴露在公网。
+2. **网关端点关缓冲**：`stream:true` 走 SSE，开缓冲会把 token 攒住直到响应结束。
+3. **读超时放宽到 600s**：长上下文推理比默认 60s 慢得多。
+
+---
+
+## 7. 首次访问：创建超级管理员
+
+浏览器打开 `https://your-domain.com/`，会自动跳到 `/setup`。
+
+1. 填写超级管理员账户名（3–48 字符，区分大小写）与密码（至少 8 位）
+2. 提交后**立刻把账号与密码存进密码管理器**
+
+为什么必须现在存：
+
+- 账户名以 AES-256-GCM 密文 + SHA-256 摘要落盘，服务端**无法反查出明文**
+- 密码只存 PBKDF2-SHA256（240000 轮）散列，同样不可逆
+- 终端横幅与日志刻意不打印任何账户名或口令
+- 忘记凭据只能重置：停服 → 删除 `db.json` 里的 `config.users` → 重启后重新 `/setup`
+
+初始化完成后 `/setup` 自动失效（重复提交返回 409），只能从 `/login` 进入。
+
+### 角色分级
+
+| 角色 | 可访问 |
+| --- | --- |
+| 超级管理员 | 全部页面：`/dashboard`、`/manage`，以及全部 `/admin/*` 接口 |
+| 管理员 | 只有 `/dashboard`。手输 `/manage` 会被服务端 302 回看板，直接调管理接口返回 403 |
+
+在 `/manage` 的「管理员账户」区块添加、停用、改密或删除管理员。
+权限判定完全在服务端会话里，前端不参与，改地址栏或伪造请求都不生效。
+
+---
+
+## 8. 配置上游账号
+
+在 `/manage` 按顺序操作：
+
+1. **创建用户分组**：输入名称即可。分组可随时启用 / 禁用，禁用后该组账号立即退出分配池，数据保留。
+2. **创建账号**：点「创建账号」后在居中弹窗里填
+   - 用户名称（仅用于界面识别）
+   - API Key 批量粘贴框：每行一个，**单账号上限 5 个**
+   - Base URL：如 `https://api.newapi.com/v1`，请求时自动拼 `/chat/completions`
+   - 「获取模型列表」→ 勾选要开放的模型（留空表示接受全部）
+   - 额度查询（可选）：请求地址、访问令牌、用户 ID、超时秒数、自动查询间隔（分钟，0 = 不自动查）
+3. **确定保存配置**。保存后该账号**只能查余额或删除**，配置不可修改也不会回显。
+
+未配置额度查询的账号按「∞ 无限余额」处理，既不会被余额清理逻辑删掉，
+也不会去打上游额度接口。
+
+### 自动删号的三条触发路径
+
+1. 后台按各账号自身的「自动查询间隔」到期扫描，余额低于阈值即删
+2. 请求到达时若余额数据超过 `requestRefreshSec` 秒未更新，先查一次再分配
+3. 上游明确报「这一次请求都付不起」时立刻删号并换账号重试，调用方无感知
+
+第 3 条同时覆盖显式文案（余额不足 / insufficient_quota / credit balance is too low ...）
+和只报金额的预扣费失败，例如：
+
+```
+预扣费额度失败, 用户剩余额度: ＄0.182898, 需要预扣费额度: ＄0.290486
+```
+
+判定会折叠全角字符后比较「剩余 < 需要」。限流（rate limit）与 5xx 一律不算余额耗尽，
+避免上游抖动误删正常账号。
+
+---
+
+## 9. 下游调用
+
+在 `/dashboard` 创建网关密钥（支持批量），然后：
+
+```bash
+curl https://your-domain.com/v1/chat/completions \
+  -H "Authorization: Bearer <网关密钥>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"你好"}]}'
+```
+
+| 端点 | 说明 |
+| --- | --- |
+| `POST /v1/chat/completions` | 主入口，支持 `stream:true` |
+| `POST /v1/completions` | 旧版补全，内部转成 messages |
+| `POST /v1/embeddings` | 向量化 |
+| `GET /v1/models` | 严格 OpenAI 规范：`{"object":"list","data":[{"id","object","created","owned_by"}]}` |
+| `GET /v1/models/{id}` | 单模型查询 |
+
+Base URL 填 `https://your-domain.com/v1`。不带 `/v1` 前缀的同名路径也受支持，
+方便某些只认 `/chat/completions` 的客户端。
+
+`/v1/models` 只列出该密钥真正能调到的模型：账号可用、上游启用、密钥白名单允许，
+通配符（`gpt-4*`）只用于请求期匹配，不会作为可枚举 id 暴露。`owned_by` 统一为
+`laskah`，不泄露真实上游站点。
+
+---
+
+## 10. 备份与恢复
+
+要备份的只有两个文件：
+
+```bash
+sudo systemctl stop laskah
+sudo tar czf laskah-backup-$(date +%F).tar.gz -C /var/lib laskah
+sudo systemctl start laskah
+```
+
+- `db.json` — 分组、账号、上游 API（密文）、网关密钥（密文）、用量统计
+- `db.master.key` — 仅在未设置 `MASTER_KEY` 时存在
+
+用了 `MASTER_KEY` 环境变量的部署，请把该密钥单独存进密码管理器：
+**只有 `db.json` 没有主密钥，所有凭据都解不开。**
+
+恢复：停服 → 覆盖 `/var/lib/laskah/` → 确认属主 `laskah:laskah` 与权限 `0700` → 启动。
+
+热备份（不停服）也可行——写盘是原子替换——但快照可能落在两次统计刷盘之间，
+丢失最多 30 秒的用量计数。
+
+---
+
+## 11. 升级与回滚
+
+用一键脚本部署的（源码在 `/opt/laskah/src`），升级就是重跑同一条命令：
+
+```bash
+sudo cp /opt/laskah/laskah /opt/laskah/laskah.prev   # 先留一份好回滚
+curl -fsSL https://raw.githubusercontent.com/OWNER/laskah/main/scripts/deploy-from-github.sh | sudo bash
+```
+
+它会拉最新代码、重新编译、重启并做健康检查，`laskah.env` 与 `db.json` 都不动。
+
+手工换二进制：
+
+```bash
+# 升级
+sudo cp /opt/laskah/laskah /opt/laskah/laskah.prev
+sudo install -o root -g root -m 0755 /tmp/laskah-new /opt/laskah/laskah
+sudo systemctl restart laskah
+curl -s http://127.0.0.1:8787/health
+
+# 回滚
+sudo cp /opt/laskah/laskah.prev /opt/laskah/laskah
+sudo systemctl restart laskah
+```
+
+数据文件带 `version` 字段，启动时自动迁移到当前版本。**跨版本升级前先备份**：
+迁移是单向的，旧版本读不了新版数据。
+
+重启会清空全部登录会话（会话只在内存里），管理员需要重新登录；
+网关密钥不受影响，下游调用不中断。
+
+---
+
+## 12. 安全清单
+
+上线前逐条确认：
+
+- [ ] `MASTER_KEY` 已设置且已单独备份，`ADMIN_TOKEN` 已改成随机值
+- [ ] `/etc/laskah/laskah.env` 权限 `600`、属主 `root:root`
+- [ ] `/var/lib/laskah` 权限 `0700`、属主 `laskah:laskah`
+- [ ] 反向代理已启用 HTTPS，`/admin/*` 已限可信网段
+- [ ] `TRUST_PROXY=true`，且代理确实注入 `X-Forwarded-For`
+- [ ] `ALLOW_ORIGIN` 收紧到自己的域名
+- [ ] 超级管理员凭据已存入密码管理器
+- [ ] env 文件里没有残留 `ADMIN_USER` / `ADMIN_PASSWORD`
+- [ ] 防火墙只放 80/443，`8787` 不对外
+- [ ] 已配置 `db.json` 定期备份
+
+服务端已内置的防护，不需要额外配置：
+
+| 面向 | 措施 |
+| --- | --- |
+| 凭据存储 | 上游 API Key / 访问令牌 / 网关密钥全部 AES-256-GCM 加密落盘；口令 PBKDF2-SHA256 240000 轮 |
+| 账户名 | 超级管理员账户名密文 + 摘要存储，不可反查 |
+| 登录爆破 | 按来源 IP 限速：10 分钟内 5 次失败锁 15 分钟；不区分「账号不存在」与「口令错误」，防账户枚举 |
+| 会话 | 令牌只存摘要，HttpOnly + Secure + SameSite=Strict，8 小时绝对过期 / 90 分钟空闲过期 |
+| CSRF | Cookie 会话的写请求必须携带匹配的 `X-CSRF-Token` |
+| 越权 | 角色判定只读服务端会话；管理接口在中间件层 403，页面路由层 302 |
+| 前端注入 | CSP 无 `unsafe-inline`，DOM 全部走 `textContent` 构建，无 HTML 字符串拼接 |
+| 信息泄露 | `/health` 只报聚合数量；列表接口只回掩码；`owned_by` 不暴露上游；`Referrer-Policy: no-referrer` |
+| 逆向 | `-trimpath -s -w` 去符号与路径；前端资源随二进制内嵌 |
+| 资源 | 请求体上限 16MB；额度查询连接池限单主机并发；systemd `MemoryMax=512M` / `TasksMax=512` |
+
+---
+
+## 13. 排障
+
+| 现象 | 排查方向 |
+| --- | --- |
+| 启动即退出 | `journalctl -u laskah -n 50`。常见是 `DATA_FILE` 不在 `ReadWritePaths` 里 |
+| 访问总是跳 `/setup` | 还没创建超级管理员，或数据文件被换成了空库 |
+| 登录报 429 | 触发限速，等 15 分钟或重启服务清空计数 |
+| 流式响应一次性吐出 | 代理没关缓冲。Nginx 查 `proxy_buffering off`，Caddy 查 `flush_interval -1` |
+| 上游一直 502 | `/manage` 看账号是否被自动删号；检查 Base URL 是否多写了 `/chat/completions` |
+| 余额显示「∞ 无限」 | 该账号没配额度查询，属预期行为 |
+| 账号莫名消失 | 查 `/manage` 底部「自动删号记录」，里面有原因与上游原文 |
+| 登录限速把所有人一起锁 | `TRUST_PROXY` 没开，全部请求被当成同一个来源 IP |
+
+---
+
+## 14. 本地预览
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\start-local.ps1
+# http://127.0.0.1:8787  → 首次进 /setup
+
+# 接口级冒烟（会重置本地数据并留下一套演示数据）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-local.ps1
+
+powershell -NoProfile -File scripts\stop-local.ps1
+```
+
+`scripts\smoke-local.ps1` 覆盖 37 项断言：初始化、登录限速、角色隔离、CSRF、
+分组启停、5 个 API 上限、无限余额、批量密钥、看板汇总、`/v1/models` 规范、
+安全响应头、旧地址 `/keys → /dashboard` 重定向。
+
+需要页面截图时：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\start-chrome.ps1
+go run .\tools\devshot -user "<超管账户>" -password "<口令>" -pages "/dashboard,/manage" -theme dark -out _preview
+```
+
+`tools/devshot` 只是开发期工具（自带极简 CDP over WebSocket 客户端），不参与服务端运行。

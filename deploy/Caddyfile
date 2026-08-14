@@ -1,0 +1,35 @@
+# /etc/caddy/Caddyfile
+#
+# Caddy 自动申请并续期证书，比 Nginx 少一步 certbot。
+
+laskah.example.com {
+    encode zstd gzip
+
+    # 管理面限可信网段。
+    @admin path /admin/*
+    handle @admin {
+        @untrusted not remote_ip 203.0.113.0/24 127.0.0.1
+        respond @untrusted 403
+        reverse_proxy 127.0.0.1:8787
+    }
+
+    # 网关端点：关掉缓冲保证 SSE 实时性。
+    @gateway path /v1/* /chat/* /completions /embeddings /models /models/*
+    handle @gateway {
+        reverse_proxy 127.0.0.1:8787 {
+            flush_interval -1
+            transport http {
+                read_timeout 600s
+                write_timeout 600s
+            }
+        }
+    }
+
+    handle {
+        reverse_proxy 127.0.0.1:8787
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    }
+}

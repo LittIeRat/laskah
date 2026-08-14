@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="auto">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="robots" content="noindex, nofollow" />
+<title>数据看板 · Laskah</title>
+<link rel="icon" href="/logo.png" type="image/png" />
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<nav class="nav">
+  <div id="nav-host"></div>
+  <div class="nav-links" id="nav-links"></div>
+</nav>
+
+<div class="wrap">
+  <div class="page-hero">
+    <h2 class="page-title">数据看板</h2>
+    <p class="page-sub">汇总各分组余额与消耗。未配置额度查询的账号按无限余额处理；余额耗尽或上游报余额不足的账号会被自动删除。</p>
+  </div>
+
+  <div class="section-head">
+    <h2>全站汇总</h2>
+    <span class="hint" id="totals-hint"></span>
+  </div>
+  <div class="card">
+    <div class="stat-grid" id="totals-grid"></div>
+  </div>
+
+  <div class="section-head">
+    <h2>分组余额</h2>
+    <span class="hint">余额总量 · 消耗金额 · 消耗 tokens</span>
+  </div>
+  <div class="card">
+    <div class="btn-row" style="margin-top:0">
+      <button class="btn btn-primary" id="refresh-balances" type="button">手动刷新全部余额</button>
+      <button class="btn btn-quiet" id="reload-dashboard" type="button">重新加载数据</button>
+      <span class="hint-text" id="refresh-hint"></span>
+    </div>
+    <div class="list" id="group-list"></div>
+  </div>
+
+  <div id="keys-area" hidden>
+    <div class="section-head">
+      <h2>创建网关 API Key</h2>
+      <span class="hint">下游用它调用本站，自动分配账号并在账号内负载均衡</span>
+    </div>
+    <div class="card">
+      <div class="form-grid">
+        <div class="field">
+          <label for="key-name">名称</label>
+          <input id="key-name" type="text" placeholder="例如：客户端-A" maxlength="64" />
+        </div>
+        <div class="field">
+          <label for="key-prefix">密钥前缀</label>
+          <input id="key-prefix" type="text" placeholder="sk-laskah" maxlength="24" spellcheck="false" />
+        </div>
+        <div class="field">
+          <label for="key-group">限定分组</label>
+          <select id="key-group"></select>
+          <span class="hint-text">留空表示可使用全部分组的账号</span>
+        </div>
+        <div class="field">
+          <label for="key-count">批量数量</label>
+          <input id="key-count" type="number" min="1" max="500" value="10" />
+          <span class="hint-text">仅“批量创建”按钮使用，1-500</span>
+        </div>
+        <div class="field">
+          <label for="key-quota">额度上限（tokens）</label>
+          <input id="key-quota" type="number" min="0" placeholder="留空不限" />
+        </div>
+        <div class="field">
+          <label for="key-rate">限流（次/分钟）</label>
+          <input id="key-rate" type="number" min="1" placeholder="留空不限" />
+        </div>
+        <div class="field">
+          <label for="key-expires">过期时间</label>
+          <input id="key-expires" type="datetime-local" />
+          <span class="hint-text">留空表示长期有效</span>
+        </div>
+        <div class="field">
+          <label for="key-models">模型白名单</label>
+          <input id="key-models" type="text" placeholder="留空不限，可填 gpt-4o, gpt-4o-mini" spellcheck="false" />
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="key-create" type="button">创建 1 个</button>
+        <button class="btn" id="key-bulk" type="button">批量创建</button>
+        <button class="btn btn-quiet" id="key-reset" type="button">重置表单</button>
+      </div>
+      <div class="reveal-box" id="key-reveal" hidden></div>
+    </div>
+
+    <div class="section-head">
+      <h2>密钥列表</h2>
+      <span class="hint" id="key-hint"></span>
+    </div>
+    <div class="card">
+      <div class="btn-row" style="margin-top:0">
+        <button class="btn btn-quiet" id="key-select-all" type="button">全选</button>
+        <button class="btn btn-quiet" id="key-select-none" type="button">取消全选</button>
+        <button class="btn" id="key-export" type="button">导出 CSV</button>
+        <button class="btn btn-danger" id="key-batch-delete" type="button">删除所选</button>
+      </div>
+      <div class="list" id="key-list"></div>
+    </div>
+  </div>
+
+  <div class="section-head">
+    <h2>调用说明</h2>
+    <span class="hint">OpenAI chat completions 兼容</span>
+  </div>
+  <div class="card">
+    <div class="form-grid">
+      <div class="field full">
+        <label>本站 Base URL</label>
+        <div class="code-block" id="usage-base"></div>
+      </div>
+      <div class="field full">
+        <label>模型列表（OpenAI 规范）</label>
+        <div class="code-block" id="usage-models"></div>
+      </div>
+      <div class="field full">
+        <label>请求示例</label>
+        <div class="code-block" id="usage-curl"></div>
+      </div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-quiet" id="copy-base" type="button">复制 Base URL</button>
+      <button class="btn btn-quiet" id="change-password" type="button">修改我的密码</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+<script src="/dashboard.js"></script>
+</body>
+</html>

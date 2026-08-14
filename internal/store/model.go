@@ -1,0 +1,372 @@
+package store
+
+import (
+	"fmt"
+	"net/url"
+	"regexp"
+	"strings"
+	"time"
+)
+
+// ProviderType 表示上游 API 的协议规格。
+type ProviderType string
+
+// 支持的上游协议类型。
+const (
+	TypeOpenAI    ProviderType = "openai"
+	TypeAnthropic ProviderType = "anthropic"
+	TypeGemini    ProviderType = "gemini"
+)
+
+// ProviderTypes 列出全部合法协议类型。
+var ProviderTypes = []ProviderType{TypeOpenAI, TypeAnthropic, TypeGemini}
+
+// Paths 描述上游各端点的相对路径。
+type Paths struct {
+	Chat   string `json:"chat"`
+	Models string `json:"models"`
+}
+
+// ProviderStats 记录上游 API 的累计调用指标。
+type ProviderStats struct {
+	Requests         int64      `json:"requests"`
+	Success          int64      `json:"success"`
+	Failure          int64      `json:"failure"`
+	PromptTokens     int64      `json:"promptTokens"`
+	CompletionTokens int64      `json:"completionTokens"`
+	TotalTokens      int64      `json:"totalTokens"`
+	AvgLatencyMS     int64      `json:"avgLatencyMs"`
+	LastError        *LastError `json:"lastError"`
+	LastUsedAt       *time.Time `json:"lastUsedAt"`
+}
+
+// LastError 保存最近一次失败信息。
+type LastError struct {
+	Message string    `json:"message"`
+	At      time.Time `json:"at"`
+}
+
+// Provider 是账号名下的一个上游 API 条目。
+//
+// APIKey 仅存在于内存，落盘时写入 SealedAPIKey（AES-256-GCM 密文）。
+type Provider struct {
+	ID           string            `json:"id"`
+	AccountID    string            `json:"accountId"`
+	Name         string            `json:"name"`
+	Type         ProviderType      `json:"type"`
+	BaseURL      string            `json:"baseUrl"`
+	APIKey       string            `json:"-"`
+	SealedAPIKey string            `json:"apiKey"`
+	Models       []string          `json:"models"`
+	ModelMap     map[string]string `json:"modelMap"`
+	Headers      map[string]string `json:"headers"`
+	Paths        Paths             `json:"paths"`
+	Weight       float64           `json:"weight"`
+	Priority     int               `json:"priority"`
+	TimeoutMS    int64             `json:"timeoutMs"`
+	Enabled      bool              `json:"enabled"`
+	Tags         []string          `json:"tags"`
+	Note         string            `json:"note"`
+	CreatedAt    time.Time         `json:"createdAt"`
+	UpdatedAt    time.Time         `json:"updatedAt"`
+	Stats        ProviderStats     `json:"stats"`
+
+	// 运行时状态与加密缓存不落盘。
+	sealedFrom          string
+	CooldownUntil       time.Time `json:"-"`
+	Inflight            int64     `json:"-"`
+	ConsecutiveFailures int       `json:"-"`
+}
+
+// KeyStats 记录网关密钥的用量。
+type KeyStats struct {
+	Requests    int64      `json:"requests"`
+	Success     int64      `json:"success"`
+	Failure     int64      `json:"failure"`
+	TotalTokens int64      `json:"totalTokens"`
+	LastUsedAt  *time.Time `json:"lastUsedAt"`
+}
+
+// APIKey 是下游调用本网关使用的密钥。
+//
+// Key 仅存在于内存；落盘时写入 SealedKey 与 KeyHash，鉴权按摘要索引命中，
+// 既避免明文入库，也让查找保持 O(1)。
+type APIKey struct {
+	Name            string     `json:"name"`
+	ID              string     `json:"id"`
+	AccountID       string     `json:"accountId"`
+	GroupID         string     `json:"groupId"`
+	Key             string     `json:"-"`
+	SealedKey       string     `json:"key"`
+	KeyHash         string     `json:"keyHash"`
+	KeyMasked       string     `json:"keyMasked"`
+	Enabled         bool       `json:"enabled"`
+	AllowedModels   []string   `json:"allowedModels"`
+	ProviderIDs     []string   `json:"providerIds"`
+	Tags            []string   `json:"tags"`
+	QuotaTokens     *int64     `json:"quotaTokens"`
+	RateLimitPerMin *int       `json:"rateLimitPerMin"`
+	ExpiresAt       *time.Time `json:"expiresAt"`
+	Note            string     `json:"note"`
+	CreatedAt       time.Time  `json:"createdAt"`
+	UpdatedAt       time.Time  `json:"updatedAt"`
+	Stats           KeyStats   `json:"stats"`
+
+	sealedFrom string
+}
+
+// KeyState 表示密钥当前可用状态。
+type KeyState string
+
+// 密钥状态取值。
+const (
+	KeyActive        KeyState = "active"
+	KeyDisabled      KeyState = "disabled"
+	KeyExpired       KeyState = "expired"
+	KeyQuotaExceeded KeyState = "quota_exceeded"
+)
+
+// Config 保存全局设置与管理员凭据。
+//
+// Users 是管理面账户列表（口令为 PBKDF2-SHA256 散列、账户名为密文+摘要）；
+// EncryptionSalt 用于派生数据加密密钥。Setup 为 false 时服务处于待初始化状态，
+// 只有创建超级管理员的接口可用。
+type Config struct {
+	AdminToken     string       `json:"adminToken"`
+	Users          []*AdminUser `json:"users"`
+	Setup          bool         `json:"setup"`
+	EncryptionSalt string       `json:"encryptionSalt"`
+	Strategy       string       `json:"strategy"`
+	MaxRetries     int          `json:"maxRetries"`
+	CreatedAt      time.Time    `json:"createdAt"`
+}
+
+// Group 是一个用户分组，账号按分组归类。
+//
+// Enabled 为 false 时分组内全部账号都不再承接流量，但配置与统计保留，
+// 便于临时下线一个账号池而不必删号。
+type Group struct {
+	Name      string    `json:"name"`
+	ID        string    `json:"id"`
+	Note      string    `json:"note"`
+	Enabled   bool      `json:"enabled"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// Data 是持久化到磁盘的完整数据。
+type Data struct {
+	Version         int              `json:"version"`
+	Config          Config           `json:"config"`
+	Groups          []*Group         `json:"groups"`
+	Accounts        []*Account       `json:"accounts"`
+	Providers       []*Provider      `json:"providers"`
+	Keys            []*APIKey        `json:"keys"`
+	RemovedAccounts []RemovedAccount `json:"removedAccounts"`
+
+	// 索引不落盘，用于把鉴权与归属查询降到 O(1)。
+	adminByHash    map[string]*AdminUser
+	keyByHash      map[string]*APIKey
+	accountByID    map[string]*Account
+	groupByID      map[string]*Group
+	providerByID   map[string]*Provider
+	accountProvs   map[string][]*Provider
+	accountKeyLoad map[string]int
+}
+
+// ProviderInput 是创建上游 API 时的原始输入。
+type ProviderInput struct {
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	Type      string            `json:"type"`
+	BaseURL   string            `json:"baseUrl"`
+	APIKey    string            `json:"apiKey"`
+	Models    any               `json:"models"`
+	ModelMap  map[string]string `json:"modelMap"`
+	Headers   map[string]string `json:"headers"`
+	Paths     *Paths            `json:"paths"`
+	Weight    any               `json:"weight"`
+	Priority  any               `json:"priority"`
+	TimeoutMS any               `json:"timeoutMs"`
+	Enabled   *bool             `json:"enabled"`
+	Tags      any               `json:"tags"`
+	Note      string            `json:"note"`
+	AccountID string            `json:"accountId"`
+
+	// 批量导入时兼容的蛇形字段。
+	BaseURLSnake string `json:"base_url"`
+	URLField     string `json:"url"`
+	Endpoint     string `json:"endpoint"`
+	APIKeySnake  string `json:"api_key"`
+	KeyField     string `json:"key"`
+	TokenField   string `json:"token"`
+	ModelField   any    `json:"model"`
+}
+
+// KeyInput 是创建或更新网关密钥时的原始输入。
+type KeyInput struct {
+	ID              string `json:"id"`
+	AccountID       string `json:"accountId"`
+	GroupID         string `json:"groupId"`
+	Name            string `json:"name"`
+	Prefix          string `json:"prefix"`
+	Enabled         *bool  `json:"enabled"`
+	AllowedModels   any    `json:"allowedModels"`
+	ProviderIDs     any    `json:"providerIds"`
+	Tags            any    `json:"tags"`
+	QuotaTokens     any    `json:"quotaTokens"`
+	RateLimitPerMin any    `json:"rateLimitPerMin"`
+	ExpiresAt       string `json:"expiresAt"`
+	Note            string `json:"note"`
+}
+
+// GroupInput 是创建分组时的输入。
+type GroupInput struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Note    string `json:"note"`
+	Enabled *bool  `json:"enabled"`
+}
+
+// DefaultPaths 返回指定协议的默认端点路径。
+func DefaultPaths(t ProviderType) Paths {
+	switch t {
+	case TypeAnthropic:
+		return Paths{Chat: "/messages", Models: "/models"}
+	default:
+		return Paths{Chat: "/chat/completions", Models: "/models"}
+	}
+}
+
+// NormalizeBaseURL 补全协议头并去掉尾部斜杠。
+func NormalizeBaseURL(raw string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if trimmed == "" {
+		return ""
+	}
+	lower := strings.ToLower(trimmed)
+	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+		trimmed = "https://" + trimmed
+	}
+	return strings.TrimRight(trimmed, "/")
+}
+
+// ValidProviderType 判断协议类型是否受支持。
+func ValidProviderType(t string) bool {
+	for _, item := range ProviderTypes {
+		if string(item) == t {
+			return true
+		}
+	}
+	return false
+}
+
+// HostLabel 从 baseUrl 提取主机名，作为默认名称。
+func HostLabel(baseURL string) string {
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Host == "" {
+		return "provider"
+	}
+	return parsed.Host
+}
+
+// SupportsModel 判断上游是否可以处理该模型，支持通配符与别名。
+func (p *Provider) SupportsModel(model string) bool {
+	if model == "" {
+		return true
+	}
+	if _, ok := p.ModelMap[model]; ok {
+		return true
+	}
+	if len(p.Models) == 0 {
+		return true
+	}
+	for _, pattern := range p.Models {
+		if pattern == model || pattern == "*" {
+			return true
+		}
+		if WildcardMatch(pattern, model) {
+			return true
+		}
+	}
+	return false
+}
+
+// UpstreamModel 返回实际发送给上游的模型名。
+func (p *Provider) UpstreamModel(model string) string {
+	if mapped, ok := p.ModelMap[model]; ok && mapped != "" {
+		return mapped
+	}
+	return model
+}
+
+// WildcardMatch 支持 gpt-4* 这类通配符匹配。
+func WildcardMatch(pattern, value string) bool {
+	if !strings.Contains(pattern, "*") {
+		return false
+	}
+	segments := strings.Split(pattern, "*")
+	for i, segment := range segments {
+		segments[i] = regexp.QuoteMeta(segment)
+	}
+	expr := "^" + strings.Join(segments, ".*") + "$"
+	matched, err := regexp.MatchString(expr, value)
+	return err == nil && matched
+}
+
+// AllowsModel 判断密钥是否允许调用该模型。
+func (k *APIKey) AllowsModel(model string) bool {
+	if model == "" || len(k.AllowedModels) == 0 {
+		return true
+	}
+	for _, allowed := range k.AllowedModels {
+		if allowed == model || allowed == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+// State 计算密钥在指定时刻的可用状态。
+func (k *APIKey) State(now time.Time) KeyState {
+	if !k.Enabled {
+		return KeyDisabled
+	}
+	if k.ExpiresAt != nil && k.ExpiresAt.Before(now) {
+		return KeyExpired
+	}
+	if k.QuotaTokens != nil && k.Stats.TotalTokens >= *k.QuotaTokens {
+		return KeyQuotaExceeded
+	}
+	return KeyActive
+}
+
+// MaskKey 遮蔽密钥中部，只保留头尾用于展示。
+func MaskKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	if len(key) <= 10 {
+		return key[:min(2, len(key))] + "******"
+	}
+	return key[:6] + "******" + key[len(key)-4:]
+}
+
+// ValidationError 聚合校验阶段的全部错误信息。
+type ValidationError struct {
+	Errors []string
+}
+
+func (e *ValidationError) Error() string {
+	return strings.Join(e.Errors, "; ")
+}
+
+// Errorf 追加一条格式化的校验错误。
+func (e *ValidationError) Errorf(format string, args ...any) {
+	e.Errors = append(e.Errors, fmt.Sprintf(format, args...))
+}
+
+// HasErrors 判断是否存在校验错误。
+func (e *ValidationError) HasErrors() bool {
+	return len(e.Errors) > 0
+}

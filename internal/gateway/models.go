@@ -1,0 +1,187 @@
+package gateway
+
+import (
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"laskah/internal/httpx"
+	"laskah/internal/store"
+)
+
+// modelOwner 是 /v1/models 中 owned_by 的取值。
+//
+// 网关对下游屏蔽真实上游身份，因此统一署名为本站，
+// 避免通过模型列表反推出账号数量或供应商站点。
+const modelOwner = "laskah"
+
+// ModelEntry 是严格遵循 OpenAI 规范的模型对象。
+//
+// 字段顺序与命名都对齐 OpenAI /v1/models：
+//
+//	{"id":"gpt-4o","object":"model","created":1700000000,"owned_by":"..."}
+//
+// 用具名结构体而不是 map，保证 JSON 键固定、无多余字段、类型稳定。
+type ModelEntry struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
+}
+
+// ModelList 是 /v1/models 的响应体。
+type ModelList struct {
+	Object string       `json:"object"`
+	Data   []ModelEntry `json:"data"`
+}
+
+// HandleModels 处理 /v1/models 与 /v1/models/{id}。
+//
+// 列表严格按 OpenAI 规范输出：object=list，data 按 id 升序排列，
+// 每项只含 id / object / created / owned_by 四个规范字段。
+func (g *Gateway) HandleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		httpx.Error(w, http.StatusMethodNotAllowed, "仅支持 GET", nil)
+		return
+	}
+
+	session, authErr := g.Authenticate(r.Context(), httpx.BearerToken(r))
+	if authErr != nil {
+		httpx.Error(w, authErr.Status, authErr.Message, nil)
+		return
+	}
+
+	requested := requestedModelID(r.URL.Path)
+	entries := g.availableModels(session)
+
+	if requested == "" {
+		httpx.JSON(w, http.StatusOK, ModelList{Object: "list", Data: entries})
+		return
+	}
+	for _, entry := range entries {
+		if entry.ID == requested {
+			httpx.JSON(w, http.StatusOK, entry)
+			return
+		}
+	}
+	httpx.Error(w, http.StatusNotFound, "模型不存在或当前密钥无权访问: "+requested, nil)
+}
+
+// requestedModelID 从 /v1/models/{id} 提取模型名，列表请求返回空串。
+//
+// 模型名允许包含斜杠（如 `meta/llama-3`），因此保留剩余全部路径段。
+func requestedModelID(path string) string {
+	trimmed := strings.TrimSuffix(path, "/")
+	for _, prefix := range []string{"/v1/models", "/models"} {
+		if !strings.HasPrefix(trimmed, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(trimmed, prefix)
+		return strings.Trim(rest, "/")
+	}
+	return ""
+}
+
+// availableModels 汇总当前密钥真正能调用到的模型。
+//
+// 只统计“会被选中的上游”：启用中的 API、密钥允许的模型、
+// 以及密钥当前绑定或其分组内可用的账号，确保列表与实际可用范围一致。
+func (g *Gateway) availableModels(session Session) []ModelEntry {
+	type modelMeta struct {
+		created int64
+	}
+	found := map[string]modelMeta{}
+
+	g.Store.View(func(data *store.Data) {
+		key := data.FindKeyByID(session.KeyID)
+		allowedProviders := map[string]bool{}
+		for _, id := range session.ProviderIDs {
+			allowedProviders[id] = true
+		}
+
+		for _, provider := range g.reachableProviders(data, session) {
+			if !provider.Enabled {
+				continue
+			}
+			if len(allowedProviders) > 0 && !allowedProviders[provider.ID] {
+				continue
+			}
+			created := provider.CreatedAt.Unix()
+			if created <= 0 {
+				created = time.Now().Unix()
+			}
+			for _, name := range providerModelNames(provider) {
+				if key != nil && !key.AllowsModel(name) {
+					continue
+				}
+				if existing, seen := found[name]; !seen || created < existing.created {
+					found[name] = modelMeta{created: created}
+				}
+			}
+		}
+	})
+
+	ids := make([]string, 0, len(found))
+	for name := range found {
+		ids = append(ids, name)
+	}
+	sort.Strings(ids)
+
+	entries := make([]ModelEntry, 0, len(ids))
+	for _, id := range ids {
+		entries = append(entries, ModelEntry{
+			ID:      id,
+			Object:  "model",
+			Created: found[id].created,
+			OwnedBy: modelOwner,
+		})
+	}
+	return entries
+}
+
+// reachableProviders 返回该会话可能落到的上游集合。
+func (g *Gateway) reachableProviders(data *store.Data, session Session) []*store.Provider {
+	if session.AccountID != "" {
+		return data.AccountProviders(session.AccountID)
+	}
+
+	groupID := ""
+	if key := data.FindKeyByID(session.KeyID); key != nil {
+		groupID = key.GroupID
+	}
+	accounts := data.UsableAccounts(groupID)
+	if len(accounts) == 0 {
+		return nil
+	}
+	result := []*store.Provider{}
+	for _, account := range accounts {
+		result = append(result, data.AccountProviders(account.ID)...)
+	}
+	return result
+}
+
+// providerModelNames 展开上游声明的模型名与别名，剔除通配符条目。
+//
+// 通配符（如 `gpt-4*`）只用于请求期匹配，不能作为可枚举的模型 id 暴露给下游。
+func providerModelNames(provider *store.Provider) []string {
+	names := make([]string, 0, len(provider.Models)+len(provider.ModelMap))
+	seen := map[string]bool{}
+
+	appendName := func(raw string) {
+		name := strings.TrimSpace(raw)
+		if name == "" || name == "*" || strings.Contains(name, "*") || seen[name] {
+			return
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+
+	for _, name := range provider.Models {
+		appendName(name)
+	}
+	for alias := range provider.ModelMap {
+		appendName(alias)
+	}
+	return names
+}

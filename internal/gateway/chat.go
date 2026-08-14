@@ -1,0 +1,788 @@
+package gateway
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"laskah/internal/balancer"
+	"laskah/internal/httpx"
+	"laskah/internal/store"
+)
+
+// retryableStatus 列出值得切换提供商重试的状态码。
+var retryableStatus = map[int]bool{
+	408: true, 409: true, 425: true, 429: true,
+	500: true, 502: true, 503: true, 504: true, 522: true, 524: true,
+}
+
+// BalanceRefresher 在请求路径上按需刷新账号余额。
+//
+// 返回值表示刷新后该账号是否仍可承接流量；用接口而不是直接依赖 accounts 包，
+// 既解开包依赖，也让测试可以注入假实现。
+type BalanceRefresher interface {
+	RefreshForRequest(ctx context.Context, accountID string) bool
+}
+
+// AccountReaper 在上游明确报告余额不足时立即删除账号。
+//
+// 与定时/请求前的额度查询互补：有些站点余额查询接口有缓存或延迟，
+// 真正的“这一次请求都付不起”只有上游报错才知道，此时必须立刻把账号踢出池子。
+type AccountReaper interface {
+	DropAccount(accountID, reason string) bool
+}
+
+// balanceExhaustedMarkers 是上游“余额/额度不足”的判定文案。
+//
+// 只在上游返回业务错误时匹配，且刻意不含 "rate limit"/"too many requests" 这类
+// 限流文案，避免把临时限流误判成余额耗尽而删掉正常账号。
+var balanceExhaustedMarkers = []string{
+	"余额不足",
+	"余额不够",
+	"余额已用尽",
+	"余额已耗尽",
+	"额度不足",
+	"额度不够",
+	"额度已用尽",
+	"额度已耗尽",
+	"额度已用完",
+	"配额不足",
+	// New API 的预扣费失败：请求前按预估价格扣费，扣不动就说明连这一次都付不起。
+	"预扣费失败",
+	"预扣费额度失败",
+	"预扣费额度不足",
+	"预扣额度失败",
+	"预扣费用失败",
+	"欠费",
+	"请充值",
+	"insufficient balance",
+	"insufficient_balance",
+	"insufficient quota",
+	"insufficient_quota",
+	"insufficient_user_quota",
+	"insufficient funds",
+	"not enough balance",
+	"not enough quota",
+	"balance is not enough",
+	"quota is not enough",
+	"exceeded your current quota",
+	"quota exceeded",
+	"billing hard limit",
+	"out of credits",
+	"no credits",
+	"credit balance is too low",
+	"arrearage",
+}
+
+// 额度数字提取：用于识别“剩余 X，需要 Y”这类只报金额、不含“不足”字样的文案，
+// 例如 New API 的「预扣费额度失败, 用户剩余额度: ＄0.182898, 需要预扣费额度: ＄0.290486」。
+//
+// 两条正则都要求关键词与数字之间只隔少量非数字字符，避免跨句误配。
+var (
+	remainingAmountPattern = regexp.MustCompile(`(?:剩余|可用|当前|remaining|current)[^0-9]{0,16}([0-9]+(?:\.[0-9]+)?)`)
+	requiredAmountPattern  = regexp.MustCompile(`(?:需要|所需|需扣|require[sd]?|need(?:s|ed)?)[^0-9]{0,16}([0-9]+(?:\.[0-9]+)?)`)
+)
+
+// normalizeErrorText 统一大小写并把全角字符折叠成半角。
+//
+// 上游常用全角符号（＄、：、，）包裹金额，不折叠会让金额与关键词之间的
+// 字节距离被放大，也让 marker 匹配漏掉半角写法。
+func normalizeErrorText(text string) string {
+	var builder strings.Builder
+	builder.Grow(len(text))
+	for _, ch := range text {
+		switch {
+		case ch >= 0xFF01 && ch <= 0xFF5E:
+			builder.WriteRune(ch - 0xFEE0)
+		case ch == 0x3000:
+			builder.WriteRune(' ')
+		default:
+			builder.WriteRune(ch)
+		}
+	}
+	return strings.ToLower(builder.String())
+}
+
+// hasBalanceShortfall 判断文案里是否出现“剩余额度小于本次所需额度”。
+//
+// 只在同时给出两个金额且剩余确实更少时才成立，因此不会把
+// “剩余额度 10，本次消耗 0.2”这类正常提示误判成余额耗尽。
+func hasBalanceShortfall(normalized string) bool {
+	// 先要求文案确实在谈额度/余额，避免把无关数字凑成一对。
+	if !strings.Contains(normalized, "额度") &&
+		!strings.Contains(normalized, "余额") &&
+		!strings.Contains(normalized, "balance") &&
+		!strings.Contains(normalized, "quota") &&
+		!strings.Contains(normalized, "credit") {
+		return false
+	}
+
+	remaining, okRemaining := firstAmount(remainingAmountPattern, normalized)
+	required, okRequired := firstAmount(requiredAmountPattern, normalized)
+	if !okRemaining || !okRequired {
+		return false
+	}
+	return remaining < required
+}
+
+func firstAmount(pattern *regexp.Regexp, text string) (float64, bool) {
+	match := pattern.FindStringSubmatch(text)
+	if len(match) < 2 {
+		return 0, false
+	}
+	value, err := strconv.ParseFloat(match[1], 64)
+	if err != nil {
+		return 0, false
+	}
+	return value, true
+}
+
+// IsBalanceExhausted 判断上游错误是否属于“账号余额不足以完成一次请求”。
+//
+// 状态码先做粗筛：只有付费/权限/参数类错误才可能是余额问题，
+// 5xx 与网络错误一律不判为余额耗尽，避免上游抖动导致误删账号。
+func IsBalanceExhausted(status int, body string) bool {
+	switch status {
+	case http.StatusBadRequest, http.StatusPaymentRequired, http.StatusForbidden,
+		http.StatusTooManyRequests, http.StatusUnauthorized:
+	default:
+		return false
+	}
+	normalized := normalizeErrorText(body)
+	for _, marker := range balanceExhaustedMarkers {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return hasBalanceShortfall(normalized)
+}
+
+// maxAccountAttempts 限制单次鉴权中重新挑选账号的次数。
+//
+// 每次挑选可能触发一次上游额度查询，因此必须设上限，
+// 否则大量已耗尽的账号会把单个请求拖成一串串行网络调用。
+const maxAccountAttempts = 3
+
+// Gateway 处理 OpenAI 兼容的推理请求。
+type Gateway struct {
+	Store    *store.Store
+	Balancer *balancer.Balancer
+	Limiter  *balancer.RateLimiter
+	Upstream *Upstream
+
+	// Refresher 可为 nil，此时跳过请求时余额刷新。
+	Refresher BalanceRefresher
+
+	// Reaper 可为 nil，此时不做余额不足自动删号。
+	Reaper AccountReaper
+}
+
+// New 创建网关处理器。
+func New(dataStore *store.Store, lb *balancer.Balancer, limiter *balancer.RateLimiter, upstream *Upstream) *Gateway {
+	return &Gateway{Store: dataStore, Balancer: lb, Limiter: limiter, Upstream: upstream}
+}
+
+// SetRefresher 注入请求时余额刷新实现。
+func (g *Gateway) SetRefresher(refresher BalanceRefresher) {
+	g.Refresher = refresher
+}
+
+// SetReaper 注入余额不足自动删号实现。
+func (g *Gateway) SetReaper(reaper AccountReaper) {
+	g.Reaper = reaper
+}
+
+// dropExhaustedAccount 在上游报余额不足时删除该账号，返回是否已删除。
+func (g *Gateway) dropExhaustedAccount(accountID string, detail string) bool {
+	if g.Reaper == nil || accountID == "" {
+		return false
+	}
+	return g.Reaper.DropAccount(accountID, "上游报余额不足自动删除: "+truncateReason(detail))
+}
+
+// truncateReason 截断上游报错文本，避免把大段响应写进删号记录。
+func truncateReason(text string) string {
+	trimmed := strings.TrimSpace(text)
+	runes := []rune(trimmed)
+	if len(runes) <= 120 {
+		return trimmed
+	}
+	return string(runes[:120]) + "…"
+}
+
+// AuthError 表示密钥鉴权失败。
+type AuthError struct {
+	Status  int
+	Message string
+}
+
+func (e *AuthError) Error() string {
+	return e.Message
+}
+
+// Session 是一次请求的鉴权上下文。
+type Session struct {
+	KeyID       string
+	AccountID   string
+	ProviderIDs []string
+}
+
+// Authenticate 校验网关密钥，并在需要时自动分配可用账号。
+//
+// 分配流程：命中密钥 → 检查密钥状态 → 挑选账号 → 若该账号余额数据过期则先刷新再确认。
+// 刷新后账号若已耗尽或被自动删除，就重新挑选下一个账号，最多重试 maxAccountAttempts 次，
+// 从而避免“余额已经用完却继续往同一个账号打请求”。
+func (g *Gateway) Authenticate(ctx context.Context, secret string) (Session, *AuthError) {
+	if strings.TrimSpace(secret) == "" {
+		return Session{}, &AuthError{Status: http.StatusUnauthorized, Message: "缺少 API Key，请在 Authorization: Bearer <key> 中提供"}
+	}
+
+	for attempt := 0; attempt < maxAccountAttempts; attempt++ {
+		session, staleAccount, authErr := g.assignSession(secret)
+		if authErr != nil {
+			return Session{}, authErr
+		}
+		if staleAccount == "" {
+			return session, nil
+		}
+		// 余额数据已过期：先查一次再决定是否放行。
+		if g.Refresher == nil || g.Refresher.RefreshForRequest(ctx, staleAccount) {
+			return session, nil
+		}
+		if ctx.Err() != nil {
+			return Session{}, &AuthError{Status: http.StatusServiceUnavailable, Message: "请求已取消"}
+		}
+	}
+
+	return Session{}, &AuthError{Status: http.StatusServiceUnavailable, Message: "没有可用账号（余额已耗尽或未配置 API）"}
+}
+
+// assignSession 在一次写锁内完成密钥校验与账号分配。
+//
+// 第二个返回值非空表示所选账号的余额数据已过期，调用方需要先刷新再决定是否使用。
+func (g *Gateway) assignSession(secret string) (Session, string, *AuthError) {
+	var (
+		session      Session
+		staleAccount string
+		authErr      *AuthError
+	)
+
+	g.Store.Mutate(func(data *store.Data) {
+		key := data.FindKeyBySecret(secret)
+		if key == nil {
+			authErr = &AuthError{Status: http.StatusUnauthorized, Message: "API Key 无效"}
+			return
+		}
+		switch key.State(time.Now()) {
+		case store.KeyDisabled:
+			authErr = &AuthError{Status: http.StatusForbidden, Message: "API Key 已禁用"}
+			return
+		case store.KeyExpired:
+			authErr = &AuthError{Status: http.StatusForbidden, Message: "API Key 已过期"}
+			return
+		case store.KeyQuotaExceeded:
+			authErr = &AuthError{Status: http.StatusTooManyRequests, Message: "API Key 配额已用尽"}
+			return
+		}
+
+		session.KeyID = key.ID
+		session.ProviderIDs = append([]string{}, key.ProviderIDs...)
+		if len(data.Accounts) == 0 {
+			return
+		}
+
+		account := data.AssignAccount(key)
+		if account == nil {
+			authErr = &AuthError{Status: http.StatusServiceUnavailable, Message: "没有可用账号（全部余额耗尽或未配置 API）"}
+			return
+		}
+		session.AccountID = account.ID
+		if g.Refresher != nil && account.NeedsRequestRefresh(time.Now()) {
+			staleAccount = account.ID
+		}
+	})
+
+	if authErr != nil {
+		return Session{}, "", authErr
+	}
+	return session, staleAccount, nil
+}
+
+// HandleChatCompletions 是 /v1/chat/completions 的入口。
+func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	secret := httpx.BearerToken(r)
+	session, authErr := g.Authenticate(r.Context(), secret)
+	if authErr != nil {
+		httpx.Error(w, authErr.Status, authErr.Message, nil)
+		return
+	}
+	keyID := session.KeyID
+
+	body, err := httpx.ReadJSONObject(r)
+	if err != nil {
+		httpx.Error(w, httpx.StatusOf(err, http.StatusBadRequest), err.Error(), nil)
+		return
+	}
+
+	messages, ok := body["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		httpx.Error(w, http.StatusBadRequest, "messages 字段必须是非空数组", nil)
+		return
+	}
+	model := strings.TrimSpace(store.MustString(body["model"]))
+	if model == "" {
+		httpx.Error(w, http.StatusBadRequest, "model 字段不能为空", nil)
+		return
+	}
+
+	var (
+		allowsModel bool
+		rateLimit   int
+	)
+	g.Store.View(func(data *store.Data) {
+		key := data.FindKeyByID(keyID)
+		if key == nil {
+			return
+		}
+		allowsModel = key.AllowsModel(model)
+		if key.RateLimitPerMin != nil {
+			rateLimit = *key.RateLimitPerMin
+		}
+	})
+	if !allowsModel {
+		httpx.Error(w, http.StatusForbidden, "当前 API Key 不允许调用模型 "+model, nil)
+		return
+	}
+
+	if rateLimit > 0 {
+		decision := g.Limiter.Allow(keyID, rateLimit, time.Now())
+		if !decision.Allowed {
+			seconds := int(decision.RetryAfter.Seconds())
+			if seconds < 1 {
+				seconds = 1
+			}
+			w.Header().Set("Retry-After", fmt.Sprint(seconds))
+			g.recordKeyUsage(keyID, false, balancer.Usage{})
+			httpx.Error(w, http.StatusTooManyRequests, "触发速率限制，请稍后再试", nil)
+			return
+		}
+	}
+
+	candidates := g.orderedProviders(model, session)
+	if len(candidates) == 0 {
+		httpx.Error(w, http.StatusServiceUnavailable, "没有可用的上游提供商（检查模型匹配、启用状态与冷却状态）", nil)
+		return
+	}
+
+	maxAttempts := g.Store.MaxRetries()
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	if maxAttempts > len(candidates) {
+		maxAttempts = len(candidates)
+	}
+
+	stream := asBool(body["stream"])
+	attempts := []any{}
+	// accountSwitches 给“余额不足删号后换账号”设上限，
+	// 避免大批账号同时欠费时把一次请求拖成长串串行重试。
+	accountSwitches := 0
+
+	for index := 0; index < maxAttempts; index++ {
+		provider := candidates[index]
+		g.adjustInflight(provider.ID, 1)
+
+		response, sendErr := g.Upstream.SendChat(r.Context(), provider, body)
+		if sendErr != nil {
+			g.adjustInflight(provider.ID, -1)
+			g.reportFailure(provider.ID, sendErr)
+			attempts = append(attempts, map[string]any{"provider": provider.Name, "error": sendErr.Error()})
+			if errors.Is(sendErr, context.Canceled) {
+				return
+			}
+			continue
+		}
+
+		if response.HTTP.StatusCode < 200 || response.HTTP.StatusCode >= 300 {
+			snippet := ReadErrorBody(response.HTTP)
+			response.HTTP.Body.Close()
+			response.Cancel()
+			g.adjustInflight(provider.ID, -1)
+			statusErr := fmt.Errorf("HTTP %d %s", response.HTTP.StatusCode, snippet)
+			g.reportFailure(provider.ID, statusErr)
+			attempts = append(attempts, map[string]any{"provider": provider.Name, "status": response.HTTP.StatusCode, "error": snippet})
+
+			// 上游明确说“这一次请求的余额都不够”时立刻删号，
+			// 并换一个账号重试，让调用方感知不到这次切换。
+			if accountSwitches < maxAccountAttempts && IsBalanceExhausted(response.HTTP.StatusCode, snippet) && g.dropExhaustedAccount(session.AccountID, snippet) {
+				accountSwitches++
+				retrySession, retryErr := g.Authenticate(r.Context(), secret)
+				if retryErr == nil {
+					session = retrySession
+					keyID = session.KeyID
+					candidates = g.orderedProviders(model, session)
+					if len(candidates) > 0 {
+						maxAttempts = g.Store.MaxRetries()
+						if maxAttempts < 1 {
+							maxAttempts = 1
+						}
+						if maxAttempts > len(candidates) {
+							maxAttempts = len(candidates)
+						}
+						index = -1
+						continue
+					}
+				}
+			}
+
+			if retryableStatus[response.HTTP.StatusCode] && index < maxAttempts-1 {
+				continue
+			}
+			g.recordKeyUsage(keyID, false, balancer.Usage{})
+			status := response.HTTP.StatusCode
+			if status == http.StatusUnauthorized || status == http.StatusForbidden {
+				status = http.StatusBadGateway
+			}
+			httpx.Error(w, status, "上游返回错误: "+firstNonEmptyText(snippet, fmt.Sprint(response.HTTP.StatusCode)), map[string]any{
+				"provider": provider.Name,
+				"attempts": attempts,
+			})
+			return
+		}
+
+		w.Header().Set("X-Lb-Provider", provider.Name)
+		w.Header().Set("X-Lb-Provider-Id", provider.ID)
+		w.Header().Set("X-Lb-Attempt", fmt.Sprint(index+1))
+		w.Header().Set("X-Lb-Upstream-Model", provider.UpstreamModel(model))
+
+		if stream {
+			usage, streamErr := g.pipeStream(w, response, provider, model)
+			response.HTTP.Body.Close()
+			response.Cancel()
+			g.adjustInflight(provider.ID, -1)
+			if streamErr != nil {
+				g.reportFailure(provider.ID, streamErr)
+				g.recordKeyUsage(keyID, false, balancer.Usage{})
+				return
+			}
+			g.reportSuccess(provider.ID, time.Since(response.StartedAt), usage)
+			g.recordKeyUsage(keyID, true, usage)
+			return
+		}
+
+		payload, usage, decodeErr := g.decodeResponse(response, provider, model)
+		response.HTTP.Body.Close()
+		response.Cancel()
+		g.adjustInflight(provider.ID, -1)
+		if decodeErr != nil {
+			g.reportFailure(provider.ID, decodeErr)
+			attempts = append(attempts, map[string]any{"provider": provider.Name, "error": decodeErr.Error()})
+			if index < maxAttempts-1 {
+				continue
+			}
+			g.recordKeyUsage(keyID, false, balancer.Usage{})
+			httpx.Error(w, http.StatusBadGateway, "上游响应解析失败: "+decodeErr.Error(), map[string]any{"attempts": attempts})
+			return
+		}
+
+		g.reportSuccess(provider.ID, time.Since(response.StartedAt), usage)
+		g.recordKeyUsage(keyID, true, usage)
+		httpx.JSON(w, http.StatusOK, payload)
+		return
+	}
+
+	g.recordKeyUsage(keyID, false, balancer.Usage{})
+	httpx.Error(w, http.StatusBadGateway, "所有上游提供商均失败", map[string]any{"attempts": attempts})
+}
+
+// HandleEmbeddings 转发向量化请求到 OpenAI 兼容提供商。
+func (g *Gateway) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	secret := httpx.BearerToken(r)
+	session, authErr := g.Authenticate(r.Context(), secret)
+	if authErr != nil {
+		httpx.Error(w, authErr.Status, authErr.Message, nil)
+		return
+	}
+	keyID := session.KeyID
+
+	body, err := httpx.ReadJSONObject(r)
+	if err != nil {
+		httpx.Error(w, httpx.StatusOf(err, http.StatusBadRequest), err.Error(), nil)
+		return
+	}
+	model := strings.TrimSpace(store.MustString(body["model"]))
+	if model == "" {
+		httpx.Error(w, http.StatusBadRequest, "model 字段不能为空", nil)
+		return
+	}
+
+	candidates := g.orderedProviders(model, session)
+	if len(candidates) == 0 {
+		httpx.Error(w, http.StatusServiceUnavailable, "没有可用的上游提供商", nil)
+		return
+	}
+	provider := candidates[0]
+
+	payload := map[string]any{}
+	for key, value := range body {
+		payload[key] = value
+	}
+	payload["model"] = provider.UpstreamModel(model)
+
+	encoded, marshalErr := json.Marshal(payload)
+	if marshalErr != nil {
+		httpx.Error(w, http.StatusInternalServerError, marshalErr.Error(), nil)
+		return
+	}
+
+	target := JoinURL(provider.BaseURL, "/embeddings")
+	request, requestErr := http.NewRequestWithContext(r.Context(), http.MethodPost, target, strings.NewReader(string(encoded)))
+	if requestErr != nil {
+		httpx.Error(w, http.StatusInternalServerError, requestErr.Error(), nil)
+		return
+	}
+	request.Header = AuthHeaders(provider)
+
+	response, sendErr := g.Upstream.client.Do(request)
+	if sendErr != nil {
+		g.reportFailure(provider.ID, sendErr)
+		httpx.Error(w, http.StatusBadGateway, "上游请求失败: "+sendErr.Error(), nil)
+		return
+	}
+	defer response.Body.Close()
+
+	raw, readErr := io.ReadAll(io.LimitReader(response.Body, 16<<20))
+	if readErr != nil {
+		g.reportFailure(provider.ID, readErr)
+		httpx.Error(w, http.StatusBadGateway, "读取上游响应失败: "+readErr.Error(), nil)
+		return
+	}
+
+	if response.StatusCode >= 200 && response.StatusCode < 300 {
+		g.reportSuccess(provider.ID, 0, balancer.Usage{})
+		g.recordKeyUsage(keyID, true, balancer.Usage{})
+	} else {
+		g.reportFailure(provider.ID, fmt.Errorf("HTTP %d", response.StatusCode))
+		g.recordKeyUsage(keyID, false, balancer.Usage{})
+		// 向量化没有多上游重试，但账号既然连这一次都付不起，也应立即退出分配池。
+		if snippet := string(raw); IsBalanceExhausted(response.StatusCode, snippet) {
+			g.dropExhaustedAccount(session.AccountID, snippet)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(response.StatusCode)
+	_, _ = w.Write(raw)
+}
+
+// orderedProviders 先按账号收敛候选范围，再在账号内做负载均衡排序。
+func (g *Gateway) orderedProviders(model string, session Session) []*store.Provider {
+	snapshot := []*store.Provider{}
+	g.Store.View(func(data *store.Data) {
+		if session.AccountID != "" {
+			snapshot = append(snapshot, data.AccountProviders(session.AccountID)...)
+			return
+		}
+		snapshot = append(snapshot, data.Providers...)
+	})
+	return g.Balancer.Order(snapshot, balancer.Criteria{Model: model, ProviderIDs: session.ProviderIDs})
+}
+
+func (g *Gateway) decodeResponse(response *Response, provider *store.Provider, model string) (map[string]any, balancer.Usage, error) {
+	raw, err := io.ReadAll(io.LimitReader(response.HTTP.Body, 64<<20))
+	if err != nil {
+		return nil, balancer.Usage{}, err
+	}
+	decoded := map[string]any{}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return nil, balancer.Usage{}, fmt.Errorf("非法 JSON 响应: %w", err)
+	}
+
+	payload := decoded
+	if provider.Type == store.TypeAnthropic {
+		payload = FromAnthropicResponse(decoded, model)
+	} else {
+		payload["model"] = model
+	}
+	return payload, usageFromMap(payload["usage"]), nil
+}
+
+func (g *Gateway) pipeStream(w http.ResponseWriter, response *Response, provider *store.Provider, model string) (balancer.Usage, error) {
+	header := w.Header()
+	header.Set("Content-Type", "text/event-stream; charset=utf-8")
+	header.Set("Cache-Control", "no-cache, no-transform")
+	header.Set("Connection", "keep-alive")
+	header.Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, _ := w.(http.Flusher)
+	reader := bufio.NewReader(response.HTTP.Body)
+	usage := balancer.Usage{}
+	converter := newAnthropicStreamConverter(model)
+
+	for {
+		line, err := reader.ReadString('\n')
+		if line != "" {
+			if provider.Type == store.TypeAnthropic {
+				for _, chunk := range converter.Convert(line) {
+					if _, writeErr := io.WriteString(w, chunk); writeErr != nil {
+						return usage, writeErr
+					}
+				}
+				if converter.usage.TotalTokens > 0 {
+					usage = converter.usage
+				}
+			} else {
+				if parsed, ok := usageFromSSELine(line); ok {
+					usage = parsed
+				}
+				if _, writeErr := io.WriteString(w, line); writeErr != nil {
+					return usage, writeErr
+				}
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return usage, err
+		}
+	}
+
+	if provider.Type == store.TypeAnthropic {
+		if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+			return usage, err
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		usage = converter.usage
+	}
+	return usage, nil
+}
+
+// adjustInflight 只改内存计数，不触发落盘。
+func (g *Gateway) adjustInflight(providerID string, delta int64) {
+	g.Store.Mutate(func(data *store.Data) {
+		if provider := data.FindProvider(providerID); provider != nil {
+			provider.Inflight += delta
+			if provider.Inflight < 0 {
+				provider.Inflight = 0
+			}
+		}
+	})
+}
+
+// reportSuccess 与 reportFailure 走缓冲写：统计信息由后台合并落盘，
+// 避免每个请求都重写整个数据文件。
+func (g *Gateway) reportSuccess(providerID string, latency time.Duration, usage balancer.Usage) {
+	g.Store.Mutate(func(data *store.Data) {
+		if provider := data.FindProvider(providerID); provider != nil {
+			g.Balancer.ReportSuccess(provider, latency, usage)
+		}
+	})
+}
+
+func (g *Gateway) reportFailure(providerID string, err error) {
+	g.Store.Mutate(func(data *store.Data) {
+		if provider := data.FindProvider(providerID); provider != nil {
+			g.Balancer.ReportFailure(provider, err)
+		}
+	})
+}
+
+func (g *Gateway) recordKeyUsage(keyID string, ok bool, usage balancer.Usage) {
+	g.Store.Mutate(func(data *store.Data) {
+		key := data.FindKeyByID(keyID)
+		if key == nil {
+			return
+		}
+		now := time.Now().UTC()
+		key.Stats.Requests++
+		if ok {
+			key.Stats.Success++
+		} else {
+			key.Stats.Failure++
+		}
+		key.Stats.TotalTokens += usage.TotalTokens
+		key.Stats.LastUsedAt = &now
+
+		if account := data.FindAccount(key.AccountID); account != nil {
+			account.Stats.Requests++
+			if ok {
+				account.Stats.Success++
+			} else {
+				account.Stats.Failure++
+			}
+			account.Stats.TotalTokens += usage.TotalTokens
+			account.Stats.LastUsedAt = &now
+		}
+	})
+}
+
+func usageFromMap(value any) balancer.Usage {
+	source, ok := value.(map[string]any)
+	if !ok {
+		return balancer.Usage{}
+	}
+	usage := balancer.Usage{}
+	if prompt, ok := asInt(source["prompt_tokens"]); ok {
+		usage.PromptTokens = prompt
+	} else if prompt, ok := asInt(source["input_tokens"]); ok {
+		usage.PromptTokens = prompt
+	}
+	if completion, ok := asInt(source["completion_tokens"]); ok {
+		usage.CompletionTokens = completion
+	} else if completion, ok := asInt(source["output_tokens"]); ok {
+		usage.CompletionTokens = completion
+	}
+	if total, ok := asInt(source["total_tokens"]); ok {
+		usage.TotalTokens = total
+	} else {
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	}
+	return usage
+}
+
+func usageFromSSELine(line string) (balancer.Usage, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "data:") {
+		return balancer.Usage{}, false
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+	if payload == "" || payload == "[DONE]" {
+		return balancer.Usage{}, false
+	}
+	decoded := map[string]any{}
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		return balancer.Usage{}, false
+	}
+	if decoded["usage"] == nil {
+		return balancer.Usage{}, false
+	}
+	usage := usageFromMap(decoded["usage"])
+	if usage.TotalTokens == 0 && usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
+		return balancer.Usage{}, false
+	}
+	return usage, true
+}
+
+func firstNonEmptyText(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}

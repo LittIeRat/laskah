@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="auto">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="robots" content="noindex, nofollow" />
+<title>分组与账号 · Laskah</title>
+<link rel="icon" href="/logo.png" type="image/png" />
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<nav class="nav">
+  <div id="nav-host"></div>
+  <div class="nav-links" id="nav-links"></div>
+</nav>
+
+<div class="wrap">
+  <div class="page-hero">
+    <h2 class="page-title">分组与账号</h2>
+    <p class="page-sub">先创建用户分组，再在分组内添加账号。每个账号最多 5 个上游 API，账号内自动负载均衡；禁用分组会立即让其账号退出分配池。</p>
+  </div>
+
+  <div class="section-head">
+    <h2>用户分组</h2>
+    <span class="hint" id="group-hint">分组用于隔离账号池，网关密钥可绑定到指定分组</span>
+  </div>
+  <div class="card">
+    <div class="btn-row" style="margin-top:0">
+      <button class="btn btn-primary" id="group-create" type="button">创建分组</button>
+      <button class="btn" id="refresh-all" type="button">刷新全部余额</button>
+      <button class="btn btn-quiet" id="reload-list" type="button">重新加载</button>
+    </div>
+    <div class="list" id="group-list"></div>
+  </div>
+
+  <div class="section-head">
+    <h2>账号</h2>
+    <span class="hint" id="account-summary">保存后仅可查询余额或删除账号，配置不可修改或查看</span>
+  </div>
+  <div class="card">
+    <div class="btn-row" style="margin-top:0">
+      <button class="btn btn-primary" id="account-create" type="button">创建账号</button>
+      <button class="btn" id="refresh-accounts" type="button">手动刷新全部余额</button>
+      <span class="hint-text" id="refresh-status">余额耗尽的账号会在刷新后自动删除</span>
+    </div>
+    <div class="list" id="account-list"></div>
+  </div>
+
+  <div class="section-head" id="users">
+    <h2>管理员账户</h2>
+    <span class="hint" id="users-hint">超级管理员可访问全部页面；管理员只能查看数据看板</span>
+  </div>
+  <div class="card">
+    <div class="btn-row" style="margin-top:0">
+      <button class="btn btn-primary" id="user-create" type="button">添加管理员</button>
+    </div>
+    <div class="list" id="user-list"></div>
+  </div>
+
+  <div class="section-head">
+    <h2>自动删号记录</h2>
+    <span class="hint">余额耗尽、上游报余额不足或分组删除时自动清理</span>
+  </div>
+  <div class="card">
+    <div class="list" id="removed-list"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+<script src="/manage.js"></script>
+</body>
+</html>

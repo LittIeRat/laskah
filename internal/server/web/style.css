@@ -1,0 +1,919 @@
+/* Laskah 设计系统：iOS 风格圆角卡片、毛玻璃导航，支持深色/浅色/跟随系统。
+   主题通过 <html data-theme="auto|light|dark"> 切换：
+   - light / dark 直接锁定一套变量；
+   - auto 保留 prefers-color-scheme 媒体查询。 */
+
+:root {
+  --ios-blue: #0a84ff;
+  --ios-indigo: #5e5ce6;
+  --ios-green: #30d158;
+  --ios-orange: #ff9f0a;
+  --ios-red: #ff453a;
+  --ios-purple: #bf5af2;
+  --ios-teal: #40c8e0;
+  --radius-lg: 20px;
+  --radius-md: 13px;
+  --radius-sm: 9px;
+  --ease: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* 浅色变量（默认） */
+:root,
+:root[data-theme="light"],
+:root[data-theme="auto"] {
+  color-scheme: light;
+  --bg: #f2f2f7;
+  --bg-elevated: #ffffff;
+  --bg-grouped: #ffffff;
+  --bg-tint: rgba(10, 132, 255, 0.07);
+  --fill: rgba(120, 120, 128, 0.11);
+  --fill-strong: rgba(120, 120, 128, 0.2);
+  --label: #1c1c1e;
+  --label-secondary: rgba(60, 60, 67, 0.62);
+  --label-tertiary: rgba(60, 60, 67, 0.32);
+  --separator: rgba(60, 60, 67, 0.14);
+  --nav-bg: rgba(255, 255, 255, 0.72);
+  --overlay: rgba(0, 0, 0, 0.3);
+  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.04), 0 10px 30px rgba(16, 24, 40, 0.06);
+  --shadow-modal: 0 24px 70px rgba(16, 24, 40, 0.28);
+  --logo-filter: none;
+  --hero: radial-gradient(115% 85% at 12% 0%, rgba(94, 92, 230, 0.16), transparent 60%),
+    radial-gradient(90% 80% at 92% 8%, rgba(64, 200, 224, 0.16), transparent 62%);
+  --badge-good: #248a3d;
+  --badge-warn: #a24d00;
+  --badge-bad: #c9241a;
+  --badge-info: #0a6fd8;
+}
+
+/* 深色变量 */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #000000;
+  --bg-elevated: #2c2c2e;
+  --bg-grouped: #1c1c1e;
+  --bg-tint: rgba(10, 132, 255, 0.16);
+  --fill: rgba(120, 120, 128, 0.22);
+  --fill-strong: rgba(120, 120, 128, 0.38);
+  --label: #f5f5f7;
+  --label-secondary: rgba(235, 235, 245, 0.62);
+  --label-tertiary: rgba(235, 235, 245, 0.32);
+  --separator: rgba(84, 84, 88, 0.6);
+  --nav-bg: rgba(22, 22, 24, 0.72);
+  --overlay: rgba(0, 0, 0, 0.6);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow-modal: 0 24px 70px rgba(0, 0, 0, 0.7);
+  --logo-filter: invert(1);
+  --hero: radial-gradient(115% 85% at 12% 0%, rgba(94, 92, 230, 0.3), transparent 60%),
+    radial-gradient(90% 80% at 92% 8%, rgba(64, 200, 224, 0.22), transparent 62%);
+  --badge-good: #6ee787;
+  --badge-warn: #ffc46b;
+  --badge-bad: #ff8f87;
+  --badge-info: #7ab9ff;
+}
+
+/* 跟随系统：只有 auto 时才让媒体查询接管 */
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="auto"] {
+    color-scheme: dark;
+    --bg: #000000;
+    --bg-elevated: #2c2c2e;
+    --bg-grouped: #1c1c1e;
+    --bg-tint: rgba(10, 132, 255, 0.16);
+    --fill: rgba(120, 120, 128, 0.22);
+    --fill-strong: rgba(120, 120, 128, 0.38);
+    --label: #f5f5f7;
+    --label-secondary: rgba(235, 235, 245, 0.62);
+    --label-tertiary: rgba(235, 235, 245, 0.32);
+    --separator: rgba(84, 84, 88, 0.6);
+    --nav-bg: rgba(22, 22, 24, 0.72);
+    --overlay: rgba(0, 0, 0, 0.6);
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.5);
+    --shadow-modal: 0 24px 70px rgba(0, 0, 0, 0.7);
+    --logo-filter: invert(1);
+    --hero: radial-gradient(115% 85% at 12% 0%, rgba(94, 92, 230, 0.3), transparent 60%),
+      radial-gradient(90% 80% at 92% 8%, rgba(64, 200, 224, 0.22), transparent 62%);
+    --badge-good: #6ee787;
+    --badge-warn: #ffc46b;
+    --badge-bad: #ff8f87;
+    --badge-info: #7ab9ff;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--label);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  letter-spacing: -0.01em;
+  transition: background 0.3s var(--ease), color 0.3s var(--ease);
+}
+
+body.modal-open {
+  overflow: hidden;
+}
+
+/* ---------- 顶部导航 ---------- */
+
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 22px;
+  background: var(--nav-bg);
+  backdrop-filter: saturate(180%) blur(22px);
+  -webkit-backdrop-filter: saturate(180%) blur(22px);
+  border-bottom: 0.5px solid var(--separator);
+}
+
+/* 左上角花字品牌 */
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  text-decoration: none;
+  color: inherit;
+}
+
+.brand-mark {
+  width: 30px;
+  height: 30px;
+  object-fit: contain;
+  filter: var(--logo-filter);
+}
+
+.brand-word {
+  font-family: "Snell Roundhand", "Apple Chancery", "Segoe Script", "Brush Script MT",
+    "Palatino Linotype", "PingFang SC", cursive;
+  font-size: 30px;
+  line-height: 1;
+  font-weight: 600;
+  font-style: italic;
+  letter-spacing: 0.01em;
+  background: linear-gradient(112deg, var(--ios-indigo), var(--ios-blue) 42%, var(--ios-teal));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  padding-right: 3px;
+}
+
+.nav-links {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.nav-link {
+  color: var(--ios-blue);
+  text-decoration: none;
+  font-size: 15px;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  transition: background 0.2s var(--ease);
+}
+
+.nav-link:hover {
+  background: var(--fill);
+}
+
+.nav-link.active {
+  background: var(--fill);
+  font-weight: 600;
+}
+
+/* 分段控件（主题切换） */
+.segment {
+  display: inline-flex;
+  padding: 2px;
+  border-radius: 999px;
+  background: var(--fill);
+  gap: 2px;
+}
+
+.segment-item {
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  border: none;
+  background: transparent;
+  color: var(--label-secondary);
+  padding: 5px 11px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.22s var(--ease), color 0.22s var(--ease);
+}
+
+.segment-item.active {
+  background: var(--bg-elevated);
+  color: var(--label);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.14);
+}
+
+/* ---------- 页面骨架 ---------- */
+
+.wrap {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 26px 20px 78px;
+}
+
+.page-hero {
+  background: var(--hero);
+  border-radius: 26px;
+  padding: 26px 26px 22px;
+  margin-bottom: 6px;
+}
+
+.page-title {
+  font-size: 33px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  margin: 0 0 6px;
+}
+
+.page-sub {
+  color: var(--label-secondary);
+  margin: 0;
+  font-size: 15px;
+  max-width: 74ch;
+}
+
+.section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 30px 4px 10px;
+  flex-wrap: wrap;
+}
+
+.section-head h2 {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+
+.section-head .hint {
+  color: var(--label-secondary);
+  font-size: 13px;
+}
+
+.card {
+  background: var(--bg-grouped);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  padding: 18px;
+  margin-bottom: 16px;
+}
+
+.card + .card {
+  margin-top: 0;
+}
+
+/* ---------- 统计 ---------- */
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(196px, 1fr));
+  gap: 12px;
+}
+
+.stat {
+  background: var(--bg-tint);
+  border-radius: var(--radius-lg);
+  padding: 16px 18px;
+}
+
+.stat-label {
+  font-size: 13px;
+  color: var(--label-secondary);
+  margin-bottom: 6px;
+}
+
+.stat-value {
+  font-size: 27px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-value.accent {
+  color: var(--ios-blue);
+}
+
+.stat-value.warn {
+  color: var(--ios-orange);
+}
+
+.stat-value.good {
+  color: var(--ios-green);
+}
+
+.stat-note {
+  font-size: 12px;
+  color: var(--label-tertiary);
+  margin-top: 4px;
+}
+
+/* ---------- 表单 ---------- */
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(244px, 1fr));
+  gap: 14px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.field.full {
+  grid-column: 1 / -1;
+}
+
+label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--label-secondary);
+}
+
+label .req {
+  color: var(--ios-red);
+  margin-left: 3px;
+}
+
+.hint-text {
+  font-size: 12px;
+  color: var(--label-tertiary);
+}
+
+input,
+select,
+textarea {
+  font-family: inherit;
+  font-size: 15px;
+  color: var(--label);
+  background: var(--fill);
+  border: none;
+  border-radius: var(--radius-md);
+  padding: 11px 13px;
+  width: 100%;
+  transition: box-shadow 0.2s var(--ease), background 0.2s var(--ease);
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  background: var(--bg-elevated);
+  box-shadow: 0 0 0 3.5px rgba(10, 132, 255, 0.3);
+}
+
+textarea {
+  resize: vertical;
+  min-height: 92px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+/* ---------- 按钮 ---------- */
+
+.btn {
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  border: none;
+  border-radius: 980px;
+  padding: 10px 20px;
+  cursor: pointer;
+  background: var(--fill);
+  color: var(--label);
+  transition: transform 0.14s var(--ease), opacity 0.2s var(--ease), background 0.2s var(--ease);
+}
+
+.btn:active {
+  transform: scale(0.965);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--ios-blue), var(--ios-indigo));
+  color: #fff;
+}
+
+.btn-danger {
+  background: transparent;
+  color: var(--ios-red);
+  box-shadow: inset 0 0 0 1.5px currentColor;
+}
+
+.btn-quiet {
+  background: transparent;
+  color: var(--ios-blue);
+  padding: 6px 10px;
+  font-size: 14px;
+}
+
+.btn-sm {
+  font-size: 13.5px;
+  padding: 7px 14px;
+}
+
+.btn-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin-top: 16px;
+}
+
+/* ---------- 开关 ---------- */
+
+.switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 0;
+}
+
+.switch {
+  position: relative;
+  width: 51px;
+  height: 31px;
+  flex: none;
+}
+
+.switch.switch-sm {
+  width: 42px;
+  height: 26px;
+}
+
+.switch input {
+  position: absolute;
+  opacity: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  cursor: pointer;
+}
+
+.switch-track {
+  position: absolute;
+  inset: 0;
+  background: var(--fill-strong);
+  border-radius: 999px;
+  transition: background 0.26s var(--ease);
+  pointer-events: none;
+}
+
+.switch-track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 27px;
+  height: 27px;
+  background: #fff;
+  border-radius: 50%;
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.15);
+  transition: transform 0.26s var(--ease);
+}
+
+.switch.switch-sm .switch-track::after {
+  width: 22px;
+  height: 22px;
+}
+
+.switch input:checked + .switch-track {
+  background: var(--ios-green);
+}
+
+.switch input:checked + .switch-track::after {
+  transform: translateX(20px);
+}
+
+.switch.switch-sm input:checked + .switch-track::after {
+  transform: translateX(16px);
+}
+
+/* ---------- 列表 ---------- */
+
+.list {
+  display: flex;
+  flex-direction: column;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 2px;
+  border-bottom: 0.5px solid var(--separator);
+}
+
+.row:last-child {
+  border-bottom: none;
+}
+
+.row.muted {
+  opacity: 0.55;
+}
+
+.row-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.row-title {
+  font-size: 15px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.row-sub {
+  font-size: 13px;
+  color: var(--label-secondary);
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+.row-actions {
+  display: flex;
+  gap: 8px;
+  flex: none;
+  align-items: center;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+
+/* ---------- 徽标 ---------- */
+
+.badge {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--fill);
+  color: var(--label-secondary);
+  white-space: nowrap;
+}
+
+.badge.good {
+  background: rgba(48, 209, 88, 0.16);
+  color: var(--badge-good);
+}
+
+.badge.warn {
+  background: rgba(255, 159, 10, 0.16);
+  color: var(--badge-warn);
+}
+
+.badge.bad {
+  background: rgba(255, 69, 58, 0.16);
+  color: var(--badge-bad);
+}
+
+.badge.info {
+  background: rgba(10, 132, 255, 0.16);
+  color: var(--badge-info);
+}
+
+/* ---------- 进度条 ---------- */
+
+.bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--fill);
+  overflow: hidden;
+  margin-top: 8px;
+}
+
+.bar > span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--ios-blue), var(--ios-teal));
+  transition: width 0.4s var(--ease);
+}
+
+.bar.warn > span {
+  background: linear-gradient(90deg, var(--ios-orange), var(--ios-red));
+}
+
+/* ---------- 模型勾选 ---------- */
+
+.model-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(206px, 1fr));
+  gap: 8px;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 5px;
+  border-radius: var(--radius-md);
+  background: var(--fill);
+}
+
+.model-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 11px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-grouped);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.model-item input {
+  width: auto;
+  margin: 0;
+  accent-color: var(--ios-blue);
+  flex: none;
+}
+
+.model-item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- 弹窗 ---------- */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: grid;
+  place-items: center;
+  padding: 22px;
+  background: var(--overlay);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  opacity: 0;
+  transition: opacity 0.22s var(--ease);
+}
+
+.modal-overlay.show {
+  opacity: 1;
+}
+
+.modal-panel {
+  width: 100%;
+  max-width: 520px;
+  max-height: calc(100vh - 60px);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-grouped);
+  border-radius: 24px;
+  box-shadow: var(--shadow-modal);
+  transform: scale(0.94) translateY(10px);
+  transition: transform 0.26s var(--ease);
+  overflow: hidden;
+}
+
+.modal-panel.wide {
+  max-width: 760px;
+}
+
+.modal-overlay.show .modal-panel {
+  transform: scale(1) translateY(0);
+}
+
+.modal-head {
+  padding: 22px 24px 8px;
+}
+
+.modal-head h3 {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+
+.modal-head p {
+  margin: 6px 0 0;
+  font-size: 13.5px;
+  color: var(--label-secondary);
+}
+
+.modal-body {
+  padding: 12px 24px 4px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 16px 24px 20px;
+  border-top: 0.5px solid var(--separator);
+}
+
+/* ---------- 提示条 ---------- */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translate(-50%, 16px);
+  background: rgba(28, 28, 30, 0.94);
+  color: #fff;
+  padding: 12px 20px;
+  border-radius: 14px;
+  font-size: 14px;
+  max-width: min(560px, calc(100vw - 40px));
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.26s var(--ease), transform 0.26s var(--ease);
+  backdrop-filter: blur(16px);
+  z-index: 300;
+}
+
+.toast.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+.toast.error {
+  background: rgba(255, 69, 58, 0.95);
+}
+
+.toast.ok {
+  background: rgba(48, 209, 88, 0.95);
+}
+
+.empty {
+  text-align: center;
+  color: var(--label-tertiary);
+  padding: 30px 10px;
+  font-size: 14px;
+}
+
+/* ---------- 登录 / 初始化 ---------- */
+
+.login-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--hero), var(--bg);
+}
+
+.login-card {
+  width: 100%;
+  max-width: 392px;
+  background: var(--bg-grouped);
+  border-radius: 28px;
+  box-shadow: var(--shadow-card);
+  padding: 30px 28px 26px;
+  text-align: center;
+}
+
+.login-card.wide {
+  max-width: 460px;
+}
+
+.login-logo {
+  width: 96px;
+  height: 96px;
+  margin: 0 auto 12px;
+  display: block;
+  object-fit: contain;
+  filter: var(--logo-filter);
+}
+
+.login-word {
+  font-family: "Snell Roundhand", "Apple Chancery", "Segoe Script", "Brush Script MT",
+    "Palatino Linotype", cursive;
+  font-size: 46px;
+  line-height: 1.05;
+  font-weight: 600;
+  font-style: italic;
+  background: linear-gradient(112deg, var(--ios-indigo), var(--ios-blue) 45%, var(--ios-teal));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  margin: 0 0 2px;
+}
+
+.login-card p {
+  color: var(--label-secondary);
+  font-size: 14px;
+  margin: 0 0 22px;
+}
+
+.login-card .field {
+  text-align: left;
+  margin-bottom: 13px;
+}
+
+.login-card .btn {
+  width: 100%;
+  margin-top: 8px;
+}
+
+.login-theme {
+  display: flex;
+  justify-content: center;
+  margin-top: 18px;
+}
+
+.login-error {
+  color: var(--ios-red);
+  font-size: 13px;
+  min-height: 18px;
+  margin-top: 12px;
+}
+
+.code-block {
+  background: var(--fill);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  overflow-x: auto;
+  white-space: pre;
+  margin: 0;
+}
+
+.reveal-box {
+  background: var(--fill);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  margin-top: 12px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  max-height: 220px;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}
+
+.notice {
+  background: rgba(255, 159, 10, 0.14);
+  color: var(--badge-warn);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  font-size: 13.5px;
+  margin-bottom: 14px;
+  text-align: left;
+}
+
+@media (max-width: 640px) {
+  .page-title {
+    font-size: 27px;
+  }
+  .page-hero {
+    padding: 20px 18px 18px;
+  }
+  .wrap {
+    padding: 18px 15px 60px;
+  }
+  .nav {
+    padding: 10px 15px;
+    flex-wrap: wrap;
+  }
+  .nav-links {
+    margin-left: 0;
+    width: 100%;
+  }
+  .brand-word {
+    font-size: 26px;
+  }
+  .row {
+    flex-wrap: wrap;
+  }
+}

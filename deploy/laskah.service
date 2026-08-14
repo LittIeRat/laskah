@@ -1,0 +1,42 @@
+[Unit]
+Description=laskah API load balancer
+Documentation=file:///opt/laskah/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=laskah
+Group=laskah
+WorkingDirectory=/opt/laskah
+ExecStart=/opt/laskah/laskah
+EnvironmentFile=/etc/laskah/laskah.env
+Restart=always
+RestartSec=3
+
+# 权限收紧：只允许写数据目录，禁止提权与新增能力。
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/laskah
+
+# 资源上限：单进程网关，够用且防失控。
+LimitNOFILE=65535
+MemoryMax=512M
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

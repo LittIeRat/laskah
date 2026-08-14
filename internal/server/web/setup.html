@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="auto">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="robots" content="noindex, nofollow" />
+<title>初始化 · Laskah</title>
+<link rel="icon" href="/logo.png" type="image/png" />
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div class="login-shell">
+  <form class="login-card wide" id="setup-form" autocomplete="off">
+    <img class="login-logo" src="/logo.png" alt="Laskah" />
+    <div class="login-word">Laskah</div>
+    <p>首次部署：创建超级管理员账号</p>
+
+    <div class="notice">
+      超级管理员账户名会加密后落盘，服务端只保留密文与摘要，<strong>无法找回</strong>。
+      请立刻把账号与密码保存到密码管理器。
+    </div>
+
+    <div class="field">
+      <label for="setup-user">超级管理员账户<span class="req">*</span></label>
+      <input id="setup-user" type="text" autocomplete="off" spellcheck="false" placeholder="3-48 个字符，区分大小写" />
+    </div>
+    <div class="field">
+      <label for="setup-password">密码<span class="req">*</span></label>
+      <input id="setup-password" type="password" autocomplete="new-password" placeholder="至少 8 个字符" />
+    </div>
+    <div class="field">
+      <label for="setup-confirm">确认密码<span class="req">*</span></label>
+      <input id="setup-confirm" type="password" autocomplete="new-password" />
+    </div>
+    <button class="btn btn-primary" id="setup-submit" type="submit">创建并保存</button>
+    <div class="login-error" id="setup-error"></div>
+    <div class="reveal-box" id="setup-result" hidden></div>
+    <div class="login-theme" id="setup-theme"></div>
+  </form>
+</div>
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+<script src="/setup.js"></script>
+</body>
+</html>

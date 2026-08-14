@@ -1,0 +1,19 @@
+# 编译产物
+bin/
+*.exe
+
+# 运行时数据与密钥 —— 绝不入库
+data/
+*.log
+db.json
+db.master.key
+
+# 开发临时物
+tmp-*/
+tmp-*
+_preview/
+_pack/
+_report.txt
+laskah-src.zip
+
+.DS_Store
