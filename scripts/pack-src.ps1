@@ -12,7 +12,7 @@ $zip = Join-Path $parent 'laskah-src.zip'
 $stageRoot = Join-Path $parent '_pack'
 $stage = Join-Path $stageRoot 'laskah'
 
-$excludeDirs = @('bin', 'data', '_preview', '_pack')
+$excludeDirs = @('bin', 'data', '_preview', '_pack', '.git')
 
 if (Test-Path -LiteralPath $stageRoot) { Remove-Item -LiteralPath $stageRoot -Recurse -Force }
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
