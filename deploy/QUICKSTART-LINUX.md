@@ -16,13 +16,13 @@
 服务器上一条命令搞定：克隆源码、装 Go、编译、建用户、写配置、装 systemd、起服务、健康检查。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/laskah/main/scripts/deploy-from-github.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/LittIeRat/laskah/main/scripts/deploy-from-github.sh | sudo bash
 ```
 
 不放心直接管道给 root 的话（应该不放心），先下载读一遍再执行：
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/OWNER/laskah/main/scripts/deploy-from-github.sh
+curl -fsSLO https://raw.githubusercontent.com/LittIeRat/laskah/main/scripts/deploy-from-github.sh
 less deploy-from-github.sh
 sudo bash deploy-from-github.sh
 ```
@@ -37,7 +37,7 @@ sudo bash deploy-from-github.sh
 
 ```bash
 # 例：部署自己 fork 的 dev 分支
-curl -fsSL https://raw.githubusercontent.com/OWNER/laskah/main/scripts/deploy-from-github.sh \
+curl -fsSL https://raw.githubusercontent.com/LittIeRat/laskah/main/scripts/deploy-from-github.sh \
   | sudo LASKAH_REPO=https://github.com/你的用户名/laskah.git LASKAH_BRANCH=dev bash
 ```
 
@@ -188,7 +188,7 @@ sudo cp /var/lib/laskah/db.json ~/laskah-db-$(date +%F).json
 sudo cp /etc/laskah/laskah.env ~/laskah-env-$(date +%F).bak
 
 # 升级：重跑远程脚本即可拉最新代码重编重启，env 与数据都保留
-curl -fsSL https://raw.githubusercontent.com/OWNER/laskah/main/scripts/deploy-from-github.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/LittIeRat/laskah/main/scripts/deploy-from-github.sh | sudo bash
 
 # 或在已有源码目录里
 sudo LASKAH_AUTO_GO=1 bash scripts/install-linux.sh
@@ -201,7 +201,7 @@ sudo LASKAH_AUTO_GO=1 bash scripts/install-linux.sh
 | 现象 | 处理 |
 | --- | --- |
 | 脚本报找不到 `go` | 加 `LASKAH_AUTO_GO=1` 让脚本自动装，或自己装后 `export PATH=/usr/local/go/bin:$PATH` |
-| `git clone` 卡住或超时 | 国内机器访问 GitHub 不稳，换镜像：`LASKAH_REPO=https://ghproxy.net/https://github.com/OWNER/laskah.git` |
+| `git clone` 卡住或超时 | 国内机器访问 GitHub 不稳，换镜像：`LASKAH_REPO=https://ghproxy.net/https://github.com/LittIeRat/laskah.git` |
 | 脚本报 `$'\r': command not found` | 脚本被 Windows 改成 CRLF 了，`sed -i 's/\r$//' 脚本名` 修掉；仓库里已用 `.gitattributes` 强制 LF |
 | 启动失败 | `sudo journalctl -u laskah -n 50 --no-pager`；多半是 env 写错或 `DATA_FILE` 目录不在 `ReadWritePaths` 里 |
 | 登录页 403 | 反代的 `/admin/*` IP 白名单没改成你的网段 |

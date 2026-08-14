@@ -11,7 +11,7 @@ Laskah 是单文件 Go 程序：没有运行时依赖，不需要 Python / Node.
 > **只想快点跑起来**：服务器上一条命令即可，不必读本文。
 >
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/OWNER/laskah/main/scripts/deploy-from-github.sh | sudo bash
+> curl -fsSL https://raw.githubusercontent.com/LittIeRat/laskah/main/scripts/deploy-from-github.sh | sudo bash
 > ```
 >
 > 细节见 [QUICKSTART-LINUX.md](QUICKSTART-LINUX.md)。
@@ -24,7 +24,7 @@ Laskah 是单文件 Go 程序：没有运行时依赖，不需要 Python / Node.
 ### 在服务器上直接编译（推荐）
 
 ```bash
-git clone --depth 1 https://github.com/OWNER/laskah.git
+git clone --depth 1 https://github.com/LittIeRat/laskah.git
 cd laskah
 bash scripts/build.sh                                     # 当前架构
 TARGETS="linux/amd64 linux/arm64" bash scripts/build.sh    # 交叉编译
@@ -314,7 +314,7 @@ sudo systemctl start laskah
 
 ```bash
 sudo cp /opt/laskah/laskah /opt/laskah/laskah.prev   # 先留一份好回滚
-curl -fsSL https://raw.githubusercontent.com/OWNER/laskah/main/scripts/deploy-from-github.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/LittIeRat/laskah/main/scripts/deploy-from-github.sh | sudo bash
 ```
 
 它会拉最新代码、重新编译、重启并做健康检查，`laskah.env` 与 `db.json` 都不动。

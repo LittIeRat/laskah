@@ -15,5 +15,7 @@ _preview/
 _pack/
 _report.txt
 laskah-src.zip
+_t*.ps1
+_t*.log
 
 .DS_Store

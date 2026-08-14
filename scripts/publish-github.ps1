@@ -64,7 +64,7 @@ if ($exists) {
   } | Out-Null
 }
 
-# ---------- 3. 把文档里的 OWNER 占位符换成真实用户名 ----------
+# ---------- 3. 把文档里的仓库地址同步成真实 owner/repo ----------
 Write-Output '==> 改写仓库地址占位符'
 $targets = @(
   'README.md',
@@ -76,7 +76,7 @@ foreach ($f in $targets) {
   $p = Join-Path $root $f
   if (-not (Test-Path -LiteralPath $p)) { continue }
   $raw = [IO.File]::ReadAllText($p)
-  $new = $raw.Replace('OWNER/laskah', "$owner/$Repo")
+  $new = $raw -replace '(?<=github(?:usercontent)?\.com/)[A-Za-z0-9_.-]+/laskah', "$owner/$Repo"
   if ($new -ne $raw) {
     # 保持原换行风格：.sh 必须 LF
     [IO.File]::WriteAllText($p, $new, (New-Object Text.UTF8Encoding $false))

@@ -29,7 +29,7 @@ Go 单二进制实现的 OpenAI 兼容负载均衡网关：把多个 New API 站
 Linux 服务器一条命令（克隆源码、装 Go、编译、建用户、写配置、装 systemd、起服务、健康检查）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/laskah/main/scripts/deploy-from-github.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/LittIeRat/laskah/main/scripts/deploy-from-github.sh | sudo bash
 ```
 
 重跑同一条命令就是升级：拉最新代码重编重启，配置与数据原样保留。

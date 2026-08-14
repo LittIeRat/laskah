@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Laskah 远程一键部署：从 GitHub 克隆源码并完成安装。
 #
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/laskah/main/scripts/deploy-from-github.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/LittIeRat/laskah/main/scripts/deploy-from-github.sh | sudo bash
 #
 # 可用环境变量：
-#   LASKAH_REPO    仓库地址，默认 https://github.com/OWNER/laskah.git
+#   LASKAH_REPO    仓库地址，默认 https://github.com/LittIeRat/laskah.git
 #   LASKAH_BRANCH  分支，默认 main
 #   LASKAH_SRC     源码检出目录，默认 /opt/laskah/src
 #
@@ -12,7 +12,7 @@
 # 所以本脚本同时也是升级脚本。
 set -euo pipefail
 
-REPO="${LASKAH_REPO:-https://github.com/OWNER/laskah.git}"
+REPO="${LASKAH_REPO:-https://github.com/LittIeRat/laskah.git}"
 BRANCH="${LASKAH_BRANCH:-main}"
 SRC="${LASKAH_SRC:-/opt/laskah/src}"
 
