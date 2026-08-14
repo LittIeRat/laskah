@@ -99,25 +99,34 @@ $hasCommit = $true
 try { git rev-parse --verify HEAD 2>$null | Out-Null; if ($LASTEXITCODE -ne 0) { $hasCommit = $false } } catch { $hasCommit = $false }
 
 if ($staged) {
-  $msg = if ($hasCommit) { 'chore: sync' } else { 'feat: Laskah API 负载均衡网关首次开源' }
+  $msg = if ($hasCommit) { 'docs: 文档填入真实仓库地址' } else { 'feat: Laskah API 负载均衡网关首次开源' }
   git commit -q -m $msg
   Write-Output "==> 已提交: $msg"
 } else {
   Write-Output '==> 无改动可提交'
 }
 
-# ---------- 6. 推送（Token 只用于本次进程，不写入 .git/config） ----------
+# ---------- 6. 推送 ----------
+# Token 只出现在本次 push 的临时 URL 里：不写 remote、不写 .git/config、不进 credential store。
 git remote remove origin 2>$null | Out-Null
 git remote add origin "https://github.com/$full.git"
 git branch -M main | Out-Null
 
 Write-Output '==> 推送到 GitHub'
 $authUrl = "https://${owner}:${Token}@github.com/$full.git"
-git push -u $authUrl main 2>&1 | ForEach-Object { $_ -replace [regex]::Escape($Token), '***' }
+git push $authUrl 'main:main' 2>&1 | ForEach-Object { $_ -replace [regex]::Escape($Token), '***' }
 if ($LASTEXITCODE -ne 0) { throw '推送失败，见上面输出' }
 
-# origin 里保存的是不带凭据的地址，Token 不落盘
-git remote set-url origin "https://github.com/$full.git"
+# 上游指向不带凭据的 origin
+git fetch origin main -q 2>$null | Out-Null
+git branch --set-upstream-to=origin/main main 2>$null | Out-Null
+
+# 自检：确认 Token 没有留在仓库配置里
+$cfg = git config --local --get-regexp '.*' 2>$null
+if ($cfg -and ($cfg -join "`n") -match [regex]::Escape($Token)) {
+  throw '警告：Token 出现在 .git/config 里，请手动清除'
+}
+Write-Output '    Token 未写入仓库配置'
 
 Write-Output ''
 Write-Output "仓库地址   https://github.com/$full"

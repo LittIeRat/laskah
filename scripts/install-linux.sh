@@ -47,7 +47,7 @@ go_version_ok() {
   [ -n "$have" ] || return 1
   want="$GO_MIN"
   # 取两者最小版本，若最小者就是 want 说明 have >= want
-  [ "$(printf '%s\\n%s\\n' "$have" "$want" | sort -V | head -n1)" = "$want" ]
+  [ "$(printf '%s\n%s\n' "$have" "$want" | sort -V | head -n1)" = "$want" ]
 }
 
 install_go() {
