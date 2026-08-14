@@ -12,7 +12,9 @@ param(
   [Parameter(Mandatory = $true)][string] $Token,
   [string] $Repo = 'laskah',
   [string] $Description = 'Laskah — OpenAI 兼容的 API 负载均衡网关，Go 单二进制，多账号自动分配与余额耗尽自动删号',
-  [switch] $Private
+  [switch] $Private,
+  # 留空则在直连不通时自动沿用系统代理（IE/WinINET 设置）
+  [string] $Proxy = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -112,12 +114,38 @@ git remote remove origin 2>$null | Out-Null
 git remote add origin "https://github.com/$full.git"
 git branch -M main | Out-Null
 
+# git 不读 Windows 的系统代理设置。API 能通但 git 连不上时，
+# 沿用 IE/WinINET 里配置的代理，避免 “Could not connect to server”。
+$gitProxyArgs = @()
+if (-not $Proxy) {
+  try {
+    $ie = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction Stop
+    if ($ie.ProxyEnable -eq 1 -and $ie.ProxyServer) {
+      $first = ($ie.ProxyServer -split ';')[0]
+      if ($first -match '=') { $first = ($first -split '=')[1] }
+      $Proxy = if ($first -match '^https?://') { $first } else { "http://$first" }
+    }
+  } catch { }
+}
+if ($Proxy) {
+  $reachable = $false
+  try { $reachable = Test-NetConnection -ComputerName github.com -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue } catch { }
+  if (-not $reachable) {
+    Write-Output "    直连 github.com:443 失败，本次推送走代理 $Proxy"
+    $gitProxyArgs = @('-c', "http.proxy=$Proxy", '-c', "https.proxy=$Proxy")
+  }
+}
+
 Write-Output '==> 推送到 GitHub'
 $authUrl = "https://${owner}:${Token}@github.com/$full.git"
-git push $authUrl 'main:main' 2>&1 | ForEach-Object { $_ -replace [regex]::Escape($Token), '***' }
+git @gitProxyArgs push $authUrl 'main:main' 2>&1 | ForEach-Object { $_ -replace [regex]::Escape($Token), '***' }
 if ($LASTEXITCODE -ne 0) { throw '推送失败，见上面输出' }
 
-# 上游指向不带凭据的 origin
+# 上游指向不带凭据的 origin；代理写进本地配置，方便之后直接 git push
+if ($gitProxyArgs.Count -gt 0) {
+  git config --local http.proxy $Proxy
+  git config --local https.proxy $Proxy
+}
 git fetch origin main -q 2>$null | Out-Null
 git branch --set-upstream-to=origin/main main 2>$null | Out-Null
 

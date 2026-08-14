@@ -201,7 +201,7 @@ sudo LASKAH_AUTO_GO=1 bash scripts/install-linux.sh
 | 现象 | 处理 |
 | --- | --- |
 | 脚本报找不到 `go` | 加 `LASKAH_AUTO_GO=1` 让脚本自动装，或自己装后 `export PATH=/usr/local/go/bin:$PATH` |
-| `git clone` 卡住或超时 | 国内机器访问 GitHub 不稳，换镜像：`LASKAH_REPO=https://ghproxy.net/https://github.com/LittIeRat/laskah.git` |
+| `git clone` 卡住或超时 | 国内机器访问 GitHub 不稳。有代理就 `export https_proxy=http://127.0.0.1:7890` 后重跑；没代理换镜像 `LASKAH_REPO=https://ghproxy.net/https://github.com/LittIeRat/laskah.git` |
 | 脚本报 `$'\r': command not found` | 脚本被 Windows 改成 CRLF 了，`sed -i 's/\r$//' 脚本名` 修掉；仓库里已用 `.gitattributes` 强制 LF |
 | 启动失败 | `sudo journalctl -u laskah -n 50 --no-pager`；多半是 env 写错或 `DATA_FILE` 目录不在 `ReadWritePaths` 里 |
 | 登录页 403 | 反代的 `/admin/*` IP 白名单没改成你的网段 |
