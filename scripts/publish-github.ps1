@@ -1,8 +1,8 @@
 ﻿# 把 Laskah 发布到 GitHub：建仓 -> 改写文档里的仓库占位符 -> 提交 -> 推送。
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File D:\Claude\laskah\scripts\publish-github.ps1 -Token ghp_xxx
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\publish-github.ps1 -Token <你的 PAT>
 #
-# Token 需要 Personal Access Token（classic，勾 `repo` 与 `workflow` 两个 scope）：
+# 需要 Personal Access Token（classic，勾 `repo` 与 `workflow` 两个 scope）：
 #   https://github.com/settings/tokens/new?scopes=repo,workflow&description=laskah-publish
 #
 # GitHub 从 2021-08-13 起彻底停用密码做 Git 与 API 认证，所以只能用 Token。
