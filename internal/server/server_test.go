@@ -1887,3 +1887,51 @@ func TestNonStreamBalanceShortfallInBodySwitchesAccount(t *testing.T) {
 		}
 	}
 }
+
+// TestStreamBalanceShortfallWithoutFallbackReturns503 覆盖「流还没开始下发就发现余额不足，
+// 但没有别的账号可以接手」：此时必须回一个干净的 503，而不是把空的 SSE 流丢给调用方。
+func TestStreamBalanceShortfallWithoutFallbackReturns503(t *testing.T) {
+	h := newHarness(t)
+	quota, used := 5000000.0, 0.0
+	site := fakeSite(t, &quota, &used)
+
+	mode := "error-first"
+	hits := []string{}
+	upstream := streamUpstream(t, &mode, &hits)
+
+	groupID := h.createGroup("团队 A")
+	_, body := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":        "only",
+		"groupId":     groupID,
+		"baseUrl":     upstream.URL + "/v1",
+		"siteUrl":     site.URL,
+		"userId":      "1",
+		"accessToken": "tok",
+		"keys":        "sk-only",
+	})
+	accountID := body["data"].(map[string]any)["id"].(string)
+
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client"})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+
+	payload := chatBody()
+	payload["stream"] = true
+	response, raw := h.doRaw(http.MethodPost, "/v1/chat/completions", payload, secret)
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("无账号可接手时应返回 503: %d %s", response.StatusCode, raw)
+	}
+	if strings.Contains(raw, "text/event-stream") || strings.Contains(raw, "data: ") {
+		t.Fatalf("不应下发半截 SSE: %s", raw)
+	}
+	if contentType := response.Header.Get("Content-Type"); !strings.Contains(contentType, "application/json") {
+		t.Fatalf("失败响应应是 JSON: %s", contentType)
+	}
+
+	// 欠费账号仍然要被删掉。
+	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
+	for _, item := range list["data"].([]any) {
+		if item.(map[string]any)["id"] == accountID {
+			t.Fatalf("欠费账号应被自动删除: %#v", list["data"])
+		}
+	}
+}
