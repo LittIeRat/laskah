@@ -84,23 +84,51 @@ func (d *Data) HealthyAccountProviders(accountID string) int {
 //
 // model 为空时退化为“不限模型”，因此同一个实现可服务通用分配与按模型分配两条路径。
 func (d *Data) healthyProvidersForModel(accountID, model string) int {
+	explicit, loose := d.providerCountsForModel(accountID, model)
+	return explicit + loose
+}
+
+// explicitProvidersForModel 统计账号名下“明确声明过该模型”的可用上游数量。
+//
+// 与 healthyProvidersForModel 的差别是不含模型列表留空的“什么都收”上游：
+// 那类上游只是没设限制，并不代表真的有这个模型。
+func (d *Data) explicitProvidersForModel(accountID, model string) int {
+	explicit, _ := d.providerCountsForModel(accountID, model)
+	return explicit
+}
+
+// providerCountsForModel 一次遍历同时给出两种口径的可用上游数量。
+//
+// explicit 是明确声明该模型的上游数；loose 是模型列表留空、按“不限”接收的上游数。
+// model 为空时全部计入 loose——此时没有模型维度的偏好可言。
+func (d *Data) providerCountsForModel(accountID, model string) (explicit int, loose int) {
 	now := time.Now()
-	count := 0
 	for _, provider := range d.AccountProviders(accountID) {
 		if !provider.Enabled || provider.CooldownUntil.After(now) {
 			continue
 		}
-		if model != "" && !provider.SupportsModel(model) {
+		if model == "" {
+			loose++
 			continue
 		}
-		count++
+		switch {
+		case provider.ExplicitlySupportsModel(model):
+			explicit++
+		case provider.SupportsModel(model):
+			loose++
+		}
 	}
-	return count
+	return explicit, loose
 }
 
 // AccountServesModel 判断账号当前是否能承接该模型的请求。
 func (d *Data) AccountServesModel(accountID, model string) bool {
 	return d.healthyProvidersForModel(accountID, model) > 0
+}
+
+// AccountDeclaresModel 判断账号是否明确声明支持该模型。
+func (d *Data) AccountDeclaresModel(accountID, model string) bool {
+	return d.explicitProvidersForModel(accountID, model) > 0
 }
 
 // AssignAccount 为网关密钥挑选账号：已有且仍可用则保持，否则按负载与余额重新分配。
@@ -112,49 +140,39 @@ func (d *Data) AssignAccount(key *APIKey) *Account {
 
 // AssignAccountForModel 按请求的模型为网关密钥挑选账号。
 //
-// model 非空时，粘性绑定与重新分配都要求账号名下有支持该模型的可用上游：
-// 请求 claude-3-opus 就不能落到只挂了 gpt 系列的账号上，否则必然失败。
+// model 非空时，粘性绑定与重新分配都限定在“能承接该模型的账号”里：
+// 请求 claude-3-opus 就不会落到只挂了 gpt 系列的账号上。
 // 换号只影响本次请求的落点，key.AccountID 仍指向常驻绑定，
 // 避免一次冷门模型请求把密钥永久迁走、打乱既有的均摊结果。
 func (d *Data) AssignAccountForModel(key *APIKey, model string) *Account {
 	if key == nil {
 		return nil
 	}
+
+	pool := d.accountPoolForModel(key.GroupID, model)
+
 	if key.AccountID != "" {
 		current := d.FindAccount(key.AccountID)
 		sameGroup := current != nil && (key.GroupID == "" || current.GroupID == key.GroupID)
-		sticky := sameGroup &&
-			d.GroupEnabled(current.GroupID) &&
-			current.Usable() &&
-			d.healthyProvidersForModel(current.ID, model) > 0
-		if sticky {
+		// 候选池已经过滤过分组启停、账号可用性与模型匹配，命中即可保持粘性。
+		if sameGroup && containsAccount(pool, current.ID) {
 			return current
 		}
-		// 绑定账号只是不支持这个模型时，不解绑：换一个能接的账号跑完这次请求，
+		// 绑定账号本身仍然健康，只是不适合承接这个模型：临时借一个能接的账号，
 		// 常驻绑定留给它本来擅长的模型，避免密钥在模型间来回漂移。
 		if model != "" && sameGroup &&
 			d.GroupEnabled(current.GroupID) &&
 			current.Usable() &&
 			d.HealthyAccountProviders(current.ID) > 0 {
-			return d.pickAccountForModel(key.GroupID, model)
+			return pickFromPool(d, pool, model)
 		}
 		d.detachKeyAccount(key)
 	}
 
-	pool := d.UsableAccountsForModel(key.GroupID, model)
-	if len(pool) == 0 {
+	chosen := pickFromPool(d, pool, model)
+	if chosen == nil {
 		return nil
 	}
-
-	// 排序目标是把密钥摊平到各账号，同时优先用余额更充足、可用 Key 更多的账号：
-	// 1) 每个可用上游承载的密钥数最少 —— 避免把 20 个密钥压在只剩 1 个 Key 的账号上；
-	// 2) 绑定密钥数最少；
-	// 3) 无限额度账号优先于有限额度账号（不会中途耗尽）；
-	// 4) 余额更高；
-	// 5) 创建更早，保证结果稳定可预期。
-	sortAccountPool(d, pool, model)
-
-	chosen := pool[0]
 	key.AccountID = chosen.ID
 	key.UpdatedAt = time.Now().UTC()
 	if d.accountKeyLoad != nil {
@@ -163,14 +181,50 @@ func (d *Data) AssignAccountForModel(key *APIKey, model string) *Account {
 	return chosen
 }
 
-// pickAccountForModel 只为本次请求挑一个能接该模型的账号，不改动密钥的常驻绑定。
-func (d *Data) pickAccountForModel(groupID, model string) *Account {
+// accountPoolForModel 返回本次请求真正应该考虑的账号池。
+//
+// 指定模型时优先只用“明确声明过该模型”的账号；一个都没有才回退到
+// 模型列表留空的“什么都收”账号。没有这层优先级，请求冷门模型时很容易被
+// 分到一个没设模型限制、其实并不提供它的账号上，白跑一次上游。
+func (d *Data) accountPoolForModel(groupID, model string) []*Account {
 	pool := d.UsableAccountsForModel(groupID, model)
+	if model == "" || len(pool) == 0 {
+		return pool
+	}
+	explicit := make([]*Account, 0, len(pool))
+	for _, account := range pool {
+		if d.AccountDeclaresModel(account.ID, model) {
+			explicit = append(explicit, account)
+		}
+	}
+	if len(explicit) > 0 {
+		return explicit
+	}
+	return pool
+}
+
+// pickFromPool 排序候选池并取第一个，池为空时返回 nil。
+func pickFromPool(d *Data, pool []*Account, model string) *Account {
 	if len(pool) == 0 {
 		return nil
 	}
+	// 排序目标是把密钥摊平到各账号，同时优先用余额更充足、可用 Key 更多的账号：
+	// 1) 每个可用上游承载的密钥数最少 —— 避免把 20 个密钥压在只剩 1 个 Key 的账号上；
+	// 2) 绑定密钥数最少；
+	// 3) 无限额度账号优先于有限额度账号（不会中途耗尽）；
+	// 4) 余额更高；
+	// 5) 创建更早，保证结果稳定可预期。
 	sortAccountPool(d, pool, model)
 	return pool[0]
+}
+
+func containsAccount(pool []*Account, accountID string) bool {
+	for _, account := range pool {
+		if account.ID == accountID {
+			return true
+		}
+	}
+	return false
 }
 
 // sortAccountPool 把候选账号按分配优先级排序。

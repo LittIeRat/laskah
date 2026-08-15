@@ -271,14 +271,30 @@ func HostLabel(baseURL string) string {
 }
 
 // SupportsModel 判断上游是否可以处理该模型，支持通配符与别名。
+//
+// 模型列表为空表示“不限”，即接受任何模型。这是宽松匹配，
+// 用于决定一个上游能否被尝试；要判断它是否真的声明了该模型，用 ExplicitlySupportsModel。
 func (p *Provider) SupportsModel(model string) bool {
 	if model == "" {
 		return true
 	}
-	if _, ok := p.ModelMap[model]; ok {
+	if p.ExplicitlySupportsModel(model) {
 		return true
 	}
-	if len(p.Models) == 0 {
+	// 模型列表留空表示“不限”，接受任何模型。
+	return len(p.Models) == 0
+}
+
+// ExplicitlySupportsModel 判断上游是否“明确声明”支持该模型。
+//
+// 与 SupportsModel 的区别只在模型列表为空时：那种账号是“什么都收”，
+// 并不代表它真的有这个模型。分配账号时要优先用明确声明过的账号，
+// 否则「请求 claude-3-opus」很容易落到一个模型列表留空、其实只挂了 gpt Key 的账号上。
+func (p *Provider) ExplicitlySupportsModel(model string) bool {
+	if model == "" {
+		return false
+	}
+	if _, ok := p.ModelMap[model]; ok {
 		return true
 	}
 	for _, pattern := range p.Models {

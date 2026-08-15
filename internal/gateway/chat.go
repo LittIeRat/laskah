@@ -767,7 +767,32 @@ func (g *Gateway) orderedProviders(model string, session Session) []*store.Provi
 		}
 		snapshot = append(snapshot, data.Providers...)
 	})
-	return g.Balancer.Order(snapshot, balancer.Criteria{Model: model, ProviderIDs: session.ProviderIDs})
+	ordered := g.Balancer.Order(snapshot, balancer.Criteria{Model: model, ProviderIDs: session.ProviderIDs})
+	return preferDeclaredModel(ordered, model)
+}
+
+// preferDeclaredModel 把“明确声明该模型”的上游排到前面。
+//
+// Balancer 已按策略排好序，这里只做一次稳定的两分区：模型列表留空的上游
+// 属于“什么都收”，真实提供情况未知，应该留作兜底而不是首选。
+// 全部都是同一类时返回原切片，不产生额外分配。
+func preferDeclaredModel(providers []*store.Provider, model string) []*store.Provider {
+	if model == "" || len(providers) <= 1 {
+		return providers
+	}
+	declared := make([]*store.Provider, 0, len(providers))
+	fallback := []*store.Provider{}
+	for _, provider := range providers {
+		if provider.ExplicitlySupportsModel(model) {
+			declared = append(declared, provider)
+			continue
+		}
+		fallback = append(fallback, provider)
+	}
+	if len(declared) == 0 || len(fallback) == 0 {
+		return providers
+	}
+	return append(declared, fallback...)
 }
 
 func (g *Gateway) decodeResponse(response *Response, provider *store.Provider, model string) (map[string]any, balancer.Usage, error) {

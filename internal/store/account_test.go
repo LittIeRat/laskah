@@ -850,3 +850,101 @@ func TestAssignAccountSkipsAccountsBelowFloor(t *testing.T) {
 		t.Fatalf("改派后应更新常驻绑定: %s", bound.AccountID)
 	}
 }
+
+// TestExplicitlySupportsModelVsSupportsModel 划清“明确声明”与“不限模型”的边界。
+func TestExplicitlySupportsModelVsSupportsModel(t *testing.T) {
+	catchAll, _ := BuildProvider(ProviderInput{BaseURL: "https://a.example.com"})
+	if !catchAll.SupportsModel("claude-3-opus") {
+		t.Fatalf("模型列表留空应接受任何模型")
+	}
+	if catchAll.ExplicitlySupportsModel("claude-3-opus") {
+		t.Fatalf("留空不等于声明支持该模型")
+	}
+
+	declared, _ := BuildProvider(ProviderInput{BaseURL: "https://b.example.com", Models: "gpt-4*,claude-3-opus"})
+	if !declared.ExplicitlySupportsModel("claude-3-opus") || !declared.ExplicitlySupportsModel("gpt-4o") {
+		t.Fatalf("精确名与通配符都应算明确声明")
+	}
+	if declared.ExplicitlySupportsModel("gemini-1.5-pro") || declared.SupportsModel("gemini-1.5-pro") {
+		t.Fatalf("未声明的模型不应匹配")
+	}
+	if declared.ExplicitlySupportsModel("") {
+		t.Fatalf("空模型名不算明确声明")
+	}
+
+	aliased, _ := BuildProvider(ProviderInput{BaseURL: "https://c.example.com", Models: "gpt-4o", ModelMap: map[string]string{"opus": "claude-3-opus"}})
+	if !aliased.ExplicitlySupportsModel("opus") {
+		t.Fatalf("别名应算明确声明")
+	}
+}
+
+// TestAssignAccountPrefersAccountDeclaringModel 是本轮需求的核心：
+// 请求某个模型时，优先用「明确挂了这个模型」的账号，而不是模型列表留空的兜底账号。
+func TestAssignAccountPrefersAccountDeclaringModel(t *testing.T) {
+	declared := newAccount(t, "declared", 10)
+	catchAll := newAccount(t, "catch-all", 999)
+
+	data := newTestData(declared, catchAll)
+	// declared 只挂 claude；catchAll 不设模型限制，什么都收。
+	claude, _ := BuildProvider(ProviderInput{BaseURL: "https://claude.example.com", AccountID: declared.ID, Models: "claude-3-opus"})
+	loose, _ := BuildProvider(ProviderInput{BaseURL: "https://any.example.com", AccountID: catchAll.ID})
+	data.Providers = append(data.Providers, claude, loose)
+	data.reindex()
+
+	if !data.AccountDeclaresModel(declared.ID, "claude-3-opus") {
+		t.Fatalf("declared 账号应算明确声明")
+	}
+	if data.AccountDeclaresModel(catchAll.ID, "claude-3-opus") {
+		t.Fatalf("留空的账号不应算明确声明")
+	}
+
+	// 即便 catchAll 余额高得多（排序上更占优），claude 请求也要落到明确声明的账号。
+	for index := 0; index < 3; index++ {
+		key, _ := BuildKey(KeyInput{Name: "k"})
+		data.Keys = append(data.Keys, key)
+		data.reindex()
+		account := data.AssignAccountForModel(key, "claude-3-opus")
+		if account == nil || account.ID != declared.ID {
+			t.Fatalf("第 %d 次应命中明确声明该模型的账号: %#v", index+1, account)
+		}
+	}
+
+	// 没有账号明确声明的模型才回退到兜底账号。
+	key, _ := BuildKey(KeyInput{Name: "fallback"})
+	data.Keys = append(data.Keys, key)
+	data.reindex()
+	if account := data.AssignAccountForModel(key, "gemini-1.5-pro"); account == nil || account.ID != catchAll.ID {
+		t.Fatalf("无人声明时应回退到不限模型的账号: %#v", account)
+	}
+}
+
+// TestAssignAccountForModelBorrowsWithoutRebinding 保证「临时借号」不改写常驻绑定。
+//
+// 绑定在兜底账号上的密钥请求 claude 时应借用声明了 claude 的账号跑完这次请求，
+// key.AccountID 不能被改掉，否则一次冷门模型请求就把密钥永久迁走了。
+func TestAssignAccountForModelBorrowsWithoutRebinding(t *testing.T) {
+	catchAll := newAccount(t, "catch-all", 50)
+	declared := newAccount(t, "declared", 10)
+
+	data := newTestData(catchAll, declared)
+	loose, _ := BuildProvider(ProviderInput{BaseURL: "https://any.example.com", AccountID: catchAll.ID})
+	claude, _ := BuildProvider(ProviderInput{BaseURL: "https://claude.example.com", AccountID: declared.ID, Models: "claude-3-opus"})
+	data.Providers = append(data.Providers, loose, claude)
+
+	key, _ := BuildKey(KeyInput{Name: "bound"})
+	key.AccountID = catchAll.ID
+	data.Keys = append(data.Keys, key)
+	data.reindex()
+
+	if account := data.AssignAccountForModel(key, "claude-3-opus"); account == nil || account.ID != declared.ID {
+		t.Fatalf("应借用声明了该模型的账号: %#v", account)
+	}
+	if key.AccountID != catchAll.ID {
+		t.Fatalf("常驻绑定不应被改写: %s", key.AccountID)
+	}
+
+	// 不限模型的请求仍然走常驻绑定。
+	if account := data.AssignAccountForModel(key, ""); account == nil || account.ID != catchAll.ID {
+		t.Fatalf("未指定模型时应保持粘性: %#v", account)
+	}
+}

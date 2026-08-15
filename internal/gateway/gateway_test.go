@@ -404,3 +404,38 @@ func TestBalanceExhaustedInPayload(t *testing.T) {
 		t.Fatalf("nil 不应触发")
 	}
 }
+
+// TestPreferDeclaredModel 验证账号内部的上游排序：明确声明该模型的 Key 排在前面。
+//
+// 模型列表留空的上游属于“什么都收”，真实提供情况未知，只能当兜底。
+func TestPreferDeclaredModel(t *testing.T) {
+	loose := &store.Provider{ID: "loose", BaseURL: "https://a", Models: []string{}}
+	declared := &store.Provider{ID: "declared", BaseURL: "https://b", Models: []string{"claude-3-opus"}}
+	wildcard := &store.Provider{ID: "wildcard", BaseURL: "https://c", Models: []string{"claude-3*"}}
+
+	ordered := preferDeclaredModel([]*store.Provider{loose, declared, wildcard}, "claude-3-opus")
+	if len(ordered) != 3 {
+		t.Fatalf("不应丢弃候选: %d", len(ordered))
+	}
+	if ordered[0].ID != "declared" || ordered[1].ID != "wildcard" || ordered[2].ID != "loose" {
+		t.Fatalf("声明该模型的上游应排在兜底之前: %s %s %s", ordered[0].ID, ordered[1].ID, ordered[2].ID)
+	}
+
+	// 全是兜底或全是声明时保持原顺序，不做额外分配。
+	onlyLoose := []*store.Provider{loose, {ID: "loose2", Models: []string{}}}
+	if got := preferDeclaredModel(onlyLoose, "claude-3-opus"); got[0].ID != "loose" || got[1].ID != "loose2" {
+		t.Fatalf("同类候选应保持原顺序: %#v", got)
+	}
+	onlyDeclared := []*store.Provider{declared, wildcard}
+	if got := preferDeclaredModel(onlyDeclared, "claude-3-opus"); got[0].ID != "declared" || got[1].ID != "wildcard" {
+		t.Fatalf("同类候选应保持原顺序: %#v", got)
+	}
+
+	// 未指定模型或单个候选时原样返回。
+	if got := preferDeclaredModel([]*store.Provider{loose, declared}, ""); got[0].ID != "loose" {
+		t.Fatalf("未指定模型不应重排")
+	}
+	if got := preferDeclaredModel([]*store.Provider{loose}, "claude-3-opus"); len(got) != 1 {
+		t.Fatalf("单候选应原样返回")
+	}
+}

@@ -1935,3 +1935,80 @@ func TestStreamBalanceShortfallWithoutFallbackReturns503(t *testing.T) {
 		}
 	}
 }
+
+// TestModelRoutingPrefersAccountDeclaringModel 端到端验证：
+// 一个账号明确勾选了 claude，另一个账号没勾任何模型（“什么都收”），
+// 请求 claude 必须落到明确声明的那个账号，而不是余额更高的兜底账号。
+func TestModelRoutingPrefersAccountDeclaringModel(t *testing.T) {
+	h := newHarness(t)
+	declaredQuota, declaredUsed := 5000000.0, 0.0
+	looseQuota, looseUsed := 500000000.0, 0.0
+	declaredSite := fakeSite(t, &declaredQuota, &declaredUsed)
+	looseSite := fakeSite(t, &looseQuota, &looseUsed)
+	declaredHits := []string{}
+	looseHits := []string{}
+	declaredUpstream := fakeUpstream(t, &declaredHits)
+	looseUpstream := fakeUpstream(t, &looseHits)
+
+	groupID := h.createGroup("团队 A")
+
+	// 明确勾选 claude-3-opus 的账号，余额较低。
+	if response, body := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":           "claude-declared",
+		"groupId":        groupID,
+		"baseUrl":        declaredUpstream.URL + "/v1",
+		"siteUrl":        declaredSite.URL,
+		"userId":         "1",
+		"accessToken":    "tok",
+		"keys":           "sk-declared",
+		"selectedModels": []string{"claude-3-opus"},
+	}); response.StatusCode != http.StatusCreated {
+		t.Fatalf("创建声明账号失败: %d %#v", response.StatusCode, body)
+	}
+
+	// 不勾任何模型的兜底账号，余额高得多（排序上本来更占优）。
+	if response, body := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":        "catch-all",
+		"groupId":     groupID,
+		"baseUrl":     looseUpstream.URL + "/v1",
+		"siteUrl":     looseSite.URL,
+		"userId":      "2",
+		"accessToken": "tok",
+		"keys":        "sk-loose",
+	}); response.StatusCode != http.StatusCreated {
+		t.Fatalf("创建兜底账号失败: %d %#v", response.StatusCode, body)
+	}
+
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client", "groupId": groupID})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+
+	claudePayload := map[string]any{
+		"model":    "claude-3-opus",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}
+	for index := 0; index < 3; index++ {
+		if response, chat := h.do(http.MethodPost, "/v1/chat/completions", claudePayload, secret); response.StatusCode != http.StatusOK {
+			t.Fatalf("第 %d 次 claude 调用失败: %d %#v", index+1, response.StatusCode, chat)
+		}
+	}
+	if len(declaredHits) != 3 {
+		t.Fatalf("claude 请求应全部落到声明该模型的账号: %#v", declaredHits)
+	}
+	if len(looseHits) != 0 {
+		t.Fatalf("不应落到没声明模型的兜底账号: %#v", looseHits)
+	}
+
+	// 没有账号声明的模型才回退到兜底账号。
+	if response, chat := h.do(http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":    "gemini-1.5-pro",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, secret); response.StatusCode != http.StatusOK {
+		t.Fatalf("无人声明的模型应回退到兜底账号: %d %#v", response.StatusCode, chat)
+	}
+	if len(looseHits) != 1 || looseHits[0] != "sk-loose" {
+		t.Fatalf("回退应命中兜底账号: %#v", looseHits)
+	}
+	if len(declaredHits) != 3 {
+		t.Fatalf("回退不应打扰声明账号: %#v", declaredHits)
+	}
+}
