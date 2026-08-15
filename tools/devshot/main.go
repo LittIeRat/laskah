@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -34,18 +35,34 @@ func main() {
 	theme := flag.String("theme", "", "预设主题：light / dark / auto，留空则不干预")
 	pages := flag.String("pages", "", "要截取的路径，逗号分隔；留空按登录态自动选择")
 	eval := flag.String("eval", "", "截图前在页面里执行的 JS（用于展开弹窗等交互态）")
+	evalFile := flag.String("eval-file", "", "从文件读取 -eval 的脚本，避免 shell 吃掉引号")
+	drag := flag.String("drag", "", "eval 之后派发一次真实鼠标拖拽：x1,y1,x2,y2（用于验证拖选等交互）")
+	after := flag.String("after", "", "拖拽之后再执行的 JS（用于断言交互结果）")
+	afterFile := flag.String("after-file", "", "从文件读取 -after 的脚本")
 	suffix := flag.String("suffix", "", "输出文件名附加后缀")
 	width := flag.Int("width", 1440, "视口宽度")
 	height := flag.Int("height", 960, "视口高度")
 	flag.Parse()
 
-	if err := run(*base, *user, *password, *devtools, *out, *theme, *pages, *eval, *suffix, *width, *height); err != nil {
+	// PowerShell 向原生命令传参会吞掉字符串里的双引号，脚本稍长就必须走文件。
+	evalScript, err := resolveScript(*eval, *evalFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "devshot 失败:", err)
+		os.Exit(1)
+	}
+	afterScript, err := resolveScript(*after, *afterFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "devshot 失败:", err)
+		os.Exit(1)
+	}
+
+	if err := run(*base, *user, *password, *devtools, *out, *theme, *pages, evalScript, *drag, afterScript, *suffix, *width, *height); err != nil {
 		fmt.Fprintln(os.Stderr, "devshot 失败:", err)
 		os.Exit(1)
 	}
 }
 
-func run(base, user, password, devtools, out, theme, pages, eval, suffix string, width, height int) error {
+func run(base, user, password, devtools, out, theme, pages, eval, drag, after, suffix string, width, height int) error {
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		return err
 	}
@@ -134,10 +151,41 @@ func run(base, user, password, devtools, out, theme, pages, eval, suffix string,
 		time.Sleep(1400 * time.Millisecond)
 
 		if eval != "" {
-			if _, err := client.Call("Runtime.evaluate", map[string]any{"expression": eval, "awaitPromise": true}); err != nil {
+			raw, err := client.Call("Runtime.evaluate", map[string]any{
+				"expression":    eval,
+				"awaitPromise":  true,
+				"returnByValue": true,
+			})
+			if err != nil {
 				return err
 			}
+			// 打印表达式的返回值，方便用脚本断言交互态而不是只靠肉眼看截图。
+			if summary := evalSummary(raw); summary != "" {
+				fmt.Printf("eval %s => %s\n", page, summary)
+			}
 			time.Sleep(900 * time.Millisecond)
+		}
+
+		if drag != "" {
+			if err := dispatchDrag(client, drag); err != nil {
+				return err
+			}
+			time.Sleep(400 * time.Millisecond)
+		}
+
+		if after != "" {
+			raw, err := client.Call("Runtime.evaluate", map[string]any{
+				"expression":    after,
+				"awaitPromise":  true,
+				"returnByValue": true,
+			})
+			if err != nil {
+				return err
+			}
+			if summary := evalSummary(raw); summary != "" {
+				fmt.Printf("after %s => %s\n", page, summary)
+			}
+			time.Sleep(300 * time.Millisecond)
 		}
 
 		result, err := client.Call("Page.captureScreenshot", map[string]any{
@@ -172,6 +220,86 @@ func run(base, user, password, devtools, out, theme, pages, eval, suffix string,
 		fmt.Printf("已保存 %s (%d 字节)\n", file, len(raw))
 	}
 	return nil
+}
+
+// resolveScript 优先返回文件内容，并剥掉 UTF-8 BOM。
+//
+// PowerShell 写出的 UTF-8 文件默认带 BOM，直接注入会让 V8 报语法错误。
+func resolveScript(inline, file string) (string, error) {
+	if strings.TrimSpace(file) == "" {
+		return inline, nil
+	}
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		return "", fmt.Errorf("读取脚本文件失败: %w", err)
+	}
+	return strings.TrimPrefix(string(raw), "\ufeff"), nil
+}
+
+// dispatchDrag 用 Input 域派发一次真实的按下-移动-松开，spec 为 "x1,y1,x2,y2"。
+//
+// 合成 PointerEvent 无法复现浏览器把 click 派发到共同祖先的行为，
+// 而弹窗里「拖选文本却把窗口关掉」这类问题恰好取决于这一点，所以要走真实事件。
+func dispatchDrag(client *conn, spec string) error {
+	parts := strings.Split(spec, ",")
+	if len(parts) != 4 {
+		return fmt.Errorf("drag 需要 4 个坐标，收到 %q", spec)
+	}
+	points := make([]int, 4)
+	for index, part := range parts {
+		value, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil {
+			return fmt.Errorf("drag 坐标 %q 不是整数: %w", part, err)
+		}
+		points[index] = value
+	}
+
+	steps := []map[string]any{
+		{"type": "mousePressed", "x": points[0], "y": points[1], "button": "left", "buttons": 1, "clickCount": 1},
+		{"type": "mouseMoved", "x": (points[0] + points[2]) / 2, "y": (points[1] + points[3]) / 2, "button": "left", "buttons": 1},
+		{"type": "mouseMoved", "x": points[2], "y": points[3], "button": "left", "buttons": 1},
+		{"type": "mouseReleased", "x": points[2], "y": points[3], "button": "left", "buttons": 0, "clickCount": 1},
+	}
+	for _, step := range steps {
+		if _, err := client.Call("Input.dispatchMouseEvent", step); err != nil {
+			return err
+		}
+		time.Sleep(60 * time.Millisecond)
+	}
+	return nil
+}
+
+// evalSummary 从 Runtime.evaluate 的响应里提取可读的返回值或异常信息。
+func evalSummary(raw []byte) string {
+	payload := struct {
+		Result struct {
+			Type        string          `json:"type"`
+			Description string          `json:"description"`
+			Value       json.RawMessage `json:"value"`
+		} `json:"result"`
+		ExceptionDetails *struct {
+			Text      string `json:"text"`
+			Exception *struct {
+				Description string `json:"description"`
+			} `json:"exception"`
+		} `json:"exceptionDetails"`
+	}{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	if payload.ExceptionDetails != nil {
+		if payload.ExceptionDetails.Exception != nil && payload.ExceptionDetails.Exception.Description != "" {
+			return "异常: " + payload.ExceptionDetails.Exception.Description
+		}
+		return "异常: " + payload.ExceptionDetails.Text
+	}
+	if len(payload.Result.Value) > 0 {
+		return string(payload.Result.Value)
+	}
+	if payload.Result.Description != "" {
+		return payload.Result.Description
+	}
+	return payload.Result.Type
 }
 
 // login 用管理面接口换取会话 Cookie。

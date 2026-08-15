@@ -400,10 +400,32 @@
         confirmButton.textContent = label;
       }
     });
-    overlay.addEventListener("click", function (event) {
-      if (event.target === overlay) {
-        closeModal();
+    // 点遮罩空白处关闭弹窗，但要求按下与松开都发生在遮罩本身。
+    //
+    // 不能只看 click 的 target：在面板里按住鼠标拖选文本、松手时指针已经移出面板，
+    // click 会派发到按下点与松开点的共同祖先（也就是遮罩），弹窗于是被当成
+    // 「点了背景」直接关掉，用户填好的表单一起丢。改成配对判定 pointerdown /
+    // pointerup 就能把这类跨元素拖拽排除在关闭条件之外。
+    var pressedOnOverlay = false;
+    overlay.addEventListener("pointerdown", function (event) {
+      // 只认主键：右键菜单与中键不参与关闭判定。
+      pressedOnOverlay = event.target === overlay && event.button === 0;
+    });
+    overlay.addEventListener("pointercancel", function () {
+      pressedOnOverlay = false;
+    });
+    overlay.addEventListener("pointerup", function (event) {
+      var startedOnOverlay = pressedOnOverlay;
+      pressedOnOverlay = false;
+      if (!startedOnOverlay || event.target !== overlay || event.button !== 0) {
+        return;
       }
+      // 起止点都在遮罩上但存在选区，说明这是一次拖选，保留弹窗与选中的文本。
+      var selection = window.getSelection ? window.getSelection() : null;
+      if (selection && !selection.isCollapsed) {
+        return;
+      }
+      closeModal();
     });
 
     document.body.appendChild(overlay);
@@ -435,7 +457,8 @@
   }
 
   document.addEventListener("keydown", function (event) {
-    if (event.key === "Escape") {
+    // 输入法组字中按 Esc 只是取消候选词，不应连带关掉弹窗丢掉已填内容。
+    if (event.key === "Escape" && !event.isComposing) {
       closeModal();
     }
   });

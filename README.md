@@ -172,6 +172,11 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 批量粘贴支持每行一个 Key，同行内可用空白 / 逗号 / 分号分隔多个，`#` 与 `//` 开头为注释，
 自动去重。超过 5 条的部分出现在响应 `skipped` 里并在界面提示，不会静默丢弃。
 
+弹窗只在两种情况下关闭：点「取消」/「确定」，或**在遮罩空白处完整点击一次**。
+在输入框里拖选文本、把鼠标拖出面板再松手不会关闭弹窗（关闭判定要求 `pointerdown`
+与 `pointerup` 都落在遮罩上且没有选区），已填的内容不会因为选文本而丢失。
+输入法组字时按 Esc 只取消候选词，不关弹窗。
+
 **未配置额度查询的账号显示「∞ 无限余额」**：既不参与金额汇总（避免 0 余额把总额拉低），
 也不会被余额清理逻辑删掉，刷新时直接返回无限结果、不打上游。
 
@@ -381,9 +386,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\start-chrome.ps1
 go run .\tools\devshot -user "<超管账户>" -password "<口令>" -pages "/dashboard,/manage" -theme dark -out _preview
 ```
 
+弹窗交互验证（需要上面的 Chrome 与本地实例；用 CDP 派发真实鼠标拖拽，
+合成事件复现不了浏览器把 `click` 派发到共同祖先的行为）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check-modal.ps1
+```
+
 本地脚本一览：`scripts/build.sh`（Linux 编译）、`scripts/install-linux.sh`（安装 / 升级）、
 `scripts/deploy-from-github.sh`（远程一键部署）、`scripts/build.ps1` / `start-local.ps1` /
-`stop-local.ps1` / `smoke-local.ps1` / `start-chrome.ps1`（Windows 开发）、
+`stop-local.ps1` / `smoke-local.ps1` / `start-chrome.ps1` / `check-modal.ps1`（Windows 开发）、
 `scripts/pack-src.ps1`（打不含数据的源码包）、`scripts/publish-github.ps1`（发布到 GitHub）。
 
 Go 测试覆盖：账号构建与余额判定、$0.50 安全线的边界判定、请求时刷新窗口、5 个 API 上限、
