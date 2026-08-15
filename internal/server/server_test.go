@@ -2012,3 +2012,60 @@ func TestModelRoutingPrefersAccountDeclaringModel(t *testing.T) {
 		t.Fatalf("回退不应打扰声明账号: %#v", declaredHits)
 	}
 }
+
+// TestPasswordResetWithWhitespaceStillLogsIn 复现报障：超管在 /manage 重置口令后登不进去。
+//
+// 从密码管理器粘贴的口令常带尾随空格或换行；前端不做 trim，
+// 若服务端写入与校验的归一化规则不一致，账户就会被锁死。
+func TestPasswordResetWithWhitespaceStillLogsIn(t *testing.T) {
+	h := newHarness(t)
+	if response, _ := h.login(testSuperUser, testSuperPassword); response.StatusCode != http.StatusOK {
+		t.Fatalf("超管登录失败")
+	}
+
+	_, created := h.do(http.MethodPost, "/admin/users", map[string]any{
+		"user": "viewer", "password": "viewer-password", "role": "admin",
+	}, "")
+	viewerID := created["data"].(map[string]any)["id"].(string)
+
+	// 超管重置他人口令：新口令带尾随空格。
+	if response, body := h.do(http.MethodPost, "/admin/users/"+viewerID+"/password", map[string]any{
+		"password": "viewer-reset-1  ", "confirm": "viewer-reset-1  ",
+	}, ""); response.StatusCode != http.StatusOK {
+		t.Fatalf("重置口令失败: %d %#v", response.StatusCode, body)
+	}
+	superCSRF := h.csrf
+	for _, candidate := range []string{"viewer-reset-1", "viewer-reset-1  "} {
+		if response, body := h.login("viewer", candidate); response.StatusCode != http.StatusOK {
+			t.Fatalf("口令 %q 应可登录: %d %#v", candidate, response.StatusCode, body)
+		}
+	}
+	h.csrf = superCSRF
+
+	// 超管改自己的密码：新口令带尾随换行，之后用干净口令登录。
+	if response, _ := h.login(testSuperUser, testSuperPassword); response.StatusCode != http.StatusOK {
+		t.Fatalf("超管重新登录失败")
+	}
+	if response, body := h.do(http.MethodPost, "/admin/password", map[string]any{
+		"current": testSuperPassword, "next": "super-reset-1\n",
+	}, ""); response.StatusCode != http.StatusOK {
+		t.Fatalf("超管改密失败: %d %#v", response.StatusCode, body)
+	}
+	h.csrf = ""
+	if response, body := h.login(testSuperUser, "super-reset-1"); response.StatusCode != http.StatusOK {
+		t.Fatalf("超管改密后应能用新口令登录: %d %#v", response.StatusCode, body)
+	}
+}
+
+// TestSetupPasswordWithWhitespaceLogsIn 覆盖 /setup 创建超管时带空白的口令。
+func TestSetupPasswordWithWhitespaceLogsIn(t *testing.T) {
+	h := newBareHarness(t)
+	if response, body := h.do(http.MethodPost, "/admin/setup", map[string]any{
+		"user": " Digital Gleam ", "password": " setup-password-1 ", "confirm": " setup-password-1 ",
+	}, ""); response.StatusCode != http.StatusCreated {
+		t.Fatalf("初始化失败: %d %#v", response.StatusCode, body)
+	}
+	if response, body := h.login("Digital Gleam", "setup-password-1"); response.StatusCode != http.StatusOK {
+		t.Fatalf("初始化后应可登录: %d %#v", response.StatusCode, body)
+	}
+}

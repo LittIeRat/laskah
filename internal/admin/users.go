@@ -82,11 +82,12 @@ func (h *Handler) resetUserPassword(w http.ResponseWriter, r *http.Request, id s
 		httpx.Error(w, httpx.StatusOf(err, http.StatusBadRequest), err.Error(), nil)
 		return
 	}
-	if payload.Confirm != "" && payload.Confirm != payload.Password {
+	if payload.Confirm != "" && store.NormalizePassword(payload.Confirm) != store.NormalizePassword(payload.Password) {
 		httpx.Error(w, http.StatusBadRequest, "两次输入的密码不一致", nil)
 		return
 	}
-	if err := h.Store.SetAdminPassword(id, strings.TrimSpace(payload.Password)); err != nil {
+	// 归一化统一交给 store：这里再自行 TrimSpace 会让两处规则漂移。
+	if err := h.Store.SetAdminPassword(id, payload.Password); err != nil {
 		httpx.Error(w, http.StatusBadRequest, err.Error(), nil)
 		return
 	}

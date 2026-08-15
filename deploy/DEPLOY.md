@@ -207,9 +207,32 @@ sudo systemctl reload caddy
 - 账户名以 AES-256-GCM 密文 + SHA-256 摘要落盘，服务端**无法反查出明文**
 - 密码只存 PBKDF2-SHA256（240000 轮）散列，同样不可逆
 - 终端横幅与日志刻意不打印任何账户名或口令
-- 忘记凭据只能重置：停服 → 删除 `db.json` 里的 `config.users` → 重启后重新 `/setup`
+
+口令至少 8 个字符，**首尾空白一律忽略**：创建、改密、重置、登录共用同一个归一化规则，
+所以从密码管理器粘贴带上的尾随空格或换行不会导致改密后登不进去；中间的空格是有效字符。
 
 初始化完成后 `/setup` 自动失效（重复提交返回 409），只能从 `/login` 进入。
+
+### 忘记口令的恢复流程
+
+不需要清库重装，用二进制自带的子命令重置（只能在服务器本机执行，需要数据文件与主密钥）：
+
+```bash
+sudo systemctl stop laskah                       # 必须先停：运行中的进程会把内存态盖回磁盘
+sudo -u laskah /opt/laskah/laskah list-admins    # 列出账户（账户名脱敏）
+sudo -u laskah /opt/laskah/laskah reset-password 'Digital Gleam' '新口令至少八位'
+sudo systemctl start laskah
+```
+
+若 `DATA_FILE` / `MASTER_KEY` 写在 `/etc/laskah/laskah.env`，执行时要把它们带上：
+
+```bash
+sudo -u laskah env $(grep -E '^(DATA_FILE|MASTER_KEY)=' /etc/laskah/laskah.env | xargs) \
+  /opt/laskah/laskah reset-password 'Digital Gleam' '新口令至少八位'
+```
+
+重置会顺带把该账户置为启用状态，避免「口令对了但账户被禁用」的二次卡死。
+只有连一个超管账户都不剩时才需要走「删除 `db.json` 里的 `config.users` → 重新 `/setup`」。
 
 ### 角色分级
 
@@ -379,7 +402,8 @@ sudo systemctl restart laskah
 | --- | --- |
 | 启动即退出 | `journalctl -u laskah -n 50`。常见是 `DATA_FILE` 不在 `ReadWritePaths` 里 |
 | 访问总是跳 `/setup` | 还没创建超级管理员，或数据文件被换成了空库 |
-| 登录报 429 | 触发限速，等 15 分钟或重启服务清空计数 |
+| 登录报 429 | 触发限速（10 分钟 5 次失败锁 15 分钟），响应里带剩余分钟数；等待或重启服务清空计数 |
+| 改密或重置后新口令登不进去 | 先排除 429 锁定（连试多次会被锁），再用 `laskah reset-password` 重置。口令首尾空白被忽略，不要把空格算进口令 |
 | 流式响应一次性吐出 | 代理没关缓冲。Nginx 查 `proxy_buffering off`，Caddy 查 `flush_interval -1` |
 | 上游一直 502 | `/manage` 看账号是否被自动删号；检查 Base URL 是否多写了 `/chat/completions` |
 | 余额显示「∞ 无限」 | 该账号没配额度查询，属预期行为 |

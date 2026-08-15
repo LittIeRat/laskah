@@ -63,6 +63,28 @@ powershell -NoProfile -File scripts\stop-local.ps1
 
 旧地址 `/keys` 301 重定向到 `/dashboard`。
 
+### 口令规则
+
+口令至少 8 个字符，**首尾空白（空格、Tab、换行）一律忽略**：创建、改密、重置与登录
+都走同一个归一化函数，所以从密码管理器粘贴时带上的尾随空格不会让你事后登不进去。
+口令中间的空格是有效字符，会被完整保留。
+
+### 忘记口令 / 改密后登不进去
+
+在服务器上用二进制自带的子命令重置，不需要清库重装：
+
+```bash
+sudo systemctl stop laskah                       # 先停服务，否则内存态会盖回磁盘
+sudo -u laskah /opt/laskah/laskah list-admins    # 确认要重置哪个账户（账户名脱敏）
+sudo -u laskah /opt/laskah/laskah reset-password 'Digital Gleam' '新口令至少八位'
+sudo systemctl start laskah
+```
+
+子命令必须读到同一份 `DATA_FILE` 与 `MASTER_KEY`（用 systemd 部署时把
+`EnvironmentFile=/etc/laskah/laskah.env` 对应的变量带上）。重置会顺带把该账户置为启用。
+连续输错 5 次会触发 15 分钟来源锁定，此时即使口令正确也会返回 429——
+响应里带剩余分钟数，等待即可，或重启服务清空内存计数。
+
 ## 角色分级
 
 | 角色 | 可访问 |
@@ -304,7 +326,9 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 - 口令 PBKDF2-SHA256 240000 轮；账户不存在时也跑一次等价耗时的假校验，抹平时间侧信道。
 - 超级管理员账户名 AES-256-GCM 加密落盘 + SHA-256 摘要索引，**不可反查**；不区分「账号不存在 / 被禁用 / 口令错误」，防账户枚举。
-- 登录失败按来源 IP 限速：10 分钟 5 次锁 15 分钟；`/admin/setup` 同样受限速保护。
+- 登录失败按来源 IP 限速：10 分钟 5 次锁 15 分钟，429 响应里给出剩余分钟数；`/admin/setup` 同样受限速保护。
+- 口令归一化只做一次且写入与校验共用（`store.NormalizePassword`），不存在「设置时剪空白、登录时不剪」这类把账户锁死的不对称。
+- 口令重置只有两条路径：超管在 `/manage` 重置，或运维在服务器本机跑 `laskah reset-password`（需要数据文件与主密钥，远程不可用）。
 - 会话只在内存、只存令牌摘要；HttpOnly + Secure + SameSite=Strict，8 小时绝对过期 / 90 分钟空闲过期；改密或停用账户立即注销相关会话。
 - Cookie 会话的写请求校验 `X-CSRF-Token`；Bearer 令牌调用不依赖 Cookie，不受 CSRF 影响。
 - 数据文件里上游 API Key、网关密钥、access_token 全部 AES-256-GCM 加密，主密钥来自 `MASTER_KEY` 或随机生成的 `db.master.key`（`0600`）。
@@ -344,7 +368,7 @@ go vet ./...
 go test ./... -count=1
 ```
 
-接口级冒烟，38 项断言（Windows；会重置本地数据并留下一套演示数据）：
+接口级冒烟，40 项断言（Windows；会重置本地数据并留下一套演示数据）：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-local.ps1

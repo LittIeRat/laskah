@@ -509,3 +509,92 @@ func TestSplitListAndMustString(t *testing.T) {
 		t.Fatalf("MustString 转换错误")
 	}
 }
+
+// TestPasswordNormalizationKeepsLoginWorking 复现“重置口令后登不进去”的报障。
+//
+// 历史实现里写入口令时剪掉首尾空白、校验时却按原串比较，
+// 粘贴带尾随空格或换行的口令就会造成账户被锁死。
+func TestPasswordNormalizationKeepsLoginWorking(t *testing.T) {
+	t.Setenv("MASTER_KEY", "unit-test-master-key")
+	dataStore := New(filepath.Join(t.TempDir(), "db.json"))
+	if err := dataStore.Load(); err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	super, err := dataStore.CreateSuperAdmin("Digital Gleam", "  sup3r-secret  ")
+	if err != nil {
+		t.Fatalf("创建超级管理员失败: %v", err)
+	}
+	// 创建时带空白，登录时无论带不带空白都应该通过。
+	for _, candidate := range []string{"sup3r-secret", "  sup3r-secret  ", "sup3r-secret\n"} {
+		if _, ok := dataStore.VerifyAdmin("Digital Gleam", candidate); !ok {
+			t.Fatalf("口令 %q 应可登录", candidate)
+		}
+	}
+
+	// 重置口令时带尾随换行，用户随后输入的干净口令必须能登录。
+	if err := dataStore.SetAdminPassword(super.ID, "reset-password-1\n"); err != nil {
+		t.Fatalf("重置口令失败: %v", err)
+	}
+	if _, ok := dataStore.VerifyAdmin("Digital Gleam", "reset-password-1"); !ok {
+		t.Fatalf("重置后的口令应生效")
+	}
+	if _, ok := dataStore.VerifyAdmin("Digital Gleam", "reset-password-1\n"); !ok {
+		t.Fatalf("带尾随换行的同一口令也应生效")
+	}
+	if _, ok := dataStore.VerifyAdmin("Digital Gleam", "sup3r-secret"); ok {
+		t.Fatalf("旧口令必须失效")
+	}
+
+	// 归一化后长度不足的口令要被拒绝，避免“7 个字符 + 空格”绕过下限。
+	if err := dataStore.SetAdminPassword(super.ID, "  short  "); err == nil {
+		t.Fatalf("归一化后过短的口令应被拒绝")
+	}
+}
+
+// TestResetAdminPasswordByName 覆盖命令行自救入口。
+func TestResetAdminPasswordByName(t *testing.T) {
+	t.Setenv("MASTER_KEY", "unit-test-master-key")
+	file := filepath.Join(t.TempDir(), "db.json")
+	dataStore := New(file)
+	if err := dataStore.Load(); err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if _, err := dataStore.CreateSuperAdmin("Digital Gleam", "sup3r-secret"); err != nil {
+		t.Fatalf("创建超级管理员失败: %v", err)
+	}
+	viewer, err := dataStore.CreateAdminUser("viewer", "viewer-password", RoleAdmin, "")
+	if err != nil {
+		t.Fatalf("创建管理员失败: %v", err)
+	}
+	if err := dataStore.SetAdminEnabled(viewer.ID, false); err != nil {
+		t.Fatalf("禁用账户失败: %v", err)
+	}
+
+	if _, err := dataStore.ResetAdminPasswordByName("nobody", "whatever-1"); err == nil {
+		t.Fatalf("未知账户应报错")
+	}
+	if _, err := dataStore.ResetAdminPasswordByName("viewer", "tiny"); err == nil {
+		t.Fatalf("过短口令应报错")
+	}
+
+	// 重置会顺带把账户重新启用，避免“口令对了但账户禁用”的二次卡死。
+	restored, err := dataStore.ResetAdminPasswordByName(" viewer ", "cli-reset-password")
+	if err != nil {
+		t.Fatalf("命令行重置失败: %v", err)
+	}
+	if !restored.Enabled {
+		t.Fatalf("重置后账户应为启用状态")
+	}
+	if _, ok := dataStore.VerifyAdmin("viewer", "cli-reset-password"); !ok {
+		t.Fatalf("命令行重置后的口令应可登录")
+	}
+
+	// 必须已经落盘：命令行改完口令后服务是重新启动的。
+	reloaded := New(file)
+	if err := reloaded.Load(); err != nil {
+		t.Fatalf("重新 Load 失败: %v", err)
+	}
+	if _, ok := reloaded.VerifyAdmin("viewer", "cli-reset-password"); !ok {
+		t.Fatalf("命令行重置应持久化")
+	}
+}

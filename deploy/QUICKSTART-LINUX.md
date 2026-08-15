@@ -216,6 +216,30 @@ curl -fsSL https://raw.githubusercontent.com/LittIeRat/laskah/main/scripts/deplo
 sudo LASKAH_AUTO_GO=1 bash scripts/install-linux.sh
 ```
 
+### 忘记口令 / 重置后登不进去
+
+二进制自带命令行自救入口，不用清库重装：
+
+```bash
+sudo systemctl stop laskah                       # 必须先停，否则运行中的进程会把旧数据盖回磁盘
+sudo -u laskah /opt/laskah/laskah list-admins    # 列出账户（账户名脱敏，只用来确认目标）
+sudo -u laskah /opt/laskah/laskah reset-password 'Digital Gleam' '新口令至少八位'
+sudo systemctl start laskah
+```
+
+子命令要读到与服务相同的 `DATA_FILE` 与 `MASTER_KEY`。若这两个变量写在
+`/etc/laskah/laskah.env`，就用下面这种带 env 的写法：
+
+```bash
+sudo systemctl stop laskah
+sudo -u laskah env $(grep -E '^(DATA_FILE|MASTER_KEY)=' /etc/laskah/laskah.env | xargs) \
+  /opt/laskah/laskah reset-password 'Digital Gleam' '新口令至少八位'
+sudo systemctl start laskah
+```
+
+重置会顺带把该账户置为启用。口令的首尾空白一律被忽略，所以从密码管理器粘贴带上尾随
+空格或换行不会影响登录；口令中间的空格有效。
+
 ---
 
 ## 排障
@@ -227,7 +251,8 @@ sudo LASKAH_AUTO_GO=1 bash scripts/install-linux.sh
 | 脚本报 `$'\r': command not found` | 脚本被 Windows 改成 CRLF 了，`sed -i 's/\r$//' 脚本名` 修掉；仓库里已用 `.gitattributes` 强制 LF |
 | 启动失败 | `sudo journalctl -u laskah -n 50 --no-pager`；多半是 env 写错或 `DATA_FILE` 目录不在 `ReadWritePaths` 里 |
 | 登录页 403 | 反代的 `/admin/*` IP 白名单没改成你的网段 |
-| 登录报 429 | 触发限速（10 分钟 5 次失败锁 15 分钟），等一会儿或重启服务清计数 |
+| 登录报 429 | 触发限速（10 分钟 5 次失败锁 15 分钟），响应里带剩余分钟数；等待或 `systemctl restart laskah` 清计数 |
+| 改密/重置后新口令登不进去 | 先确认不是 429 锁定；再用 `laskah reset-password` 在服务器上重置（见上一节）。口令首尾空白会被忽略，别把空格当成口令的一部分 |
 | 流式响应挤在一起才吐 | 反代没关缓冲，用 `deploy/` 里给的配置，别自己写 |
 | 调用返回 503 | 分组被禁用、账号全被删光、或所有 Key 都在冷却，去 `/dashboard` 看 |
 

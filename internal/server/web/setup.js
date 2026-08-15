@@ -25,8 +25,9 @@
     errorBox.textContent = "";
 
     var user = document.getElementById("setup-user").value.trim();
-    var password = document.getElementById("setup-password").value;
-    var confirm = document.getElementById("setup-confirm").value;
+    // 与服务端一致地忽略首尾空白：保存下来的凭据必须与实际生效的口令一致。
+    var password = document.getElementById("setup-password").value.trim();
+    var confirm = document.getElementById("setup-confirm").value.trim();
 
     if (user.length < 3) {
       errorBox.textContent = "账户名至少 3 个字符";

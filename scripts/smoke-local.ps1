@@ -33,6 +33,7 @@ $superUser = 'Digital Gleam'
 $superPass = 'Laskah-2026-Super'
 $adminUser = 'viewer'
 $adminPass = 'Laskah-2026-View'
+$adminId = ''
 
 $pass = 0
 $fail = 0
@@ -307,6 +308,7 @@ Step 'GET /v1/models 返回准确模型列表' {
 Step 'POST /admin/users 创建普通管理员' {
   $r = Api POST '/admin/users' @{ user = $adminUser; password = $adminPass; role = 'admin'; note = '只看看板' } -Session $superSession -Csrf $superCsrf -Expect 201
   if ($r.Data.data.role -ne 'admin') { throw '角色不是 admin' }
+  $script:adminId = $r.Data.data.id
   'role=admin id=' + $r.Data.data.id
 }
 
@@ -399,6 +401,31 @@ Step '安全响应头齐备（CSP 无 unsafe-inline）' {
   'CSP/XFO/nosniff 均就位'
 }
 
+Step '重置口令（尾随空格）后可用干净口令登录' {
+  $reset = $adminPass + '-2  '
+  $r = Api POST ('/admin/users/' + $adminId + '/password') @{ password = $reset; confirm = $reset } -Session $superSession -Csrf $superCsrf -Expect 200
+  # 服务端与前端共用同一套归一化：带空格存进去，登录时不带空格也必须通过。
+  $payload = [System.Text.Encoding]::UTF8.GetBytes((@{ user = $adminUser; password = ($adminPass + '-2') } | ConvertTo-Json -Compress))
+  $login = Invoke-WebRequest -Uri ($base + '/admin/login') -Method POST -Body $payload -ContentType 'application/json; charset=utf-8' -SessionVariable rv -UseBasicParsing -TimeoutSec 20
+  if ([int]$login.StatusCode -ne 200) { throw ('登录失败 HTTP ' + $login.StatusCode) }
+  $json = $login.Content | ConvertFrom-Json
+  $script:adminSession = $rv
+  $script:adminCsrf = $json.csrfToken
+  $script:adminPass = $adminPass + '-2'
+  '重置后新口令可登录（首尾空白被忽略）'
+}
+
+Step '重置后旧口令立即失效' {
+  $payload = [System.Text.Encoding]::UTF8.GetBytes((@{ user = $adminUser; password = 'Laskah-2026-View' } | ConvertTo-Json -Compress))
+  try {
+    $r = Invoke-WebRequest -Uri ($base + '/admin/login') -Method POST -Body $payload -ContentType 'application/json; charset=utf-8' -UseBasicParsing -TimeoutSec 20
+    throw ('旧口令仍可登录 HTTP ' + [int]$r.StatusCode)
+  } catch [System.Net.WebException] {
+    $status = [int]$_.Exception.Response.StatusCode
+    if ($status -ne 401) { throw ('期望 401，实际 ' + $status) }
+  }
+  'HTTP 401'
+}
 Step 'POST /admin/logout 注销后会话失效' {
   $out = Api POST '/admin/logout' -Session $adminSession -Csrf $adminCsrf -Expect 200
   $after = Api GET '/admin/session' -Session $adminSession -Expect 200

@@ -181,7 +181,7 @@ func (h *Handler) handleSetup(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, httpx.StatusOf(err, http.StatusBadRequest), err.Error(), nil)
 			return
 		}
-		if payload.Confirm != "" && payload.Confirm != payload.Password {
+		if payload.Confirm != "" && store.NormalizePassword(payload.Confirm) != store.NormalizePassword(payload.Password) {
 			httpx.Error(w, http.StatusBadRequest, "两次输入的密码不一致", nil)
 			return
 		}
@@ -214,7 +214,9 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if allowed, wait := h.Throttle.Check(source); !allowed {
 		seconds := int(wait.Seconds()) + 1
 		w.Header().Set("Retry-After", itoa(seconds))
-		httpx.Error(w, http.StatusTooManyRequests, "尝试次数过多，请稍后再试", nil)
+		// 明确告知剩余锁定时间：否则口令刚被重置的用户会误以为新口令没生效。
+		httpx.Error(w, http.StatusTooManyRequests,
+			"失败次数过多，该来源已被锁定，请在 "+itoa((seconds+59)/60)+" 分钟后重试", nil)
 		return
 	}
 
@@ -325,7 +327,7 @@ func (h *Handler) handlePassword(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "当前密码错误", nil)
 		return
 	}
-	if err := h.Store.SetAdminPassword(session.UserID, strings.TrimSpace(payload.Next)); err != nil {
+	if err := h.Store.SetAdminPassword(session.UserID, payload.Next); err != nil {
 		httpx.Error(w, http.StatusBadRequest, err.Error(), nil)
 		return
 	}

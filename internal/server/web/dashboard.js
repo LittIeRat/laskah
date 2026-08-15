@@ -383,20 +383,22 @@
       subtitle: "修改成功后当前账户需要重新登录",
       body: h("div", { class: "form-grid" }, [
         field("当前密码", current),
-        field("新密码", next, "至少 8 个字符"),
+        field("新密码", next, "至少 8 个字符；首尾空格与换行会被忽略"),
         field("确认新密码", confirm)
       ]),
       confirmText: "更新密码",
       onConfirm: async function () {
-        if (next.value.length < 8) {
+        // 与服务端一致地忽略首尾空白，避免粘贴带尾随空格后改完密码登不进去。
+        var nextValue = next.value.trim();
+        if (nextValue.length < 8) {
           LB.toast("新密码至少 8 个字符", "error");
           return false;
         }
-        if (next.value !== confirm.value) {
+        if (nextValue !== confirm.value.trim()) {
           LB.toast("两次输入的密码不一致", "error");
           return false;
         }
-        await LB.request("POST", "/admin/password", { current: current.value, next: next.value });
+        await LB.request("POST", "/admin/password", { current: current.value, next: nextValue });
         LB.toast("密码已更新，即将重新登录", "ok");
         window.setTimeout(function () {
           window.location.href = "/login";

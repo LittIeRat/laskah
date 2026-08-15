@@ -624,28 +624,30 @@
       subtitle: "管理员只能看到数据看板，无法通过网址跳转访问分组与账号页",
       body: h("div", { class: "form-grid" }, [
         field("账户名", nameInput, null, true),
-        field("密码", passwordInput, "至少 8 个字符", true),
+        field("密码", passwordInput, "至少 8 个字符；首尾空格与换行会被忽略", true),
         field("确认密码", confirmInput, null, true),
         field("角色", roleSelect, null, true),
         field("备注", noteInput)
       ]),
       confirmText: "创建账户",
       onConfirm: async function () {
+        // 与服务端一致地忽略首尾空白，保证这里创建的口令一定能登录。
+        var password = passwordInput.value.trim();
         if (nameInput.value.trim().length < 3) {
           LB.toast("账户名至少 3 个字符", "error");
           return false;
         }
-        if (passwordInput.value.length < 8) {
+        if (password.length < 8) {
           LB.toast("密码至少 8 个字符", "error");
           return false;
         }
-        if (passwordInput.value !== confirmInput.value) {
+        if (password !== confirmInput.value.trim()) {
           LB.toast("两次输入的密码不一致", "error");
           return false;
         }
         await LB.request("POST", "/admin/users", {
           user: nameInput.value.trim(),
-          password: passwordInput.value,
+          password: password,
           role: roleSelect.value,
           note: noteInput.value.trim()
         });
@@ -663,24 +665,26 @@
       title: "重置「" + user.username + "」的口令",
       subtitle: "重置后该账户的所有会话会立即失效",
       body: h("div", { class: "form-grid" }, [
-        field("新密码", passwordInput, "至少 8 个字符", true),
+        field("新密码", passwordInput, "至少 8 个字符；首尾空格与换行会被忽略", true),
         field("确认密码", confirmInput, null, true)
       ]),
       confirmText: "重置口令",
       onConfirm: async function () {
-        if (passwordInput.value.length < 8) {
+        // 粘贴口令常带尾随空格；这里先按服务端规则归一化再提交。
+        var password = passwordInput.value.trim();
+        if (password.length < 8) {
           LB.toast("密码至少 8 个字符", "error");
           return false;
         }
-        if (passwordInput.value !== confirmInput.value) {
+        if (password !== confirmInput.value.trim()) {
           LB.toast("两次输入的密码不一致", "error");
           return false;
         }
         await LB.request("POST", "/admin/users/" + encodeURIComponent(user.id) + "/password", {
-          password: passwordInput.value,
-          confirm: confirmInput.value
+          password: password,
+          confirm: password
         });
-        LB.toast("口令已重置", "ok");
+        LB.toast("口令已重置，请把新口令交给该账户", "ok");
         await loadAll();
       }
     });

@@ -437,16 +437,18 @@ func (s *Store) VerifyAdmin(username, password string) (*AdminUser, bool) {
 	defer s.mu.Unlock()
 
 	name := NormalizeUsername(username)
+	// 口令与写入时保持同一归一化规则，避免改密后登录被首尾空白卡住。
+	secret := NormalizePassword(password)
 	user := s.data.FindAdminByHash(security.HashToken(name))
 	if user == nil {
-		security.VerifyPassword(security.DummyHash, password)
+		security.VerifyPassword(security.DummyHash, secret)
 		return nil, false
 	}
 	if !user.Enabled {
-		security.VerifyPassword(security.DummyHash, password)
+		security.VerifyPassword(security.DummyHash, secret)
 		return nil, false
 	}
-	if !security.VerifyPassword(user.Password, password) {
+	if !security.VerifyPassword(user.Password, secret) {
 		return nil, false
 	}
 
@@ -457,12 +459,49 @@ func (s *Store) VerifyAdmin(username, password string) (*AdminUser, bool) {
 	return &copied, true
 }
 
+// ResetAdminPasswordByName 按账户名重置口令并确保账户可用。
+//
+// 专供命令行自救：超级管理员忘记口令或改密后登不进去时，
+// 运维可以在服务器上直接改回一个已知口令，而不必清空数据重新初始化。
+// 一并把账户置为启用状态，避免“口令对了但账户被禁用”的二次卡死。
+func (s *Store) ResetAdminPasswordByName(username, password string) (*AdminUser, error) {
+	name := NormalizeUsername(username)
+	if name == "" {
+		return nil, errors.New("账户名不能为空")
+	}
+	secret := NormalizePassword(password)
+	if len([]rune(secret)) < minPasswordLength {
+		return nil, fmt.Errorf("密码至少 %d 个字符", minPasswordLength)
+	}
+	hashed, err := security.HashPassword(secret)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user := s.data.FindAdminByHash(security.HashToken(name))
+	if user == nil {
+		return nil, errors.New("账户不存在")
+	}
+	user.Password = hashed
+	user.PasswordSetAt = time.Now().UTC()
+	user.UpdatedAt = user.PasswordSetAt
+	user.Enabled = true
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
+	copied := *user
+	return &copied, nil
+}
+
 // SetAdminPassword 更新指定账户的口令散列。
 func (s *Store) SetAdminPassword(id, password string) error {
-	if len([]rune(password)) < minPasswordLength {
+	secret := NormalizePassword(password)
+	if len([]rune(secret)) < minPasswordLength {
 		return fmt.Errorf("密码至少 %d 个字符", minPasswordLength)
 	}
-	hashed, err := security.HashPassword(password)
+	hashed, err := security.HashPassword(secret)
 	if err != nil {
 		return err
 	}

@@ -63,6 +63,15 @@ func NormalizeUsername(raw string) string {
 	return strings.TrimSpace(raw)
 }
 
+// NormalizePassword 统一口令的空白处理。
+//
+// 设置口令与校验口令必须走同一个归一化函数，否则会出现
+// “存的是剪掉首尾空白的散列、登录时提交的是原串”这种改密后登不进去的死锁。
+// 剪掉首尾空白也顺手消化了从密码管理器或记事本粘贴时带上的尾随空格与换行。
+func NormalizePassword(raw string) string {
+	return strings.TrimSpace(raw)
+}
+
 // BuildAdminUser 校验输入并生成管理员账户。
 func BuildAdminUser(username, password string, role Role, note string) (*AdminUser, *ValidationError) {
 	verr := &ValidationError{}
@@ -77,7 +86,8 @@ func BuildAdminUser(username, password string, role Role, note string) (*AdminUs
 		verr.Errorf("账户名不能超过 48 个字符")
 	}
 
-	if len([]rune(password)) < minPasswordLength {
+	secret := NormalizePassword(password)
+	if len([]rune(secret)) < minPasswordLength {
 		verr.Errorf("密码至少 %d 个字符", minPasswordLength)
 	}
 	if !ValidRole(string(role)) {
@@ -87,7 +97,7 @@ func BuildAdminUser(username, password string, role Role, note string) (*AdminUs
 		return nil, verr
 	}
 
-	hashed, err := security.HashPassword(password)
+	hashed, err := security.HashPassword(secret)
 	if err != nil {
 		verr.Errorf("%s", err.Error())
 		return nil, verr
