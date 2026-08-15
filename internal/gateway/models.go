@@ -40,20 +40,23 @@ type ModelList struct {
 //
 // 列表严格按 OpenAI 规范输出：object=list，data 按 id 升序排列，
 // 每项只含 id / object / created / owned_by 四个规范字段。
+// 列表覆盖「该密钥能落到的全部账号」，而不只是当前绑定的那一个：
+// 请求某个模型时网关会自动切到提供它的账号，因此可调用范围就是分组内的并集。
 func (g *Gateway) HandleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		httpx.Error(w, http.StatusMethodNotAllowed, "仅支持 GET", nil)
 		return
 	}
 
-	session, authErr := g.Authenticate(r.Context(), httpx.BearerToken(r))
+	// 只验密钥、不分配账号：列举模型不该触发余额查询或改动粘性绑定。
+	keyID, authErr := g.ValidateKey(httpx.BearerToken(r))
 	if authErr != nil {
 		httpx.Error(w, authErr.Status, authErr.Message, nil)
 		return
 	}
 
 	requested := requestedModelID(r.URL.Path)
-	entries := g.availableModels(session)
+	entries := g.availableModels(keyID)
 
 	if requested == "" {
 		httpx.JSON(w, http.StatusOK, ModelList{Object: "list", Data: entries})
@@ -86,21 +89,23 @@ func requestedModelID(path string) string {
 // availableModels 汇总当前密钥真正能调用到的模型。
 //
 // 只统计“会被选中的上游”：启用中的 API、密钥允许的模型、
-// 以及密钥当前绑定或其分组内可用的账号，确保列表与实际可用范围一致。
-func (g *Gateway) availableModels(session Session) []ModelEntry {
+// 以及密钥所在分组内当前可用的账号，确保列表与实际可用范围一致。
+func (g *Gateway) availableModels(keyID string) []ModelEntry {
 	type modelMeta struct {
 		created int64
 	}
 	found := map[string]modelMeta{}
 
 	g.Store.View(func(data *store.Data) {
-		key := data.FindKeyByID(session.KeyID)
+		key := data.FindKeyByID(keyID)
 		allowedProviders := map[string]bool{}
-		for _, id := range session.ProviderIDs {
-			allowedProviders[id] = true
+		if key != nil {
+			for _, id := range key.ProviderIDs {
+				allowedProviders[id] = true
+			}
 		}
 
-		for _, provider := range g.reachableProviders(data, session) {
+		for _, provider := range g.reachableProviders(data, key) {
 			if !provider.Enabled {
 				continue
 			}
@@ -140,14 +145,14 @@ func (g *Gateway) availableModels(session Session) []ModelEntry {
 	return entries
 }
 
-// reachableProviders 返回该会话可能落到的上游集合。
-func (g *Gateway) reachableProviders(data *store.Data, session Session) []*store.Provider {
-	if session.AccountID != "" {
-		return data.AccountProviders(session.AccountID)
-	}
-
+// reachableProviders 返回该密钥可能落到的上游集合。
+//
+// 覆盖分组内全部可用账号，而不是只看当前绑定的账号：
+// 网关会为不同模型自动切换到提供该模型的账号，列表必须与这个行为一致，
+// 否则下游会看不到自己其实能调用的模型。
+func (g *Gateway) reachableProviders(data *store.Data, key *store.APIKey) []*store.Provider {
 	groupID := ""
-	if key := data.FindKeyByID(session.KeyID); key != nil {
+	if key != nil {
 		groupID = key.GroupID
 	}
 	accounts := data.UsableAccounts(groupID)

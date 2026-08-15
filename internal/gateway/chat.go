@@ -156,6 +156,14 @@ func IsBalanceExhausted(status int, body string) bool {
 	default:
 		return false
 	}
+	return matchesBalanceExhaustion(body)
+}
+
+// matchesBalanceExhaustion 只看文案，不看状态码。
+//
+// 供两处使用：状态码粗筛之后的 IsBalanceExhausted，以及流式响应里
+// HTTP 状态已经是 200、余额不足只能从 SSE 的 error 事件里读出来的场景。
+func matchesBalanceExhaustion(body string) bool {
 	normalized := normalizeErrorText(body)
 	for _, marker := range balanceExhaustedMarkers {
 		if strings.Contains(normalized, marker) {
@@ -163,6 +171,44 @@ func IsBalanceExhausted(status int, body string) bool {
 		}
 	}
 	return hasBalanceShortfall(normalized)
+}
+
+// balanceExhaustedInPayload 判断一个已解析的 JSON 响应体是否在 error 字段里报余额不足。
+//
+// 刻意只看 error 字段：模型正文完全可能出现“余额不足”这类字样，
+// 拿整个响应体做关键词匹配会把正常回答误判成账号欠费。
+func balanceExhaustedInPayload(payload map[string]any) (string, bool) {
+	if payload == nil {
+		return "", false
+	}
+	raw, exists := payload["error"]
+	if !exists || raw == nil {
+		return "", false
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return "", false
+	}
+	text := string(encoded)
+	if !matchesBalanceExhaustion(text) {
+		return "", false
+	}
+	return text, true
+}
+
+// balanceStreamError 表示流式响应中途发现上游账号余额不足。
+//
+// 流式响应的 HTTP 状态码早在第一个字节前就是 200，余额不足只能从 SSE 事件里读到，
+// 因此需要一个专门的错误类型把这个信号带回请求主流程做「截断 + 换号」。
+type balanceStreamError struct {
+	detail string
+	// streamed 表示是否已经有内容下发给调用方。
+	// 未下发时可以完全透明地换号重试；已下发时只能截断并结束这一次输出。
+	streamed bool
+}
+
+func (e *balanceStreamError) Error() string {
+	return "上游账号余额不足: " + e.detail
 }
 
 // maxAccountAttempts 限制单次鉴权中重新挑选账号的次数。
@@ -230,23 +276,34 @@ func (e *AuthError) Error() string {
 
 // Session 是一次请求的鉴权上下文。
 type Session struct {
-	KeyID       string
-	AccountID   string
+	KeyID     string
+	AccountID string
+
+	// Model 是本次请求指定的模型，为空表示不限模型。
+	// 账号与上游都按它筛选，确保请求只落到真正提供该模型的账号上。
+	Model       string
 	ProviderIDs []string
 }
 
 // Authenticate 校验网关密钥，并在需要时自动分配可用账号。
+func (g *Gateway) Authenticate(ctx context.Context, secret string) (Session, *AuthError) {
+	return g.AuthenticateForModel(ctx, secret, "")
+}
+
+// AuthenticateForModel 校验网关密钥，并分配一个能承接指定模型的账号。
 //
-// 分配流程：命中密钥 → 检查密钥状态 → 挑选账号 → 若该账号余额数据过期则先刷新再确认。
+// 分配流程：命中密钥 → 检查密钥状态 → 挑选支持该模型的账号 → 若该账号余额数据过期则先刷新再确认。
 // 刷新后账号若已耗尽或被自动删除，就重新挑选下一个账号，最多重试 maxAccountAttempts 次，
 // 从而避免“余额已经用完却继续往同一个账号打请求”。
-func (g *Gateway) Authenticate(ctx context.Context, secret string) (Session, *AuthError) {
+//
+// model 为空表示不限模型（用于 /v1/models 之类不针对单一模型的请求）。
+func (g *Gateway) AuthenticateForModel(ctx context.Context, secret, model string) (Session, *AuthError) {
 	if strings.TrimSpace(secret) == "" {
 		return Session{}, &AuthError{Status: http.StatusUnauthorized, Message: "缺少 API Key，请在 Authorization: Bearer <key> 中提供"}
 	}
 
 	for attempt := 0; attempt < maxAccountAttempts; attempt++ {
-		session, staleAccount, authErr := g.assignSession(secret)
+		session, staleAccount, authErr := g.assignSession(secret, model)
 		if authErr != nil {
 			return Session{}, authErr
 		}
@@ -262,13 +319,64 @@ func (g *Gateway) Authenticate(ctx context.Context, secret string) (Session, *Au
 		}
 	}
 
-	return Session{}, &AuthError{Status: http.StatusServiceUnavailable, Message: "没有可用账号（余额已耗尽或未配置 API）"}
+	return Session{}, &AuthError{Status: http.StatusServiceUnavailable, Message: noAccountMessage(model)}
+}
+
+// ValidateKey 只校验密钥本身，不分配账号，返回密钥 ID。
+//
+// 供请求先解析出 model 再分配账号的流程使用：既保证非法密钥仍然优先返回 401/403，
+// 又让账号分配能拿到模型信息，避免把请求交给不支持该模型的账号。
+func (g *Gateway) ValidateKey(secret string) (string, *AuthError) {
+	if strings.TrimSpace(secret) == "" {
+		return "", &AuthError{Status: http.StatusUnauthorized, Message: "缺少 API Key，请在 Authorization: Bearer <key> 中提供"}
+	}
+	var (
+		keyID   string
+		authErr *AuthError
+	)
+	g.Store.View(func(data *store.Data) {
+		key := data.FindKeyBySecret(secret)
+		if key == nil {
+			authErr = &AuthError{Status: http.StatusUnauthorized, Message: "API Key 无效"}
+			return
+		}
+		if stateErr := keyStateError(key); stateErr != nil {
+			authErr = stateErr
+			return
+		}
+		keyID = key.ID
+	})
+	if authErr != nil {
+		return "", authErr
+	}
+	return keyID, nil
+}
+
+// keyStateError 把密钥状态映射成鉴权错误，nil 表示状态正常。
+func keyStateError(key *store.APIKey) *AuthError {
+	switch key.State(time.Now()) {
+	case store.KeyDisabled:
+		return &AuthError{Status: http.StatusForbidden, Message: "API Key 已禁用"}
+	case store.KeyExpired:
+		return &AuthError{Status: http.StatusForbidden, Message: "API Key 已过期"}
+	case store.KeyQuotaExceeded:
+		return &AuthError{Status: http.StatusTooManyRequests, Message: "API Key 配额已用尽"}
+	}
+	return nil
+}
+
+// noAccountMessage 生成“无可用账号”的提示，指定模型时说明是模型维度无账号可用。
+func noAccountMessage(model string) string {
+	if model == "" {
+		return "没有可用账号（余额已耗尽或未配置 API）"
+	}
+	return "没有账号可以承接模型 " + model + "（未配置该模型、余额已耗尽或上游全部在冷却中）"
 }
 
 // assignSession 在一次写锁内完成密钥校验与账号分配。
 //
 // 第二个返回值非空表示所选账号的余额数据已过期，调用方需要先刷新再决定是否使用。
-func (g *Gateway) assignSession(secret string) (Session, string, *AuthError) {
+func (g *Gateway) assignSession(secret, model string) (Session, string, *AuthError) {
 	var (
 		session      Session
 		staleAccount string
@@ -281,27 +389,21 @@ func (g *Gateway) assignSession(secret string) (Session, string, *AuthError) {
 			authErr = &AuthError{Status: http.StatusUnauthorized, Message: "API Key 无效"}
 			return
 		}
-		switch key.State(time.Now()) {
-		case store.KeyDisabled:
-			authErr = &AuthError{Status: http.StatusForbidden, Message: "API Key 已禁用"}
-			return
-		case store.KeyExpired:
-			authErr = &AuthError{Status: http.StatusForbidden, Message: "API Key 已过期"}
-			return
-		case store.KeyQuotaExceeded:
-			authErr = &AuthError{Status: http.StatusTooManyRequests, Message: "API Key 配额已用尽"}
+		if stateErr := keyStateError(key); stateErr != nil {
+			authErr = stateErr
 			return
 		}
 
 		session.KeyID = key.ID
+		session.Model = model
 		session.ProviderIDs = append([]string{}, key.ProviderIDs...)
 		if len(data.Accounts) == 0 {
 			return
 		}
 
-		account := data.AssignAccount(key)
+		account := data.AssignAccountForModel(key, model)
 		if account == nil {
-			authErr = &AuthError{Status: http.StatusServiceUnavailable, Message: "没有可用账号（全部余额耗尽或未配置 API）"}
+			authErr = &AuthError{Status: http.StatusServiceUnavailable, Message: noAccountMessage(model)}
 			return
 		}
 		session.AccountID = account.ID
@@ -317,14 +419,17 @@ func (g *Gateway) assignSession(secret string) (Session, string, *AuthError) {
 }
 
 // HandleChatCompletions 是 /v1/chat/completions 的入口。
+//
+// 顺序刻意是「先验密钥 → 再读 model → 最后分配账号」：
+// 账号分配必须知道请求的是哪个模型，才能只挑真正提供该模型的账号，
+// 否则会把请求交给不支持它的账号，白跑一次上游甚至误伤统计。
 func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	secret := httpx.BearerToken(r)
-	session, authErr := g.Authenticate(r.Context(), secret)
+	keyID, authErr := g.ValidateKey(secret)
 	if authErr != nil {
 		httpx.Error(w, authErr.Status, authErr.Message, nil)
 		return
 	}
-	keyID := session.KeyID
 
 	body, err := httpx.ReadJSONObject(r)
 	if err != nil {
@@ -362,6 +467,7 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// 限速在账号分配之前判定：被限流的请求不该触发余额查询等上游动作。
 	if rateLimit > 0 {
 		decision := g.Limiter.Allow(keyID, rateLimit, time.Now())
 		if !decision.Allowed {
@@ -375,6 +481,13 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
+
+	session, authErr := g.AuthenticateForModel(r.Context(), secret, model)
+	if authErr != nil {
+		httpx.Error(w, authErr.Status, authErr.Message, nil)
+		return
+	}
+	keyID = session.KeyID
 
 	candidates := g.orderedProviders(model, session)
 	if len(candidates) == 0 {
@@ -395,6 +508,37 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	// accountSwitches 给“余额不足删号后换账号”设上限，
 	// 避免大批账号同时欠费时把一次请求拖成长串串行重试。
 	accountSwitches := 0
+
+	// switchAccount 在“账号连这一次请求都付不起”时立刻删号并换一个账号，
+	// 成功时已就地刷新 session / candidates / maxAttempts，调用方只需重置循环下标。
+	switchAccount := func(detail string) bool {
+		if accountSwitches >= maxAccountAttempts {
+			return false
+		}
+		if !g.dropExhaustedAccount(session.AccountID, detail) {
+			return false
+		}
+		accountSwitches++
+		retrySession, retryErr := g.AuthenticateForModel(r.Context(), secret, model)
+		if retryErr != nil {
+			return false
+		}
+		retryCandidates := g.orderedProviders(model, retrySession)
+		if len(retryCandidates) == 0 {
+			return false
+		}
+		session = retrySession
+		keyID = session.KeyID
+		candidates = retryCandidates
+		maxAttempts = g.Store.MaxRetries()
+		if maxAttempts < 1 {
+			maxAttempts = 1
+		}
+		if maxAttempts > len(candidates) {
+			maxAttempts = len(candidates)
+		}
+		return true
+	}
 
 	for index := 0; index < maxAttempts; index++ {
 		provider := candidates[index]
@@ -422,25 +566,9 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 			// 上游明确说“这一次请求的余额都不够”时立刻删号，
 			// 并换一个账号重试，让调用方感知不到这次切换。
-			if accountSwitches < maxAccountAttempts && IsBalanceExhausted(response.HTTP.StatusCode, snippet) && g.dropExhaustedAccount(session.AccountID, snippet) {
-				accountSwitches++
-				retrySession, retryErr := g.Authenticate(r.Context(), secret)
-				if retryErr == nil {
-					session = retrySession
-					keyID = session.KeyID
-					candidates = g.orderedProviders(model, session)
-					if len(candidates) > 0 {
-						maxAttempts = g.Store.MaxRetries()
-						if maxAttempts < 1 {
-							maxAttempts = 1
-						}
-						if maxAttempts > len(candidates) {
-							maxAttempts = len(candidates)
-						}
-						index = -1
-						continue
-					}
-				}
+			if IsBalanceExhausted(response.HTTP.StatusCode, snippet) && switchAccount(snippet) {
+				index = -1
+				continue
 			}
 
 			if retryableStatus[response.HTTP.StatusCode] && index < maxAttempts-1 {
@@ -468,6 +596,28 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			response.HTTP.Body.Close()
 			response.Cancel()
 			g.adjustInflight(provider.ID, -1)
+
+			// 流式响应里余额不足只能从 SSE 的 error 事件读到（HTTP 状态早已是 200）。
+			var balanceErr *balanceStreamError
+			if errors.As(streamErr, &balanceErr) {
+				g.reportFailure(provider.ID, streamErr)
+				attempts = append(attempts, map[string]any{"provider": provider.Name, "error": balanceErr.Error()})
+				switched := switchAccount(balanceErr.detail)
+				if switched && !balanceErr.streamed {
+					// 还没给调用方写过任何字节，可以完全透明地换号重来。
+					index = -1
+					continue
+				}
+				// 已经下发过内容：立刻截断并正常收尾，不让调用方干等或读到半截 SSE。
+				g.recordKeyUsage(keyID, false, usage)
+				if balanceErr.streamed {
+					finishTruncatedStream(w, model)
+					return
+				}
+				httpx.Error(w, http.StatusServiceUnavailable, noAccountMessage(model), map[string]any{"attempts": attempts})
+				return
+			}
+
 			if streamErr != nil {
 				g.reportFailure(provider.ID, streamErr)
 				g.recordKeyUsage(keyID, false, balancer.Usage{})
@@ -482,6 +632,20 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		response.HTTP.Body.Close()
 		response.Cancel()
 		g.adjustInflight(provider.ID, -1)
+		if decodeErr == nil {
+			// 有些上游用 HTTP 200 包着 error 字段返回余额不足，状态码粗筛拦不住。
+			if detail, exhausted := balanceExhaustedInPayload(payload); exhausted {
+				g.reportFailure(provider.ID, errors.New("上游账号余额不足"))
+				attempts = append(attempts, map[string]any{"provider": provider.Name, "error": detail})
+				if switchAccount(detail) {
+					index = -1
+					continue
+				}
+				g.recordKeyUsage(keyID, false, balancer.Usage{})
+				httpx.Error(w, http.StatusServiceUnavailable, noAccountMessage(model), map[string]any{"attempts": attempts})
+				return
+			}
+		}
 		if decodeErr != nil {
 			g.reportFailure(provider.ID, decodeErr)
 			attempts = append(attempts, map[string]any{"provider": provider.Name, "error": decodeErr.Error()})
@@ -504,14 +668,14 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 }
 
 // HandleEmbeddings 转发向量化请求到 OpenAI 兼容提供商。
+//
+// 与 chat 一致：先验密钥、再读 model、最后按模型分配账号。
 func (g *Gateway) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	secret := httpx.BearerToken(r)
-	session, authErr := g.Authenticate(r.Context(), secret)
-	if authErr != nil {
+	if _, authErr := g.ValidateKey(secret); authErr != nil {
 		httpx.Error(w, authErr.Status, authErr.Message, nil)
 		return
 	}
-	keyID := session.KeyID
 
 	body, err := httpx.ReadJSONObject(r)
 	if err != nil {
@@ -524,9 +688,16 @@ func (g *Gateway) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	session, authErr := g.AuthenticateForModel(r.Context(), secret, model)
+	if authErr != nil {
+		httpx.Error(w, authErr.Status, authErr.Message, nil)
+		return
+	}
+	keyID := session.KeyID
+
 	candidates := g.orderedProviders(model, session)
 	if len(candidates) == 0 {
-		httpx.Error(w, http.StatusServiceUnavailable, "没有可用的上游提供商", nil)
+		httpx.Error(w, http.StatusServiceUnavailable, "没有可用的上游提供商（检查模型匹配、启用状态与冷却状态）", nil)
 		return
 	}
 	provider := candidates[0]
@@ -584,6 +755,9 @@ func (g *Gateway) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
 }
 
 // orderedProviders 先按账号收敛候选范围，再在账号内做负载均衡排序。
+//
+// 候选只来自会话绑定的账号，绝不跨账号混用：Balancer 再按模型匹配、
+// 冷却状态与策略排序，因此最终只会打到「确实提供该模型」的那些 Key 上。
 func (g *Gateway) orderedProviders(model string, session Session) []*store.Provider {
 	snapshot := []*store.Provider{}
 	g.Store.View(func(data *store.Data) {
@@ -615,25 +789,92 @@ func (g *Gateway) decodeResponse(response *Response, provider *store.Provider, m
 	return payload, usageFromMap(payload["usage"]), nil
 }
 
-func (g *Gateway) pipeStream(w http.ResponseWriter, response *Response, provider *store.Provider, model string) (balancer.Usage, error) {
-	header := w.Header()
-	header.Set("Content-Type", "text/event-stream; charset=utf-8")
-	header.Set("Cache-Control", "no-cache, no-transform")
-	header.Set("Connection", "keep-alive")
-	header.Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
+// sseBalanceError 从一行 SSE 文本里识别“账号余额不足”。
+//
+// 流式响应的 HTTP 状态码在第一个字节前就已经是 200，余额不足只会以
+// SSE 的 error 事件出现，因此必须逐行看一眼 error 字段。
+func sseBalanceError(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "data:") {
+		return "", false
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+	if payload == "" || payload == "[DONE]" || !strings.HasPrefix(payload, "{") {
+		return "", false
+	}
+	decoded := map[string]any{}
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		return "", false
+	}
+	return balanceExhaustedInPayload(decoded)
+}
 
+// finishTruncatedStream 在流式输出中途换号时给调用方一个明确的收尾。
+//
+// 已经下发的内容撤不回来，但绝不能让连接就这么挂着：补一个
+// finish_reason=length 的 chunk 再发 [DONE]，标准 OpenAI 客户端会正常结束读取。
+func finishTruncatedStream(w http.ResponseWriter, model string) {
+	chunk := map[string]any{
+		"id":      fmt.Sprintf("chatcmpl_%d", time.Now().UnixNano()),
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"delta":         map[string]any{},
+			"finish_reason": "length",
+		}},
+	}
+	if encoded, err := json.Marshal(chunk); err == nil {
+		_, _ = io.WriteString(w, "data: "+string(encoded)+"\n\n")
+	}
+	_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// pipeStream 把上游 SSE 原样转发给调用方。
+//
+// 响应头刻意延迟到第一次真正下发内容时才写：在那之前发现余额不足，
+// 还可以完全透明地换一个账号重试，调用方看不到任何异常。
+func (g *Gateway) pipeStream(w http.ResponseWriter, response *Response, provider *store.Provider, model string) (balancer.Usage, error) {
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(response.HTTP.Body)
 	usage := balancer.Usage{}
 	converter := newAnthropicStreamConverter(model)
+	started := false
+
+	begin := func() {
+		if started {
+			return
+		}
+		started = true
+		header := w.Header()
+		header.Set("Content-Type", "text/event-stream; charset=utf-8")
+		header.Set("Cache-Control", "no-cache, no-transform")
+		header.Set("Connection", "keep-alive")
+		header.Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+	}
+	emit := func(chunk string) error {
+		begin()
+		if _, err := io.WriteString(w, chunk); err != nil {
+			return err
+		}
+		return nil
+	}
 
 	for {
 		line, err := reader.ReadString('\n')
 		if line != "" {
+			// 余额不足要在转发之前拦下：已经写出去的内容无法撤回。
+			if detail, exhausted := sseBalanceError(line); exhausted {
+				return usage, &balanceStreamError{detail: detail, streamed: started}
+			}
 			if provider.Type == store.TypeAnthropic {
 				for _, chunk := range converter.Convert(line) {
-					if _, writeErr := io.WriteString(w, chunk); writeErr != nil {
+					if writeErr := emit(chunk); writeErr != nil {
 						return usage, writeErr
 					}
 				}
@@ -644,11 +885,11 @@ func (g *Gateway) pipeStream(w http.ResponseWriter, response *Response, provider
 				if parsed, ok := usageFromSSELine(line); ok {
 					usage = parsed
 				}
-				if _, writeErr := io.WriteString(w, line); writeErr != nil {
+				if writeErr := emit(line); writeErr != nil {
 					return usage, writeErr
 				}
 			}
-			if flusher != nil {
+			if started && flusher != nil {
 				flusher.Flush()
 			}
 		}
@@ -661,13 +902,15 @@ func (g *Gateway) pipeStream(w http.ResponseWriter, response *Response, provider
 	}
 
 	if provider.Type == store.TypeAnthropic {
-		if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+		if err := emit("data: [DONE]\n\n"); err != nil {
 			return usage, err
 		}
-		if flusher != nil {
-			flusher.Flush()
-		}
 		usage = converter.usage
+	}
+	// 上游一个字节都没给（空流）时也要落地响应头，否则调用方收不到结束。
+	begin()
+	if flusher != nil {
+		flusher.Flush()
 	}
 	return usage, nil
 }

@@ -193,6 +193,15 @@ Step 'POST /admin/accounts 创建账号并批量导入 5 个 key（未配额度�
   'id=' + $script:accountA + ' apiCount=5 unlimited=true'
 }
 
+Step '余额安全线 $0.50 强制生效（未自填最低余额）' {
+  $r = Api GET '/admin/accounts' -Session $superSession -Expect 200
+  $acct = $r.Data.data | Where-Object { $_.id -eq $accountA }
+  if (-not $acct) { throw '账号列表里找不到刚创建的账号' }
+  if ($acct.minBalance -ne 0) { throw ('minBalance=' + $acct.minBalance + '，期望 0') }
+  if ([math]::Abs($acct.balanceFloor - 0.5) -gt 0.0001) { throw ('balanceFloor=' + $acct.balanceFloor + '，期望 0.5') }
+  'minBalance=0 -> balanceFloor=0.5 USD'
+}
+
 Step '超过 5 个 API 的部分被拒绝' {
   $keys = @(1..7 | ForEach-Object { 'sk-overflow-' + $_ + '-0123456789abcdef' }) -join "`n"
   $payload = @{

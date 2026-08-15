@@ -3,6 +3,7 @@ package accounts
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -155,7 +156,7 @@ func (m *Manager) apply(id, name string, snapshot wallet.Snapshot) map[string]an
 		exhausted = account.Exhausted()
 
 		if exhausted && account.AutoDelete {
-			data.RemoveAccounts([]string{account.ID}, "余额耗尽自动删除")
+			data.RemoveAccounts([]string{account.ID}, exhaustedReason(account))
 			deleted = true
 		}
 		return nil
@@ -331,19 +332,28 @@ func (m *Manager) DropAccount(accountID, reason string) bool {
 	return removed
 }
 
+// exhaustedReason 生成删号原因，带上余额与生效下限，便于事后核对。
+func exhaustedReason(account *store.Account) string {
+	return fmt.Sprintf("余额触及下限自动删除（余额 %.6f / 下限 %.2f %s）",
+		account.Balance, account.BalanceFloor(), account.Currency)
+}
+
 // SweepExhausted 清理余额已耗尽且开启自动删除的账号，返回被删除的账号名。
 func (m *Manager) SweepExhausted() []string {
 	names := []string{}
 	_ = m.Store.Update(func(data *store.Data) error {
 		ids := []string{}
+		reasons := []string{}
 		for _, account := range data.Accounts {
 			if account.AutoDelete && account.Exhausted() {
 				ids = append(ids, account.ID)
+				reasons = append(reasons, exhaustedReason(account))
 				names = append(names, account.Name)
 			}
 		}
-		if len(ids) > 0 {
-			data.RemoveAccounts(ids, "余额耗尽自动删除")
+		// 逐个删除而不是批量：删号原因要带上各自的余额与下限。
+		for index, id := range ids {
+			data.RemoveAccounts([]string{id}, reasons[index])
 		}
 		return nil
 	})

@@ -352,3 +352,55 @@ func TestTruncateReason(t *testing.T) {
 		t.Fatalf("应截断到 120 字符加省略号: %d", len([]rune(got)))
 	}
 }
+
+// TestSSEBalanceError 校验流式响应里的余额不足识别。
+//
+// 关键是不能把模型正文里出现的“余额不足”当成账号欠费：只看 error 字段。
+func TestSSEBalanceError(t *testing.T) {
+	hits := []string{
+		`data: {"error":{"message":"预扣费额度失败, 用户剩余额度: ＄0.182898, 需要预扣费额度: ＄0.290486"}}`,
+		`data: {"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}`,
+		`data: {"error":{"message":"当前账号已欠费，请充值"}}`,
+	}
+	for _, line := range hits {
+		if _, ok := sseBalanceError(line); !ok {
+			t.Fatalf("应识别为余额不足: %s", line)
+		}
+	}
+
+	misses := []string{
+		"data: [DONE]",
+		"",
+		": keep-alive",
+		"event: message_start",
+		`data: {"choices":[{"delta":{"content":"你的余额不足时应该充值"}}]}`,
+		`data: {"error":{"message":"model not found"}}`,
+		`data: not-json`,
+	}
+	for _, line := range misses {
+		if _, ok := sseBalanceError(line); ok {
+			t.Fatalf("不应识别为余额不足: %s", line)
+		}
+	}
+}
+
+// TestBalanceExhaustedInPayload 覆盖“HTTP 200 但 error 字段报余额不足”。
+func TestBalanceExhaustedInPayload(t *testing.T) {
+	payload := map[string]any{"error": map[string]any{"message": "预扣费额度失败, 用户剩余额度: ＄0.18, 需要预扣费额度: ＄0.29"}}
+	detail, ok := balanceExhaustedInPayload(payload)
+	if !ok || !strings.Contains(detail, "0.18") {
+		t.Fatalf("应从 error 字段识别余额不足: %q %v", detail, ok)
+	}
+
+	// 正常回答里出现相关字样不能触发删号。
+	normal := map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "余额不足请充值"}}}}
+	if _, ok := balanceExhaustedInPayload(normal); ok {
+		t.Fatalf("正文内容不应触发余额不足判定")
+	}
+	if _, ok := balanceExhaustedInPayload(map[string]any{"error": nil}); ok {
+		t.Fatalf("error 为 null 不应触发")
+	}
+	if _, ok := balanceExhaustedInPayload(nil); ok {
+		t.Fatalf("nil 不应触发")
+	}
+}

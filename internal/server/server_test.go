@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -138,6 +139,37 @@ func (h *harness) do(method, path string, body any, auth string) (*http.Response
 
 func (h *harness) admin(method, path string, body any) (*http.Response, map[string]any) {
 	return h.do(method, path, body, h.token)
+}
+
+// doRaw 与 do 相同，但返回原始响应体，用于校验 SSE 流。
+func (h *harness) doRaw(method, path string, body any, auth string) (*http.Response, string) {
+	h.t.Helper()
+
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		h.t.Fatalf("序列化请求失败: %v", err)
+	}
+	request, err := http.NewRequest(method, h.server.URL+path, bytes.NewReader(encoded))
+	if err != nil {
+		h.t.Fatalf("构造请求失败: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	if auth != "" {
+		request.Header.Set("Authorization", "Bearer "+auth)
+	}
+	if h.csrf != "" {
+		request.Header.Set("X-CSRF-Token", h.csrf)
+	}
+	response, err := h.client.Do(request)
+	if err != nil {
+		h.t.Fatalf("请求失败: %v", err)
+	}
+	raw, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		h.t.Fatalf("读取响应体失败: %v", err)
+	}
+	return response, string(raw)
 }
 
 func (h *harness) get(path string) *http.Response {
@@ -653,8 +685,9 @@ func TestExhaustedAccountIsRemovedAndTrafficFailsOver(t *testing.T) {
 		t.Fatalf("只应保留健康账号: %#v", accounts)
 	}
 	removed := list["removed"].([]any)
-	if len(removed) != 1 || !strings.Contains(removed[0].(map[string]any)["reason"].(string), "余额耗尽") {
-		t.Fatalf("应记录删号原因: %#v", removed)
+	reason := removed[0].(map[string]any)["reason"].(string)
+	if len(removed) != 1 || !strings.Contains(reason, "余额触及下限") || !strings.Contains(reason, "下限 0.50") {
+		t.Fatalf("应记录删号原因与生效下限: %#v", removed)
 	}
 
 	// 调用方无需改动，请求自动切到健康账号。
@@ -1391,5 +1424,466 @@ func TestUnlimitedAccountWithoutBalanceQuery(t *testing.T) {
 	secret := keyBody["data"].(map[string]any)["key"].(string)
 	if response, _ := h.do(http.MethodPost, "/v1/chat/completions", chatBody(), secret); response.StatusCode != http.StatusOK {
 		t.Fatalf("无限额度账号应能承接流量, got %d", response.StatusCode)
+	}
+}
+
+// TestModelAwareAccountSelection 验证“请求特定模型时只会落到提供该模型的账号”。
+func TestModelAwareAccountSelection(t *testing.T) {
+	h := newHarness(t)
+	quota, used := 5000000.0, 0.0
+	site := fakeSite(t, &quota, &used)
+	gptHits := []string{}
+	claudeHits := []string{}
+	gptUpstream := fakeUpstream(t, &gptHits)
+	claudeUpstream := fakeUpstream(t, &claudeHits)
+
+	groupID := h.createGroup("团队 A")
+
+	_, gptBody := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":           "gpt-only",
+		"groupId":        groupID,
+		"baseUrl":        gptUpstream.URL + "/v1",
+		"siteUrl":        site.URL,
+		"userId":         "1",
+		"accessToken":    "tok",
+		"keys":           "sk-gpt1",
+		"selectedModels": []string{"gpt-4o-mini"},
+	})
+	gptAccountID := gptBody["data"].(map[string]any)["id"].(string)
+
+	if response, claudeBody := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":           "claude-only",
+		"groupId":        groupID,
+		"baseUrl":        claudeUpstream.URL + "/v1",
+		"siteUrl":        site.URL,
+		"userId":         "2",
+		"accessToken":    "tok",
+		"keys":           "sk-claude1",
+		"selectedModels": []string{"claude-3-opus"},
+	}); response.StatusCode != http.StatusCreated {
+		t.Fatalf("创建 claude 账号失败: %d %#v", response.StatusCode, claudeBody)
+	}
+
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client", "groupId": groupID})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+
+	// 模型列表是分组内所有账号的并集，与“按模型自动换号”的行为保持一致。
+	_, listed := h.do(http.MethodGet, "/v1/models", nil, secret)
+	entries := listed["data"].([]any)
+	if len(entries) != 2 || entries[0].(map[string]any)["id"] != "claude-3-opus" || entries[1].(map[string]any)["id"] != "gpt-4o-mini" {
+		t.Fatalf("模型列表应为两个账号的并集: %#v", entries)
+	}
+
+	// 连续多次请求 claude，全部应命中 claude 账号，不会因为轮转打到 gpt 账号。
+	for index := 0; index < 4; index++ {
+		payload := map[string]any{
+			"model":    "claude-3-opus",
+			"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		}
+		if response, chat := h.do(http.MethodPost, "/v1/chat/completions", payload, secret); response.StatusCode != http.StatusOK {
+			t.Fatalf("第 %d 次 claude 调用失败: %d %#v", index+1, response.StatusCode, chat)
+		}
+	}
+	if len(claudeHits) != 4 {
+		t.Fatalf("claude 请求应全部命中 claude 账号: %#v", claudeHits)
+	}
+	if len(gptHits) != 0 {
+		t.Fatalf("claude 请求不应命中 gpt 账号: %#v", gptHits)
+	}
+
+	// 反向验证：gpt 请求只命中 gpt 账号。
+	if response, chat := h.do(http.MethodPost, "/v1/chat/completions", chatBody(), secret); response.StatusCode != http.StatusOK {
+		t.Fatalf("gpt 调用失败: %d %#v", response.StatusCode, chat)
+	}
+	if len(gptHits) != 1 || gptHits[0] != "sk-gpt1" {
+		t.Fatalf("gpt 请求应命中 gpt 账号: %#v", gptHits)
+	}
+	if len(claudeHits) != 4 {
+		t.Fatalf("gpt 请求不应命中 claude 账号: %#v", claudeHits)
+	}
+
+	// 无人提供的模型应直接返回 503，并说明是模型维度没有账号。
+	response, missing := h.do(http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":    "gemini-1.5-pro",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, secret)
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("无账号提供该模型应返回 503, got %d %#v", response.StatusCode, missing)
+	}
+	detail := fmt.Sprintf("%v", missing["error"])
+	if !strings.Contains(detail, "gemini-1.5-pro") {
+		t.Fatalf("503 文案应点明模型名: %#v", missing)
+	}
+
+	// 绑定到 gpt 账号的密钥请求 claude 时临时换号，但常驻绑定不被改写。
+	_, boundKey := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "bound", "accountId": gptAccountID})
+	boundSecret := boundKey["data"].(map[string]any)["key"].(string)
+	boundID := boundKey["data"].(map[string]any)["id"].(string)
+
+	claudePayload := map[string]any{
+		"model":    "claude-3-opus",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}
+	if response, chat := h.do(http.MethodPost, "/v1/chat/completions", claudePayload, boundSecret); response.StatusCode != http.StatusOK {
+		t.Fatalf("绑定密钥请求 claude 应临时换号: %d %#v", response.StatusCode, chat)
+	}
+	if len(claudeHits) != 5 {
+		t.Fatalf("绑定密钥的 claude 请求应命中 claude 账号: %#v", claudeHits)
+	}
+
+	_, dashboard := h.admin(http.MethodGet, "/admin/dashboard", nil)
+	for _, item := range dashboard["keys"].([]any) {
+		entry := item.(map[string]any)
+		if entry["id"] != boundID {
+			continue
+		}
+		if entry["accountId"] != gptAccountID {
+			t.Fatalf("临时换号不应改写密钥的常驻绑定: %#v", entry["accountId"])
+		}
+	}
+}
+
+// streamUpstream 模拟流式上游：mode 决定这次连接怎么表现。
+//
+// "error-first"  连一个字节正文都不给就报余额不足（可透明换号）
+// "error-middle" 先吐两段正文再报余额不足（只能截断收尾）
+// "ok"           正常流完
+func streamUpstream(t *testing.T, mode *string, hits *[]string) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models", "/models":
+			_, _ = fmt.Fprint(w, `{"data":[{"id":"gpt-4o-mini"}]}`)
+			return
+		case "/v1/chat/completions", "/chat/completions":
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		*hits = append(*hits, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+
+		shortfall := `data: {"error":{"message":"预扣费额度失败, 用户剩余额度: ＄0.182898, 需要预扣费额度: ＄0.290486"}}` + "\n\n"
+		chunk := func(text string) string {
+			return `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"` + text + `"},"finish_reason":null}]}` + "\n\n"
+		}
+
+		switch *mode {
+		case "error-first":
+			_, _ = io.WriteString(w, shortfall)
+		case "error-middle":
+			_, _ = io.WriteString(w, chunk("前半段"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+			_, _ = io.WriteString(w, shortfall)
+		default:
+			_, _ = io.WriteString(w, chunk("完整"))
+			_, _ = io.WriteString(w, `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`+"\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]"+"\n\n")
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// TestBalanceFloorDropsAccountBeforeUpstreamFails 验证 0.5 USD 安全线：
+// 余额掉到安全线以下时刷新即删号，流量立刻转到余额充足的账号，
+// 调用方不会先吃一次上游的「预扣费失败」。
+func TestBalanceFloorDropsAccountBeforeUpstreamFails(t *testing.T) {
+	h := newHarness(t)
+	thinQuota, thinUsed := 5000000.0, 0.0
+	richQuota, richUsed := 5000000.0, 0.0
+	thinSite := fakeSite(t, &thinQuota, &thinUsed)
+	richSite := fakeSite(t, &richQuota, &richUsed)
+	thinHits := []string{}
+	richHits := []string{}
+	thinUpstream := fakeUpstream(t, &thinHits)
+	richUpstream := fakeUpstream(t, &richHits)
+
+	groupID := h.createGroup("团队 A")
+
+	_, thinBody := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":        "thin",
+		"groupId":     groupID,
+		"baseUrl":     thinUpstream.URL + "/v1",
+		"siteUrl":     thinSite.URL,
+		"userId":      "1",
+		"accessToken": "tok",
+		"keys":        "sk-thin",
+	})
+	thinAccount := thinBody["data"].(map[string]any)
+	thinID := thinAccount["id"].(string)
+	if thinAccount["balanceFloor"].(float64) != 0.5 {
+		t.Fatalf("默认余额下限应为 0.5 USD: %#v", thinAccount["balanceFloor"])
+	}
+
+	_, richBody := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":        "rich",
+		"groupId":     groupID,
+		"baseUrl":     richUpstream.URL + "/v1",
+		"siteUrl":     richSite.URL,
+		"userId":      "2",
+		"accessToken": "tok",
+		"keys":        "sk-rich",
+	})
+	richID := richBody["data"].(map[string]any)["id"].(string)
+
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client", "accountId": thinID})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+
+	// 余额还剩 $0.182898：没到 0，但连一次请求的预扣费都未必够。
+	thinQuota = 91449
+	thinUsed = 500000
+	_, refreshed := h.admin(http.MethodPost, "/admin/accounts/"+thinID+"/refresh", nil)
+	result := refreshed["data"].(map[string]any)
+	if result["balance"].(float64) >= 0.5 {
+		t.Fatalf("测试前置条件错误，余额应低于安全线: %#v", result["balance"])
+	}
+	if result["exhausted"] != true || result["deleted"] != true {
+		t.Fatalf("余额低于 0.5 USD 应判定耗尽并删号: %#v", result)
+	}
+
+	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
+	accounts := list["data"].([]any)
+	if len(accounts) != 1 || accounts[0].(map[string]any)["id"] != richID {
+		t.Fatalf("只应保留余额充足的账号: %#v", accounts)
+	}
+
+	if response, chat := h.do(http.MethodPost, "/v1/chat/completions", chatBody(), secret); response.StatusCode != http.StatusOK {
+		t.Fatalf("应无缝切到余额充足的账号: %d %#v", response.StatusCode, chat)
+	}
+	if len(richHits) != 1 || len(thinHits) != 0 {
+		t.Fatalf("流量应只落在余额充足的账号: rich=%#v thin=%#v", richHits, thinHits)
+	}
+}
+
+// TestStreamBalanceShortfallSwitchesAccountTransparently 覆盖流式响应里
+// 「一个字节都还没下发就发现余额不足」的场景：删号后换账号重来，调用方看到的是完整流。
+func TestStreamBalanceShortfallSwitchesAccountTransparently(t *testing.T) {
+	h := newHarness(t)
+	quotaA, usedA := 5000000.0, 0.0
+	quotaB, usedB := 5000000.0, 0.0
+	siteA := fakeSite(t, &quotaA, &usedA)
+	siteB := fakeSite(t, &quotaB, &usedB)
+
+	badMode := "error-first"
+	goodMode := "ok"
+	badHits := []string{}
+	goodHits := []string{}
+	badUpstream := streamUpstream(t, &badMode, &badHits)
+	goodUpstream := streamUpstream(t, &goodMode, &goodHits)
+
+	groupID := h.createGroup("团队 A")
+
+	_, badBody := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":        "broke",
+		"groupId":     groupID,
+		"baseUrl":     badUpstream.URL + "/v1",
+		"siteUrl":     siteA.URL,
+		"userId":      "1",
+		"accessToken": "tok",
+		"keys":        "sk-broke",
+	})
+	brokeID := badBody["data"].(map[string]any)["id"].(string)
+
+	if response, body := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":        "good",
+		"groupId":     groupID,
+		"baseUrl":     goodUpstream.URL + "/v1",
+		"siteUrl":     siteB.URL,
+		"userId":      "2",
+		"accessToken": "tok",
+		"keys":        "sk-good",
+	}); response.StatusCode != http.StatusCreated {
+		t.Fatalf("创建健康账号失败: %d %#v", response.StatusCode, body)
+	}
+
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client", "accountId": brokeID})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+
+	payload := chatBody()
+	payload["stream"] = true
+	response, raw := h.doRaw(http.MethodPost, "/v1/chat/completions", payload, secret)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("换号后应返回 200: %d %s", response.StatusCode, raw)
+	}
+	if !strings.Contains(raw, "完整") || !strings.Contains(raw, "data: [DONE]") {
+		t.Fatalf("调用方应收到健康账号的完整流: %s", raw)
+	}
+	if strings.Contains(raw, "预扣费") {
+		t.Fatalf("余额不足事件不应透传给调用方: %s", raw)
+	}
+	if len(goodHits) != 1 {
+		t.Fatalf("应重试到健康账号: %#v", goodHits)
+	}
+
+	// 欠费账号已被删除。
+	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
+	for _, item := range list["data"].([]any) {
+		if item.(map[string]any)["id"] == brokeID {
+			t.Fatalf("欠费账号应被自动删除: %#v", list["data"])
+		}
+	}
+	removed := list["removed"].([]any)
+	if len(removed) != 1 || !strings.Contains(removed[0].(map[string]any)["reason"].(string), "余额不足") {
+		t.Fatalf("应记录余额不足删号原因: %#v", removed)
+	}
+}
+
+// TestStreamBalanceShortfallMidStreamTruncates 覆盖「已经下发部分内容后才发现余额不足」：
+// 已发出的内容撤不回来，此时必须立刻截断并正常收尾（finish_reason=length + [DONE]），
+// 同时删号换账号，下一次请求就落到健康账号上。
+func TestStreamBalanceShortfallMidStreamTruncates(t *testing.T) {
+	h := newHarness(t)
+	quotaA, usedA := 5000000.0, 0.0
+	quotaB, usedB := 5000000.0, 0.0
+	siteA := fakeSite(t, &quotaA, &usedA)
+	siteB := fakeSite(t, &quotaB, &usedB)
+
+	badMode := "error-middle"
+	goodMode := "ok"
+	badHits := []string{}
+	goodHits := []string{}
+	badUpstream := streamUpstream(t, &badMode, &badHits)
+	goodUpstream := streamUpstream(t, &goodMode, &goodHits)
+
+	groupID := h.createGroup("团队 A")
+
+	_, badBody := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":        "broke",
+		"groupId":     groupID,
+		"baseUrl":     badUpstream.URL + "/v1",
+		"siteUrl":     siteA.URL,
+		"userId":      "1",
+		"accessToken": "tok",
+		"keys":        "sk-broke",
+	})
+	brokeID := badBody["data"].(map[string]any)["id"].(string)
+
+	h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":        "good",
+		"groupId":     groupID,
+		"baseUrl":     goodUpstream.URL + "/v1",
+		"siteUrl":     siteB.URL,
+		"userId":      "2",
+		"accessToken": "tok",
+		"keys":        "sk-good",
+	})
+
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client", "accountId": brokeID})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+
+	payload := chatBody()
+	payload["stream"] = true
+	response, raw := h.doRaw(http.MethodPost, "/v1/chat/completions", payload, secret)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("已开始下发的流应保持 200: %d %s", response.StatusCode, raw)
+	}
+	if !strings.Contains(raw, "前半段") {
+		t.Fatalf("已下发的内容应保留: %s", raw)
+	}
+	if strings.Contains(raw, "预扣费") {
+		t.Fatalf("余额不足事件不应透传给调用方: %s", raw)
+	}
+	if !strings.Contains(raw, `"finish_reason":"length"`) {
+		t.Fatalf("截断应带 finish_reason=length: %s", raw)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(raw), "data: [DONE]") {
+		t.Fatalf("截断后应以 [DONE] 收尾，避免客户端干等: %q", raw)
+	}
+
+	// 账号已被删除，下一次请求直接落到健康账号。
+	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
+	for _, item := range list["data"].([]any) {
+		if item.(map[string]any)["id"] == brokeID {
+			t.Fatalf("欠费账号应被自动删除: %#v", list["data"])
+		}
+	}
+
+	if response, retry := h.doRaw(http.MethodPost, "/v1/chat/completions", payload, secret); response.StatusCode != http.StatusOK || !strings.Contains(retry, "完整") {
+		t.Fatalf("下一次请求应命中健康账号: %d %s", response.StatusCode, retry)
+	}
+	if len(goodHits) != 1 {
+		t.Fatalf("健康账号应只被第二次请求命中: %#v", goodHits)
+	}
+}
+
+// TestNonStreamBalanceShortfallInBodySwitchesAccount 覆盖「HTTP 200 但响应体里带 error 报余额不足」：
+// 状态码粗筛拦不住这种上游，必须从 error 字段识别并换号。
+func TestNonStreamBalanceShortfallInBodySwitchesAccount(t *testing.T) {
+	h := newHarness(t)
+	quotaA, usedA := 5000000.0, 0.0
+	quotaB, usedB := 5000000.0, 0.0
+	siteA := fakeSite(t, &quotaA, &usedA)
+	siteB := fakeSite(t, &quotaB, &usedB)
+
+	brokeHits := []string{}
+	brokeUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models", "/models":
+			_, _ = fmt.Fprint(w, `{"data":[{"id":"gpt-4o-mini"}]}`)
+		case "/v1/chat/completions", "/chat/completions":
+			brokeHits = append(brokeHits, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+			w.Header().Set("Content-Type", "application/json")
+			// 状态码 200，余额不足只写在 error 字段里。
+			_, _ = fmt.Fprint(w, `{"error":{"message":"预扣费额度失败, 用户剩余额度: ＄0.182898, 需要预扣费额度: ＄0.290486"}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(brokeUpstream.Close)
+
+	goodHits := []string{}
+	goodUpstream := fakeUpstream(t, &goodHits)
+
+	groupID := h.createGroup("团队 A")
+
+	_, badBody := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":        "broke",
+		"groupId":     groupID,
+		"baseUrl":     brokeUpstream.URL + "/v1",
+		"siteUrl":     siteA.URL,
+		"userId":      "1",
+		"accessToken": "tok",
+		"keys":        "sk-broke",
+	})
+	brokeID := badBody["data"].(map[string]any)["id"].(string)
+
+	h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":        "good",
+		"groupId":     groupID,
+		"baseUrl":     goodUpstream.URL + "/v1",
+		"siteUrl":     siteB.URL,
+		"userId":      "2",
+		"accessToken": "tok",
+		"keys":        "sk-good",
+	})
+
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client", "accountId": brokeID})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+
+	response, chat := h.do(http.MethodPost, "/v1/chat/completions", chatBody(), secret)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("应换号后返回正常结果: %d %#v", response.StatusCode, chat)
+	}
+	if chat["id"] != "cmpl_1" {
+		t.Fatalf("应返回健康账号的响应: %#v", chat)
+	}
+	if len(goodHits) != 1 || goodHits[0] != "sk-good" {
+		t.Fatalf("应命中健康账号: %#v", goodHits)
+	}
+
+	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
+	for _, item := range list["data"].([]any) {
+		if item.(map[string]any)["id"] == brokeID {
+			t.Fatalf("欠费账号应被自动删除: %#v", list["data"])
+		}
 	}
 }

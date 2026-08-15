@@ -62,7 +62,7 @@
     }
 
     el("totals-hint").textContent = (account.exhausted || 0) > 0
-      ? "有 " + account.exhausted + " 个账号余额耗尽，等待自动清理"
+      ? "有 " + account.exhausted + " 个账号余额已触及 $0.50 下限，等待自动清理"
       : "分组 " + groups.length + " 个 · 负载均衡策略 " + (totals.strategy || "-");
   }
 
@@ -442,7 +442,7 @@
         renderKeys();
       }
       el("refresh-hint").textContent = "共 " + (totals.accounts ? totals.accounts.total : 0) +
-        " 个账号 · 刷新后余额耗尽的账号会被自动删除";
+        " 个账号 · 刷新后余额低于 $0.50 的账号会被自动删除";
     } catch (err) {
       LB.toast(err.message, "error");
     }

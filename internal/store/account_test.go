@@ -607,3 +607,246 @@ func TestAccountPersistence(t *testing.T) {
 		}
 	})
 }
+
+func TestUsableAccountsForModelFiltersByProviderModels(t *testing.T) {
+	gptAccount := newAccount(t, "gpt-only", 10)
+	claudeAccount := newAccount(t, "claude-only", 10)
+
+	data := newTestData(gptAccount, claudeAccount)
+	gptProvider, _ := BuildProvider(ProviderInput{BaseURL: "https://gpt.example.com", AccountID: gptAccount.ID, Models: []string{"gpt-4o", "gpt-4o-mini"}})
+	claudeProvider, _ := BuildProvider(ProviderInput{BaseURL: "https://claude.example.com", AccountID: claudeAccount.ID, Models: []string{"claude-3-opus"}})
+	data.Providers = append(data.Providers, gptProvider, claudeProvider)
+	data.reindex()
+
+	if accounts := data.UsableAccountsForModel("", "gpt-4o"); len(accounts) != 1 || accounts[0].ID != gptAccount.ID {
+		t.Fatalf("请求 gpt-4o 只应命中 gpt 账号: %#v", accounts)
+	}
+	if accounts := data.UsableAccountsForModel("", "claude-3-opus"); len(accounts) != 1 || accounts[0].ID != claudeAccount.ID {
+		t.Fatalf("请求 claude 只应命中 claude 账号: %#v", accounts)
+	}
+	if accounts := data.UsableAccountsForModel("", "gemini-pro"); len(accounts) != 0 {
+		t.Fatalf("无人提供的模型不应有候选账号: %#v", accounts)
+	}
+	// 不限模型时两个账号都算可用。
+	if accounts := data.UsableAccounts(""); len(accounts) != 2 {
+		t.Fatalf("不限模型应返回全部可用账号: %#v", accounts)
+	}
+
+	if !data.AccountServesModel(gptAccount.ID, "gpt-4o-mini") {
+		t.Fatalf("gpt 账号应能承接 gpt-4o-mini")
+	}
+	if data.AccountServesModel(gptAccount.ID, "claude-3-opus") {
+		t.Fatalf("gpt 账号不应被判定为能承接 claude")
+	}
+}
+
+func TestAssignAccountForModelPicksAccountThatHasIt(t *testing.T) {
+	// gpt 账号余额更低、创建更早，正常排序会优先命中它；
+	// 因此只要请求 claude 时选中了 claude 账号，就证明是模型维度在起作用。
+	gptAccount := newAccount(t, "gpt-only", 5)
+	claudeAccount := newAccount(t, "claude-only", 500)
+
+	data := newTestData(gptAccount, claudeAccount)
+	gptProvider, _ := BuildProvider(ProviderInput{BaseURL: "https://gpt.example.com", AccountID: gptAccount.ID, Models: []string{"gpt-4o-mini"}})
+	claudeProvider, _ := BuildProvider(ProviderInput{BaseURL: "https://claude.example.com", AccountID: claudeAccount.ID, Models: []string{"claude-3-opus"}})
+	data.Providers = append(data.Providers, gptProvider, claudeProvider)
+
+	key, _ := BuildKey(KeyInput{Name: "k"})
+	data.Keys = append(data.Keys, key)
+	data.reindex()
+
+	chosen := data.AssignAccountForModel(key, "gpt-4o-mini")
+	if chosen == nil || chosen.ID != gptAccount.ID {
+		t.Fatalf("请求 gpt-4o-mini 应落到 gpt 账号: %#v", chosen)
+	}
+	bound := key.AccountID
+	if bound != gptAccount.ID {
+		t.Fatalf("首次分配应写入常驻绑定: %s", bound)
+	}
+
+	// 绑定账号接不了 claude：本次请求换到 claude 账号，但常驻绑定不动，
+	// 否则一次冷门模型请求就会把密钥永久迁走、打乱既有均摊。
+	switched := data.AssignAccountForModel(key, "claude-3-opus")
+	if switched == nil || switched.ID != claudeAccount.ID {
+		t.Fatalf("请求 claude 应换到 claude 账号: %#v", switched)
+	}
+	if key.AccountID != bound {
+		t.Fatalf("临时换号不应改写常驻绑定: %s -> %s", bound, key.AccountID)
+	}
+
+	// 回到原模型仍然粘在原账号。
+	if again := data.AssignAccountForModel(key, "gpt-4o-mini"); again == nil || again.ID != gptAccount.ID {
+		t.Fatalf("原模型应保持粘性: %#v", again)
+	}
+
+	// 谁都不提供的模型必须分配失败，而不是硬塞一个账号。
+	if nobody := data.AssignAccountForModel(key, "gemini-pro"); nobody != nil {
+		t.Fatalf("无人提供的模型不应分配到账号: %#v", nobody)
+	}
+}
+
+func TestAssignAccountForModelSkipsCooldownAndDisabledProviders(t *testing.T) {
+	hot := newAccount(t, "hot", 10)
+	backup := newAccount(t, "backup", 10)
+
+	data := newTestData(hot, backup)
+	hotProvider, _ := BuildProvider(ProviderInput{BaseURL: "https://hot.example.com", AccountID: hot.ID, Models: []string{"gpt-4o"}})
+	backupProvider, _ := BuildProvider(ProviderInput{BaseURL: "https://backup.example.com", AccountID: backup.ID, Models: []string{"gpt-4o"}})
+	data.Providers = append(data.Providers, hotProvider, backupProvider)
+
+	key, _ := BuildKey(KeyInput{Name: "k"})
+	data.Keys = append(data.Keys, key)
+	data.reindex()
+
+	// 唯一支持该模型的上游进入冷却后，账号就不该再承接这个模型。
+	hotProvider.CooldownUntil = time.Now().Add(time.Minute)
+	if accounts := data.UsableAccountsForModel("", "gpt-4o"); len(accounts) != 1 || accounts[0].ID != backup.ID {
+		t.Fatalf("冷却中的上游不应让账号入选: %#v", accounts)
+	}
+
+	backupProvider.Enabled = false
+	if accounts := data.UsableAccountsForModel("", "gpt-4o"); len(accounts) != 0 {
+		t.Fatalf("禁用上游后不应还有候选: %#v", accounts)
+	}
+	if data.AssignAccountForModel(key, "gpt-4o") != nil {
+		t.Fatalf("没有可承接该模型的账号时应分配失败")
+	}
+}
+
+func TestAccountKeyPressureCountsOnlyMatchingProviders(t *testing.T) {
+	// wide 账号挂 3 个 Key 但只有 1 个支持 claude，narrow 账号 1 个 Key 且支持 claude。
+	// 按总数算 wide 压力更低会被优先选中，按模型算两者相同，此时余额更高的 narrow 胜出。
+	wide := newAccount(t, "wide", 10)
+	narrow := newAccount(t, "narrow", 999)
+
+	data := newTestData(wide, narrow)
+	for _, models := range [][]string{{"gpt-4o"}, {"gpt-4o-mini"}, {"claude-3-opus"}} {
+		provider, _ := BuildProvider(ProviderInput{BaseURL: "https://wide.example.com", AccountID: wide.ID, Models: models})
+		data.Providers = append(data.Providers, provider)
+	}
+	narrowProvider, _ := BuildProvider(ProviderInput{BaseURL: "https://narrow.example.com", AccountID: narrow.ID, Models: []string{"claude-3-opus"}})
+	data.Providers = append(data.Providers, narrowProvider)
+	data.reindex()
+
+	if got := data.accountKeyPressureForModel(wide.ID, "claude-3-opus"); got != 0 {
+		t.Fatalf("未绑定密钥时压力应为 0: %v", got)
+	}
+
+	key, _ := BuildKey(KeyInput{Name: "k"})
+	key.AccountID = wide.ID
+	data.Keys = append(data.Keys, key)
+	data.reindex()
+
+	// 一个密钥压在 wide 上：按全部 3 个 Key 算是 1/3，按 claude 维度只有 1 个 Key，是 1。
+	if got := data.accountKeyPressure(wide.ID); got != 1.0/3.0 {
+		t.Fatalf("不限模型时应按全部可用上游计算: %v", got)
+	}
+	if got := data.accountKeyPressureForModel(wide.ID, "claude-3-opus"); got != 1 {
+		t.Fatalf("按模型应只计入支持该模型的上游: %v", got)
+	}
+
+	fresh, _ := BuildKey(KeyInput{Name: "fresh"})
+	data.Keys = append(data.Keys, fresh)
+	data.reindex()
+	if chosen := data.AssignAccountForModel(fresh, "claude-3-opus"); chosen == nil || chosen.ID != narrow.ID {
+		t.Fatalf("claude 请求应分给压力相同但余额更高的 narrow: %#v", chosen)
+	}
+}
+
+// TestBalanceFloorDefaultsToHalfDollar 锁定内置 0.5 USD 安全线。
+//
+// 余额只剩几毛钱时上游大概率连一次预扣费都过不了，提前删号比让调用方吃一次
+// 失败再换号体验好得多；账号自填的下限更高时仍然尊重账号设置。
+func TestBalanceFloorDefaultsToHalfDollar(t *testing.T) {
+	if MinBalanceFloorUSD != 0.5 {
+		t.Fatalf("内置安全线应为 0.5 USD, got %v", MinBalanceFloorUSD)
+	}
+
+	account := newAccount(t, "floor", 10)
+	if account.MinBalance != 0 {
+		t.Fatalf("默认最低余额应为 0: %v", account.MinBalance)
+	}
+	if account.BalanceFloor() != MinBalanceFloorUSD {
+		t.Fatalf("未自填下限时应抬到安全线: %v", account.BalanceFloor())
+	}
+
+	account.MinBalance = 2
+	if account.BalanceFloor() != 2 {
+		t.Fatalf("自填下限更高时应生效: %v", account.BalanceFloor())
+	}
+
+	view := PublicAccount(newAccount(t, "view", 10), 1, 0)
+	if view["balanceFloor"] != MinBalanceFloorUSD {
+		t.Fatalf("视图应暴露生效下限: %#v", view["balanceFloor"])
+	}
+}
+
+// TestExhaustedAtBalanceFloor 校验 0.5 USD 上下的判定边界。
+func TestExhaustedAtBalanceFloor(t *testing.T) {
+	cases := []struct {
+		balance   float64
+		exhausted bool
+	}{
+		{0, true},
+		{0.182898, true},
+		{0.49, true},
+		{0.5, true},
+		{0.500001, false},
+		{1.25, false},
+	}
+	for _, item := range cases {
+		account := newAccount(t, "edge", item.balance)
+		if account.Exhausted() != item.exhausted {
+			t.Fatalf("余额 %v 的耗尽判定应为 %v", item.balance, item.exhausted)
+		}
+		if account.Usable() == item.exhausted {
+			t.Fatalf("余额 %v 的可用判定与耗尽判定矛盾", item.balance)
+		}
+	}
+
+	// 无限额度账号不受安全线约束。
+	unlimited, _ := BuildAccount(AccountInput{Name: "free", BaseURL: "https://a.com/v1"})
+	unlimited.Balance = 0
+	if unlimited.Exhausted() || !unlimited.Usable() {
+		t.Fatalf("无限额度账号不应被安全线删掉")
+	}
+}
+
+// TestAssignAccountSkipsAccountsBelowFloor 保证低于安全线的账号不再被分配。
+func TestAssignAccountSkipsAccountsBelowFloor(t *testing.T) {
+	healthy := newAccount(t, "healthy", 20)
+	thin := newAccount(t, "thin", 0.3)
+
+	data := newTestData(healthy, thin)
+	for _, account := range data.Accounts {
+		provider, _ := BuildProvider(ProviderInput{BaseURL: "https://x.example.com", AccountID: account.ID})
+		data.Providers = append(data.Providers, provider)
+	}
+	data.reindex()
+
+	if usable := data.UsableAccounts(""); len(usable) != 1 || usable[0].ID != healthy.ID {
+		t.Fatalf("低于安全线的账号不应进入可用池: %#v", usable)
+	}
+
+	for index := 0; index < 3; index++ {
+		key, _ := BuildKey(KeyInput{Name: "k"})
+		data.Keys = append(data.Keys, key)
+		data.reindex()
+		account := data.AssignAccount(key)
+		if account == nil || account.ID != healthy.ID {
+			t.Fatalf("第 %d 次分配应命中余额充足的账号: %#v", index+1, account)
+		}
+	}
+
+	// 已绑定的密钥在账号掉到安全线以下后会被解绑并改派。
+	bound, _ := BuildKey(KeyInput{Name: "bound"})
+	bound.AccountID = thin.ID
+	data.Keys = append(data.Keys, bound)
+	data.reindex()
+	if account := data.AssignAccount(bound); account == nil || account.ID != healthy.ID {
+		t.Fatalf("绑定到低余额账号的密钥应被改派: %#v", account)
+	}
+	if bound.AccountID != healthy.ID {
+		t.Fatalf("改派后应更新常驻绑定: %s", bound.AccountID)
+	}
+}

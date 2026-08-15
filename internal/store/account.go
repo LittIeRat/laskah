@@ -26,6 +26,13 @@ const DefaultRequestRefreshSeconds = 60
 // MaxRequestRefreshSeconds 限制请求时刷新的间隔上限。
 const MaxRequestRefreshSeconds = 3600
 
+// MinBalanceFloorUSD 是内置的余额安全线（USD）。
+//
+// 余额掉到这个水位以下时，账号很可能连一次正常请求的预扣费都付不起：
+// 继续把流量打过去只会换来上游报错、重试与截断，体验比直接换号差得多。
+// 因此不论账号自己填的最低余额是多少，这条线都强制生效。
+const MinBalanceFloorUSD = 0.5
+
 // AccountStats 记录账号维度的累计用量。
 type AccountStats struct {
 	Requests    int64      `json:"requests"`
@@ -449,6 +456,17 @@ func (a *Account) Unlimited() bool {
 	return !a.HasBalanceQuery()
 }
 
+// BalanceFloor 返回该账号真正生效的余额下限。
+//
+// 取「账号自填的最低余额」与内置安全线 MinBalanceFloorUSD 的较大值：
+// 填 0（默认）也会被抬到 0.5 USD，填得更高则尊重账号自己的设置。
+func (a *Account) BalanceFloor() float64 {
+	if a.MinBalance > MinBalanceFloorUSD {
+		return a.MinBalance
+	}
+	return MinBalanceFloorUSD
+}
+
 // Usable 判断账号当前是否可以承接流量。
 //
 // 查询失败（CheckError 非空）时保持可用，避免网络抖动导致全站不可用。
@@ -462,15 +480,18 @@ func (a *Account) Usable() bool {
 	if a.CheckedAt == nil || a.CheckError != "" {
 		return true
 	}
-	return a.Balance > a.MinBalance
+	return a.Balance > a.BalanceFloor()
 }
 
-// Exhausted 判断账号余额是否已耗尽（需已成功查询过余额）。
+// Exhausted 判断账号余额是否已触及下限（需已成功查询过余额）。
+//
+// 余额 <= BalanceFloor() 即视为耗尽：账号只剩不到一次请求的钱时提前退场，
+// 比等上游报「预扣费失败」再删号更早，调用方也不会先吃一次失败。
 func (a *Account) Exhausted() bool {
 	if a.Unlimited() {
 		return false
 	}
-	return a.CheckedAt != nil && a.CheckError == "" && a.Balance <= a.MinBalance
+	return a.CheckedAt != nil && a.CheckError == "" && a.Balance <= a.BalanceFloor()
 }
 
 // QueryTimeout 返回额度查询超时时长。
@@ -538,6 +559,7 @@ func PublicAccount(a *Account, apiCount, boundKeys int) map[string]any {
 		"enabled":           a.Enabled,
 		"autoDelete":        a.AutoDelete,
 		"minBalance":        a.MinBalance,
+		"balanceFloor":      a.BalanceFloor(),
 		"balance":           a.Balance,
 		"usedAmount":        a.UsedAmount,
 		"totalAmount":       a.TotalAmount,

@@ -218,6 +218,11 @@
       badges.push(h("span", { class: "badge info", text: "∞ 无限余额" }));
     } else {
       badges.push(h("span", { class: "badge info", text: "余额 " + LB.fmtMoney(account.balance, account.currency) }));
+      // 余额已进入「下一次刷新就会删号」的区间时提前提示，避免管理员措手不及。
+      var floor = account.balanceFloor || 0;
+      if (!account.exhausted && floor > 0 && account.balance <= floor * 2) {
+        badges.push(h("span", { class: "badge warn", text: "接近下限 " + LB.fmtMoney(floor, account.currency) }));
+      }
     }
     if (account.planName) {
       badges.push(h("span", { class: "badge", text: account.planName }));
@@ -241,6 +246,7 @@
         detail += " · 未配置额度查询，视为无限余额";
       } else {
         detail += " · 已用 " + LB.fmtMoney(account.usedAmount, account.currency) +
+          " · 余额下限 " + LB.fmtMoney(account.balanceFloor || 0, account.currency) +
           " · 查询于 " + LB.fmtTime(account.checkedAt);
       }
       detail += " · " + LB.fmtNumber(account.stats.totalTokens) + " tokens · " +
@@ -426,7 +432,7 @@
         field("用户 ID", userIdInput, "New API 个人设置页可见"),
         field("超时时间（秒）", timeoutInput),
         field("自动查询间隔（分钟，0 表示不自动查询）", intervalInput),
-        field("最低余额（低于则视为耗尽）", minBalanceInput),
+        field("最低余额（低于则视为耗尽）", minBalanceInput, "内置安全线 $0.50：填 0 也会按 $0.50 执行，只有填更大的值才会生效"),
         field("请求时刷新间隔（秒）", reqRefreshInput, "调用到达时若余额数据超过该时长未更新，先查一次再分配流量"),
         switchBlock("余额耗尽时自动删除账号", autoDelete, "查询失败不会触发删除，避免网络抖动误删"),
         switchBlock("请求时刷新余额", refreshOnRequest, "调用到达时先确认余额，防止余额用完仍继续使用该账号")
@@ -497,7 +503,7 @@
       var response = await LB.request("POST", "/admin/accounts/" + encodeURIComponent(account.id) + "/refresh");
       var result = response.data || {};
       if (result.deleted) {
-        LB.toast("余额已耗尽，账号「" + account.name + "」已自动删除", "error");
+        LB.toast("余额已触及下限（$0.50 安全线），账号「" + account.name + "」已自动删除", "error");
       } else if (result.error) {
         LB.toast("查询失败：" + result.error, "error");
       } else {
