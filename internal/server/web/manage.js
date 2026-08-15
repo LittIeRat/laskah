@@ -383,6 +383,15 @@
       modelStatus.textContent = "共 " + probed.length + " 个模型，已勾选 " + count + " 个" + (count ? "" : "（留空表示接受全部）");
     }
 
+    // 探测失败的原因往往很长（上游可能整页返回 HTML），固定展示在弹窗里而不是只弹提示条。
+    var probeError = h("div", { class: "inline-error" });
+    probeError.style.display = "none";
+
+    function showProbeError(text) {
+      probeError.textContent = text;
+      probeError.style.display = text ? "" : "none";
+    }
+
     var probeButton = h("button", { class: "btn btn-sm", type: "button", text: "获取模型列表" });
     probeButton.addEventListener("click", async function () {
       var keys = parseKeys(keysInput.value);
@@ -396,6 +405,7 @@
       }
       probeButton.disabled = true;
       probeButton.textContent = "获取中…";
+      showProbeError("");
       try {
         var response = await LB.request("POST", "/admin/models/probe", {
           baseUrl: baseInput.value.trim(),
@@ -404,9 +414,13 @@
         probed = response.data || [];
         selected = {};
         renderModels();
+        if (!probed.length) {
+          showProbeError("上游返回了空的模型列表，留空勾选表示接受全部模型。");
+        }
         LB.toast("获取到 " + probed.length + " 个模型（" + response.latencyMs + " ms）", "ok");
       } catch (err) {
-        LB.toast(err.message, "error");
+        showProbeError(err.message);
+        LB.toast("获取模型列表失败，详情见下方说明", "error");
       } finally {
         probeButton.disabled = false;
         probeButton.textContent = "获取模型列表";
@@ -469,6 +483,7 @@
         h("div", { class: "field full" }, [
           h("label", { text: "模型列表" }),
           h("div", { class: "btn-row" }, [probeButton, selectAll, clearAll, modelStatus]),
+          probeError,
           modelGrid
         ])
       ]),

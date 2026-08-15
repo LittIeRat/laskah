@@ -1,7 +1,10 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -65,6 +68,72 @@ func TestAuthHeadersPerProviderType(t *testing.T) {
 	none := AuthHeaders(&store.Provider{Type: store.TypeOpenAI})
 	if none.Get("Authorization") != "" {
 		t.Fatalf("无密钥时不应设置鉴权头")
+	}
+
+	// Cloudflare 一类的 WAF 会拦掉 Go 默认 UA，所有上游请求都要带浏览器标识。
+	for name, header := range map[string]http.Header{"openai": openai, "anthropic": claude, "gemini": gemini, "none": none} {
+		agent := header.Get("User-Agent")
+		if agent == "" || strings.Contains(agent, "Go-http-client") {
+			t.Fatalf("%s 缺少浏览器 UA: %q", name, agent)
+		}
+		if header.Get("Accept") != "application/json" {
+			t.Fatalf("%s 缺少 Accept 头", name)
+		}
+	}
+}
+
+// TestListModelsRejectsChallengePage 确认上游回人机验证页时按失败处理并给出可读原因。
+func TestListModelsRejectsChallengePage(t *testing.T) {
+	var gotAgent string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAgent = r.Header.Get("User-Agent")
+		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+		// 200 但正文是拦截页，这是 Cloudflare 最常见的表现。
+		_, _ = w.Write([]byte(`<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title></head><body>challenges.cloudflare.com</body></html>`))
+	}))
+	defer server.Close()
+
+	result := NewUpstream().ListModels(context.Background(), &store.Provider{
+		Type:      store.TypeOpenAI,
+		BaseURL:   server.URL + "/v1",
+		APIKey:    "sk-a",
+		Paths:     store.DefaultPaths(store.TypeOpenAI),
+		TimeoutMS: 5000,
+	})
+	if result.OK {
+		t.Fatal("拦截页不应被当成成功")
+	}
+	if !strings.Contains(result.Error, "人机验证") {
+		t.Fatalf("应说明是人机验证页: %s", result.Error)
+	}
+	if strings.Contains(result.Error, "<") {
+		t.Fatalf("错误信息不应包含原始 HTML: %s", result.Error)
+	}
+	if gotAgent == "" || strings.Contains(gotAgent, "Go-http-client") {
+		t.Fatalf("请求未带浏览器 UA: %q", gotAgent)
+	}
+}
+
+// TestListModelsParsesJSON 确认正常 JSON 仍能解析。
+func TestListModelsParsesJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-4o-mini"},{"id":"claude-3-5-sonnet"}]}`))
+	}))
+	defer server.Close()
+
+	result := NewUpstream().ListModels(context.Background(), &store.Provider{
+		Type:      store.TypeOpenAI,
+		BaseURL:   server.URL + "/v1",
+		APIKey:    "sk-a",
+		Paths:     store.DefaultPaths(store.TypeOpenAI),
+		TimeoutMS: 5000,
+	})
+	if !result.OK {
+		t.Fatalf("正常响应应成功: %s", result.Error)
+	}
+	if len(result.Models) != 2 {
+		t.Fatalf("应解析出 2 个模型, got %v", result.Models)
 	}
 }
 

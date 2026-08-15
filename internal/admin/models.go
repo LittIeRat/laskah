@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"laskah/internal/gateway"
 	"laskah/internal/httpx"
 	"laskah/internal/store"
 )
@@ -62,7 +63,10 @@ func (h *Handler) handleModelProbe(w http.ResponseWriter, r *http.Request) {
 		if message == "" {
 			message = "模型列表获取失败"
 		}
-		httpx.Error(w, http.StatusBadGateway, "获取模型列表失败: "+message, map[string]any{"status": result.Status})
+		httpx.Error(w, http.StatusBadGateway, "获取模型列表失败: "+message, map[string]any{
+			"status": result.Status,
+			"url":    gateway.ModelsURL(&probe),
+		})
 		return
 	}
 

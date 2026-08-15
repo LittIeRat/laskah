@@ -152,3 +152,34 @@ func TestFetchUsageErrorField(t *testing.T) {
 		t.Fatalf("应识别 error 字段: %v", snapshot.Err)
 	}
 }
+
+// TestFetchReportsChallengePage 确认站点被 Cloudflare 挡下时给出可读原因而不是 JSON 语法错误。
+func TestFetchReportsChallengePage(t *testing.T) {
+	var gotAgent string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAgent = r.Header.Get("User-Agent")
+		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+		_, _ = fmt.Fprint(w, `<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title></head><body>challenges.cloudflare.com</body></html>`)
+	}))
+	defer server.Close()
+
+	snapshot := NewClient().Fetch(context.Background(), Credentials{
+		BaseURL:     server.URL,
+		UserID:      "114514",
+		AccessToken: "tok-abc",
+		Timeout:     5 * time.Second,
+	})
+	if snapshot.Err == nil {
+		t.Fatal("拦截页应视为查询失败")
+	}
+	message := snapshot.Err.Error()
+	if !strings.Contains(message, "人机验证") {
+		t.Fatalf("应说明是人机验证页: %s", message)
+	}
+	if strings.Contains(message, "<") {
+		t.Fatalf("错误信息不应包含原始 HTML: %s", message)
+	}
+	if gotAgent == "" || strings.Contains(gotAgent, "Go-http-client") {
+		t.Fatalf("额度查询未带浏览器 UA: %q", gotAgent)
+	}
+}

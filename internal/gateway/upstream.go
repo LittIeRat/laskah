@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"laskah/internal/httpx"
 	"laskah/internal/store"
 )
 
@@ -61,6 +62,9 @@ func ModelsURL(p *store.Provider) string {
 func AuthHeaders(p *store.Provider) http.Header {
 	header := http.Header{}
 	header.Set("Content-Type", "application/json")
+	header.Set("Accept", "application/json")
+	// 不带浏览器 UA 时 Cloudflare 一类的 WAF 会直接回人机验证页。
+	header.Set("User-Agent", httpx.UpstreamUserAgent())
 	for key, value := range p.Headers {
 		header.Set(key, value)
 	}
@@ -326,15 +330,23 @@ func (u *Upstream) ListModels(parent context.Context, provider *store.Provider) 
 	defer response.Body.Close()
 
 	latency := time.Since(startedAt).Milliseconds()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return ProbeResult{Status: response.StatusCode, LatencyMS: latency, Error: readSnippet(response.Body)}
-	}
-
-	decoded := map[string]any{}
+	contentType := response.Header.Get("Content-Type")
 	raw, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if err != nil {
 		return ProbeResult{Status: response.StatusCode, LatencyMS: latency, Error: err.Error()}
 	}
+	body := string(raw)
+
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return ProbeResult{Status: response.StatusCode, LatencyMS: latency, Error: httpx.DescribeUpstreamFailure(contentType, body)}
+	}
+
+	// 有些站点被 WAF 挡下时仍回 200，正文却是人机验证页，必须按失败处理。
+	if httpx.LooksLikeHTML(contentType, body) {
+		return ProbeResult{Status: response.StatusCode, LatencyMS: latency, Error: httpx.DescribeUpstreamFailure(contentType, body)}
+	}
+
+	decoded := map[string]any{}
 	models := []string{}
 	if err := json.Unmarshal(raw, &decoded); err == nil {
 		models = extractModelIDs(decoded["data"])
@@ -343,9 +355,10 @@ func (u *Upstream) ListModels(parent context.Context, provider *store.Provider) 
 		}
 	} else {
 		var list []any
-		if err := json.Unmarshal(raw, &list); err == nil {
-			models = extractModelIDs(list)
+		if err := json.Unmarshal(raw, &list); err != nil {
+			return ProbeResult{Status: response.StatusCode, LatencyMS: latency, Error: "上游响应不是合法 JSON: " + httpx.CleanUpstreamText(contentType, body)}
 		}
+		models = extractModelIDs(list)
 	}
 	return ProbeResult{OK: true, Status: response.StatusCode, LatencyMS: latency, Models: models}
 }
@@ -373,7 +386,7 @@ func extractModelIDs(value any) []string {
 }
 
 func readSnippet(body io.Reader) string {
-	raw, err := io.ReadAll(io.LimitReader(body, 800))
+	raw, err := io.ReadAll(io.LimitReader(body, 8<<10))
 	if err != nil {
 		return ""
 	}
@@ -381,8 +394,19 @@ func readSnippet(body io.Reader) string {
 }
 
 // ReadErrorBody 读取错误响应正文片段。
+//
+// 上游被 WAF 挡下时会回一整页 HTML，直接透传会把提示条撑爆，也会让「余额不足」
+// 关键字匹配失效，所以这里先压成一行纯文本。限长比界面提示宽一些，留给关键字匹配。
 func ReadErrorBody(response *http.Response) string {
-	return readSnippet(response.Body)
+	raw := readSnippet(response.Body)
+	contentType := ""
+	if response != nil {
+		contentType = response.Header.Get("Content-Type")
+	}
+	if httpx.IsChallengePage(contentType, raw) {
+		return httpx.DescribeUpstreamFailure(contentType, raw)
+	}
+	return httpx.CleanUpstreamTextLimit(contentType, raw, 600)
 }
 
 func asBool(value any) bool {

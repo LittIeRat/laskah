@@ -5,11 +5,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"laskah/internal/httpx"
 )
 
 // DefaultQuotaPerUnit 是 New API 默认的额度换算单位（quota / 500000 = 1 USD）。
@@ -116,6 +119,7 @@ func (c *Client) quotaPerUnit(ctx context.Context, base string) float64 {
 		return DefaultQuotaPerUnit
 	}
 	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", httpx.UpstreamUserAgent())
 	response, err := c.http.Do(request)
 	if err != nil {
 		return DefaultQuotaPerUnit
@@ -145,6 +149,8 @@ func (c *Client) fetchUserSelf(ctx context.Context, base string, creds Credentia
 		return Snapshot{Err: err}, false
 	}
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", httpx.UpstreamUserAgent())
 	request.Header.Set("Authorization", "Bearer "+token)
 	if userID := strings.TrimSpace(creds.UserID); userID != "" {
 		request.Header.Set("New-Api-User", userID)
@@ -157,7 +163,7 @@ func (c *Client) fetchUserSelf(ctx context.Context, base string, creds Credentia
 	defer drain(response)
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return Snapshot{Err: fmt.Errorf("/api/user/self 返回 HTTP %d: %s", response.StatusCode, snippet(response.Body))}, false
+		return Snapshot{Err: describeFailure(response, "/api/user/self")}, false
 	}
 
 	payload := struct {
@@ -169,8 +175,8 @@ func (c *Client) fetchUserSelf(ctx context.Context, base string, creds Credentia
 			UsedQuota float64 `json:"used_quota"`
 		} `json:"data"`
 	}{}
-	if err := decode(response.Body, &payload); err != nil {
-		return Snapshot{Err: err}, false
+	if err := readJSONBody(response, &payload); err != nil {
+		return Snapshot{Err: fmt.Errorf("/api/user/self %w", err)}, false
 	}
 	if !payload.Success {
 		message := payload.Message
@@ -209,6 +215,8 @@ func (c *Client) fetchUsage(ctx context.Context, base string, creds Credentials)
 		return Snapshot{Err: err}, false
 	}
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", httpx.UpstreamUserAgent())
 	request.Header.Set("Authorization", "Bearer "+apiKey)
 
 	response, err := c.http.Do(request)
@@ -218,7 +226,7 @@ func (c *Client) fetchUsage(ctx context.Context, base string, creds Credentials)
 	defer drain(response)
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return Snapshot{Err: fmt.Errorf("/api/usage 返回 HTTP %d: %s", response.StatusCode, snippet(response.Body))}, false
+		return Snapshot{Err: describeFailure(response, "/api/usage")}, false
 	}
 
 	payload := struct {
@@ -226,8 +234,8 @@ func (c *Client) fetchUsage(ctx context.Context, base string, creds Credentials)
 		Balance float64 `json:"balance"`
 		Used    float64 `json:"used"`
 	}{}
-	if err := decode(response.Body, &payload); err != nil {
-		return Snapshot{Err: err}, false
+	if err := readJSONBody(response, &payload); err != nil {
+		return Snapshot{Err: fmt.Errorf("/api/usage %w", err)}, false
 	}
 	if payload.Error != nil {
 		return Snapshot{Err: fmt.Errorf("/api/usage 返回错误: %v", payload.Error)}, false
@@ -250,11 +258,38 @@ func decode(body io.Reader, target any) error {
 }
 
 func snippet(body io.Reader) string {
-	raw, err := io.ReadAll(io.LimitReader(body, 400))
+	raw, err := io.ReadAll(io.LimitReader(body, 8<<10))
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(raw))
+}
+
+// readJSONBody 解析 JSON 正文，正文是 HTML 时直接给出「被 WAF 拦下」这类可读原因。
+//
+// New API 站点挂在 Cloudflare 后面时，服务端直连会拿到一整页人机验证 HTML，
+// 若照原样丢给 json.Unmarshal，界面只会看到一句难以定位的语法错误。
+func readJSONBody(response *http.Response, target any) error {
+	raw, err := io.ReadAll(io.LimitReader(response.Body, maxBodyBytes))
+	if err != nil {
+		return err
+	}
+	contentType := response.Header.Get("Content-Type")
+	body := string(raw)
+	if httpx.LooksLikeHTML(contentType, body) {
+		return errors.New(httpx.DescribeUpstreamFailure(contentType, body))
+	}
+	if err := json.Unmarshal(raw, target); err != nil {
+		return fmt.Errorf("响应不是合法 JSON: %s", httpx.CleanUpstreamText(contentType, body))
+	}
+	return nil
+}
+
+// describeFailure 把非 2xx 响应翻译成一句可读错误。
+func describeFailure(response *http.Response, label string) error {
+	raw := snippet(response.Body)
+	contentType := response.Header.Get("Content-Type")
+	return fmt.Errorf("%s 返回 HTTP %d: %s", label, response.StatusCode, httpx.DescribeUpstreamFailure(contentType, raw))
 }
 
 // drain 读尽并关闭响应体，让连接可以回到连接池复用。

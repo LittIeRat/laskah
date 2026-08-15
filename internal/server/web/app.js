@@ -167,12 +167,27 @@
     if (!box) {
       return;
     }
-    box.textContent = String(message == null ? "" : message);
+    var text = String(message == null ? "" : message);
+    box.textContent = text;
     box.className = "toast show" + (kind ? " " + kind : "");
+    box.scrollTop = 0;
+    if (!box.dataset.bound) {
+      box.dataset.bound = "1";
+      // 长报错需要时间读，点一下手动收起。
+      box.addEventListener("click", function () {
+        window.clearTimeout(box.dataset.timer);
+        box.className = "toast";
+      });
+    }
     window.clearTimeout(box.dataset.timer);
+    // 文案越长给的阅读时间越久，上限 20 秒。
+    var hold = kind === "error" ? 5200 : 2800;
+    if (text.length > 80) {
+      hold = Math.min(20000, hold + (text.length - 80) * 45);
+    }
     box.dataset.timer = window.setTimeout(function () {
       box.className = "toast";
-    }, kind === "error" ? 5200 : 2800);
+    }, hold);
   }
 
   // ---------- 请求 ----------

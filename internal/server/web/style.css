@@ -367,6 +367,22 @@ label .req {
   color: var(--label-tertiary);
 }
 
+/* 表单内联错误：用于承载上游返回的长报错，避免只靠提示条一闪而过。 */
+.inline-error {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: rgba(255, 69, 58, 0.12);
+  border: 1px solid rgba(255, 69, 58, 0.32);
+  color: var(--badge-bad);
+  font-size: 12.5px;
+  line-height: 1.55;
+  max-height: 180px;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
 input,
 select,
 textarea {
@@ -755,7 +771,13 @@ textarea {
   padding: 12px 20px;
   border-radius: 14px;
   font-size: 14px;
+  line-height: 1.5;
   max-width: min(560px, calc(100vw - 40px));
+  /* 上游报错可能很长，限高加滚动，别让提示条糊满整屏。 */
+  max-height: 40vh;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  text-align: left;
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.26s var(--ease), transform 0.26s var(--ease);
@@ -765,6 +787,9 @@ textarea {
 
 .toast.show {
   opacity: 1;
+  /* 长文案要能滚动与选中，所以显示时恢复指针事件。 */
+  pointer-events: auto;
+  cursor: pointer;
   transform: translate(-50%, 0);
 }
 
