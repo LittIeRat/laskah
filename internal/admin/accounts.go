@@ -208,14 +208,79 @@ func (h *Handler) handleAccountItem(w http.ResponseWriter, r *http.Request) {
 		h.handleAccountBatchDelete(w, r)
 	case action == "refresh" && r.Method == http.MethodPost:
 		h.handleAccountRefresh(w, r, resource)
+	case action == "enable" && r.Method == http.MethodPost:
+		h.handleAccountEnable(w, r, resource)
 	case (action == "balance" || action == "") && r.Method == http.MethodGet:
 		h.handleAccountBalance(w, resource)
 	case action == "" && r.Method == http.MethodDelete:
 		h.handleAccountDelete(w, resource)
 	default:
 		// 账号配置保存后不可修改、不可回显，故不提供 PATCH/PUT。
-		httpx.Error(w, http.StatusMethodNotAllowed, "账号保存后只能查询余额或删除", nil)
+		httpx.Error(w, http.StatusMethodNotAllowed, "账号保存后只能查询余额、启停或删除", nil)
 	}
+}
+
+// handleAccountEnable 启用或暂停账号。
+//
+// 启用同时解除「余额耗尽自动暂停」与「管理员手动禁用」两种状态，
+// 并立刻查一次余额：充值后重新启用应当马上看到真实余额，
+// 否则账号会带着旧的耗尽数据进入分配池，第一批请求仍会被上游拒绝。
+// 这不属于修改配置，因此不违反「保存后不可修改」的约束。
+func (h *Handler) handleAccountEnable(w http.ResponseWriter, r *http.Request, id string) {
+	payload := struct {
+		Enabled *bool `json:"enabled"`
+	}{}
+	if err := httpx.DecodeJSON(r, &payload); err != nil {
+		httpx.Error(w, httpx.StatusOf(err, http.StatusBadRequest), err.Error(), nil)
+		return
+	}
+
+	enabled := true
+	if payload.Enabled != nil {
+		enabled = *payload.Enabled
+	}
+
+	missing := false
+	if err := h.Store.Update(func(data *store.Data) error {
+		account := data.FindAccount(id)
+		if account == nil {
+			missing = true
+			return nil
+		}
+		if enabled {
+			account.Resume()
+			return nil
+		}
+		account.Enabled = false
+		account.Suspend("管理员手动暂停")
+		return nil
+	}); err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error(), nil)
+		return
+	}
+	if missing {
+		httpx.Error(w, http.StatusNotFound, "账号不存在", nil)
+		return
+	}
+
+	refresh := map[string]any{}
+	if enabled {
+		if result := h.refreshAccountBalance(r, id); result != nil {
+			refresh = result
+		}
+	}
+
+	var view map[string]any
+	h.Store.View(func(data *store.Data) {
+		if account := data.FindAccount(id); account != nil {
+			view = store.PublicAccount(account, data.CountAccountKeys(account.ID), data.KeysUsingAccount(account.ID))
+		}
+	})
+	if view == nil {
+		httpx.Error(w, http.StatusNotFound, "账号不存在", nil)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"data": view, "refresh": refresh})
 }
 
 func (h *Handler) handleAccountTotals(w http.ResponseWriter) {

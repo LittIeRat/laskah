@@ -35,13 +35,13 @@
 
   <div class="section-head">
     <h2>账号</h2>
-    <span class="hint" id="account-summary">保存后仅可查询余额或删除账号，配置不可修改或查看</span>
+    <span class="hint" id="account-summary">保存后仅可查询余额、启停或删除账号，配置不可修改或查看</span>
   </div>
   <div class="card">
     <div class="btn-row" style="margin-top:0">
       <button class="btn btn-primary" id="account-create" type="button">创建账号</button>
       <button class="btn" id="refresh-accounts" type="button">手动刷新全部余额</button>
-      <span class="hint-text" id="refresh-status">余额耗尽的账号会在刷新后自动删除</span>
+      <span class="hint-text" id="refresh-status">余额耗尽的账号会在刷新后自动暂停</span>
     </div>
     <div class="list" id="account-list"></div>
   </div>
@@ -58,8 +58,8 @@
   </div>
 
   <div class="section-head">
-    <h2>自动删号记录</h2>
-    <span class="hint">余额耗尽、上游报余额不足或分组删除时自动清理</span>
+    <h2>账号移除记录</h2>
+    <span class="hint">余额耗尽只会暂停账号；这里只记录手动删除与分组删除时的清理</span>
   </div>
   <div class="card">
     <div class="list" id="removed-list"></div>

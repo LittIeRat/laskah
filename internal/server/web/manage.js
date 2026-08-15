@@ -1,4 +1,4 @@
-// /manage：分组（含启停）、账号（弹窗创建）、管理员账户、自动删号记录。
+// /manage：分组（含启停）、账号（弹窗创建、启停）、管理员账户、账号移除记录。
 (function () {
   "use strict";
 
@@ -177,9 +177,9 @@
     try {
       var response = await LB.request("POST", "/admin/groups/" + encodeURIComponent(group.id) + "/refresh");
       var results = response.data || [];
-      var deleted = results.filter(function (item) { return item.deleted; }).length;
+      var suspended = results.filter(function (item) { return item.suspended; }).length;
       var failed = results.filter(function (item) { return item.error; }).length;
-      LB.toast("分组「" + group.name + "」已刷新 " + results.length + " 个账号，自动删除 " + deleted + " 个，失败 " + failed + " 个", failed ? "error" : "ok");
+      LB.toast("分组「" + group.name + "」已刷新 " + results.length + " 个账号，自动暂停 " + suspended + " 个，失败 " + failed + " 个", failed ? "error" : "ok");
       await loadAll();
     } catch (err) {
       LB.toast(err.message, "error");
@@ -205,20 +205,25 @@
 
   function accountBadges(account) {
     var badges = [];
-    if (account.exhausted) {
-      badges.push(h("span", { class: "badge bad", text: "余额耗尽" }));
+    if (account.suspended) {
+      badges.push(h("span", { class: "badge bad", text: account.exhausted ? "余额不足已暂停" : "已暂停" }));
     } else if (!account.enabled) {
       badges.push(h("span", { class: "badge", text: "已禁用" }));
+    } else if (account.exhausted) {
+      badges.push(h("span", { class: "badge bad", text: "余额耗尽" }));
     } else if (account.checkError) {
       badges.push(h("span", { class: "badge warn", text: "查询失败" }));
     } else {
       badges.push(h("span", { class: "badge good", text: "可用" }));
     }
+    if (account.rateLimitPerMin) {
+      badges.push(h("span", { class: "badge", text: account.rateLimitPerMin + " 次/分钟" }));
+    }
     if (account.unlimited) {
       badges.push(h("span", { class: "badge info", text: "∞ 无限余额" }));
     } else {
       badges.push(h("span", { class: "badge info", text: "余额 " + LB.fmtMoney(account.balance, account.currency) }));
-      // 余额已进入「下一次刷新就会删号」的区间时提前提示，避免管理员措手不及。
+      // 余额已进入「下一次刷新就会暂停」的区间时提前提示，避免管理员措手不及。
       var floor = account.balanceFloor || 0;
       if (!account.exhausted && floor > 0 && account.balance <= floor * 2) {
         badges.push(h("span", { class: "badge warn", text: "接近下限 " + LB.fmtMoney(floor, account.currency) }));
@@ -254,6 +259,9 @@
       if (account.checkError) {
         detail += " · " + account.checkError;
       }
+      if (account.suspended && account.suspendReason) {
+        detail += " · " + account.suspendReason;
+      }
 
       var ratio = account.totalAmount > 0 ? account.balance / account.totalAmount : 0;
       list.appendChild(h("div", { class: "row" }, [
@@ -272,6 +280,9 @@
               refreshAccount(account, event.currentTarget);
             }
           }),
+          LB.toggle(!account.suspended && account.enabled, function (checked, input) {
+            toggleAccount(account, checked, input);
+          }, "启用账号"),
           h("button", {
             class: "btn btn-danger btn-sm",
             text: "删除",
@@ -282,6 +293,32 @@
         ])
       ]));
     });
+  }
+
+  // toggleAccount 启用或暂停账号。
+  //
+  // 启用会在服务端顺带刷一次余额：充值后重新启用应当立刻看到真实余额，
+  // 否则账号会带着旧的耗尽数据回到池子里，第一批请求仍会被上游拒绝。
+  async function toggleAccount(account, enabled, input) {
+    input.disabled = true;
+    try {
+      var response = await LB.request("POST", "/admin/accounts/" + encodeURIComponent(account.id) + "/enable", { enabled: enabled });
+      var refreshed = response.refresh || {};
+      if (!enabled) {
+        LB.toast("账号「" + account.name + "」已暂停，不再参与分配", "ok");
+      } else if (refreshed.suspended) {
+        LB.toast("账号「" + account.name + "」余额仍低于下限，已再次暂停", "error");
+      } else if (refreshed.error) {
+        LB.toast("账号已启用，但余额查询失败：" + refreshed.error, "error");
+      } else {
+        LB.toast("账号「" + account.name + "」已启用", "ok");
+      }
+      await loadAll();
+    } catch (err) {
+      LB.toast(err.message, "error");
+      input.checked = !enabled;
+      input.disabled = false;
+    }
   }
 
   // openAccountModal 是「先创建账号，再在居中弹窗里填 API 配置」的入口。
@@ -394,8 +431,21 @@
     var intervalInput = h("input", { type: "number", min: 0, max: 1440, value: "0" });
     var minBalanceInput = h("input", { type: "number", min: 0, step: "0.0001", value: "0" });
     var reqRefreshInput = h("input", { type: "number", min: 1, max: 3600, value: "60" });
-    var autoDelete = h("input", { type: "checkbox", checked: true });
+    var autoSuspend = h("input", { type: "checkbox", checked: true });
     var refreshOnRequest = h("input", { type: "checkbox", checked: true });
+
+    // 频率限制：默认不限制；勾选后才要求填写「一分钟能请求多少次」。
+    var rateLimited = h("input", { type: "checkbox" });
+    var rateLimitInput = h("input", { type: "number", min: 1, max: 100000, placeholder: "例如：60", disabled: true });
+    var rateLimitField = field("每分钟请求次数", rateLimitInput, "达到该次数后本账号本分钟不再参与分配，网关自动切到其它账号");
+    rateLimitField.style.display = "none";
+    rateLimited.addEventListener("change", function () {
+      rateLimitInput.disabled = !rateLimited.checked;
+      rateLimitField.style.display = rateLimited.checked ? "" : "none";
+      if (rateLimited.checked && !rateLimitInput.value) {
+        rateLimitInput.value = "60";
+      }
+    });
 
     function switchBlock(labelText, input, note) {
       return h("div", { class: "field full" }, [
@@ -434,8 +484,16 @@
         field("自动查询间隔（分钟，0 表示不自动查询）", intervalInput),
         field("最低余额（低于则视为耗尽）", minBalanceInput, "内置安全线 $0.50：填 0 也会按 $0.50 执行，只有填更大的值才会生效"),
         field("请求时刷新间隔（秒）", reqRefreshInput, "调用到达时若余额数据超过该时长未更新，先查一次再分配流量"),
-        switchBlock("余额耗尽时自动删除账号", autoDelete, "查询失败不会触发删除，避免网络抖动误删"),
+        switchBlock("余额耗尽时自动暂停账号", autoSuspend, "暂停不删除数据，充值后在列表里重新启用即可恢复；查询失败不会触发暂停"),
         switchBlock("请求时刷新余额", refreshOnRequest, "调用到达时先确认余额，防止余额用完仍继续使用该账号")
+      ]),
+      h("div", { class: "section-head" }, [
+        h("h2", { text: "频率限制" }),
+        h("span", { class: "hint", text: "留空则不限制" })
+      ]),
+      h("div", { class: "form-grid" }, [
+        switchBlock("该账号有频率限制", rateLimited, "不开启表示无限制；开启后需填写每分钟允许的请求次数"),
+        rateLimitField
       ])
     ]);
 
@@ -443,7 +501,7 @@
 
     LB.modal({
       title: "创建账号",
-      subtitle: "保存后只能查询余额或删除账号，配置不可修改也不会回显",
+      subtitle: "保存后只能查询余额、启停或删除账号，配置不可修改也不会回显",
       wide: true,
       body: body,
       confirmText: "确定保存配置",
@@ -461,6 +519,10 @@
           LB.toast("请粘贴至少一个 API Key", "error");
           return false;
         }
+        if (rateLimited.checked && !(Number(rateLimitInput.value) >= 1)) {
+          LB.toast("请填写每分钟请求次数，或关闭频率限制", "error");
+          return false;
+        }
 
         var response = await LB.request("POST", "/admin/accounts", {
           groupId: groupSelect.value,
@@ -473,7 +535,8 @@
           queryIntervalMin: intervalInput.value,
           minBalance: minBalanceInput.value,
           requestRefreshSec: reqRefreshInput.value,
-          autoDelete: autoDelete.checked,
+          rateLimitPerMin: rateLimited.checked ? rateLimitInput.value : "",
+          autoSuspend: autoSuspend.checked,
           refreshOnRequest: refreshOnRequest.checked,
           keyList: keys,
           selectedModels: Object.keys(selected)
@@ -502,8 +565,8 @@
     try {
       var response = await LB.request("POST", "/admin/accounts/" + encodeURIComponent(account.id) + "/refresh");
       var result = response.data || {};
-      if (result.deleted) {
-        LB.toast("余额已触及下限（$0.50 安全线），账号「" + account.name + "」已自动删除", "error");
+      if (result.suspended) {
+        LB.toast("余额已触及下限（$0.50 安全线），账号「" + account.name + "」已自动暂停，充值后重新启用", "error");
       } else if (result.error) {
         LB.toast("查询失败：" + result.error, "error");
       } else {
@@ -537,9 +600,9 @@
     try {
       var response = await LB.request("POST", "/admin/accounts/refresh-all");
       var results = response.data || [];
-      var deleted = results.filter(function (item) { return item.deleted; }).length;
+      var suspended = results.filter(function (item) { return item.suspended; }).length;
       var failed = results.filter(function (item) { return item.error; }).length;
-      LB.toast("已刷新 " + results.length + " 个账号，自动删除 " + deleted + " 个，失败 " + failed + " 个", failed ? "error" : "ok");
+      LB.toast("已刷新 " + results.length + " 个账号，自动暂停 " + suspended + " 个，失败 " + failed + " 个", failed ? "error" : "ok");
       await loadAll();
     } catch (err) {
       LB.toast(err.message, "error");
@@ -717,13 +780,13 @@
     }
   }
 
-  // ---------- 删号记录 ----------
+  // ---------- 账号移除记录 ----------
 
   function renderRemoved() {
     var list = el("removed-list");
     LB.clear(list);
     if (!removed.length) {
-      list.appendChild(h("div", { class: "empty", text: "暂无自动删号记录" }));
+      list.appendChild(h("div", { class: "empty", text: "暂无账号移除记录" }));
       return;
     }
     removed.slice().reverse().slice(0, 40).forEach(function (item) {
@@ -764,7 +827,8 @@
       if (totals.accounts) {
         el("account-summary").textContent = totals.accounts.total + " 个账号 · " +
           totals.accounts.apiCount + " 个上游 API · 总余额 " + LB.fmtMoney(totals.balance.total) +
-          (totals.accounts.unlimited ? " + " + totals.accounts.unlimited + " 个无限额度" : "");
+          (totals.accounts.unlimited ? " + " + totals.accounts.unlimited + " 个无限额度" : "") +
+          (totals.accounts.suspended ? " · " + totals.accounts.suspended + " 个已暂停" : "");
       }
 
       var stale = accounts.filter(function (item) { return item.checkError; }).length;
@@ -772,7 +836,7 @@
         return item.checkedAt && (!acc || item.checkedAt > acc) ? item.checkedAt : acc;
       }, "");
       el("refresh-status").textContent = (latest ? "最近查询于 " + LB.fmtTime(latest) : "尚未查询过余额") +
-        (stale ? " · " + stale + " 个账号查询失败" : " · 余额耗尽的账号会在刷新后自动删除");
+        (stale ? " · " + stale + " 个账号查询失败" : " · 余额耗尽的账号会在刷新后自动暂停");
     } catch (err) {
       LB.toast(err.message, "error");
     }

@@ -32,12 +32,13 @@ type BalanceRefresher interface {
 	RefreshForRequest(ctx context.Context, accountID string) bool
 }
 
-// AccountReaper 在上游明确报告余额不足时立即删除账号。
+// AccountSuspender 在上游明确报告余额不足时立即暂停账号。
 //
 // 与定时/请求前的额度查询互补：有些站点余额查询接口有缓存或延迟，
 // 真正的“这一次请求都付不起”只有上游报错才知道，此时必须立刻把账号踢出池子。
-type AccountReaper interface {
-	DropAccount(accountID, reason string) bool
+// 暂停而不是删除：账号、上游 API 与统计全部保留，管理员充值后重新启用即可。
+type AccountSuspender interface {
+	SuspendAccount(accountID, reason string) bool
 }
 
 // balanceExhaustedMarkers 是上游“余额/额度不足”的判定文案。
@@ -227,8 +228,8 @@ type Gateway struct {
 	// Refresher 可为 nil，此时跳过请求时余额刷新。
 	Refresher BalanceRefresher
 
-	// Reaper 可为 nil，此时不做余额不足自动删号。
-	Reaper AccountReaper
+	// Suspender 可为 nil，此时不做余额不足自动暂停。
+	Suspender AccountSuspender
 }
 
 // New 创建网关处理器。
@@ -241,20 +242,55 @@ func (g *Gateway) SetRefresher(refresher BalanceRefresher) {
 	g.Refresher = refresher
 }
 
-// SetReaper 注入余额不足自动删号实现。
-func (g *Gateway) SetReaper(reaper AccountReaper) {
-	g.Reaper = reaper
+// SetSuspender 注入余额不足自动暂停实现。
+func (g *Gateway) SetSuspender(suspender AccountSuspender) {
+	g.Suspender = suspender
 }
 
-// dropExhaustedAccount 在上游报余额不足时删除该账号，返回是否已删除。
-func (g *Gateway) dropExhaustedAccount(accountID string, detail string) bool {
-	if g.Reaper == nil || accountID == "" {
+// suspendExhaustedAccount 在上游报余额不足时暂停该账号，返回是否已暂停。
+func (g *Gateway) suspendExhaustedAccount(accountID string, detail string) bool {
+	if g.Suspender == nil || accountID == "" {
 		return false
 	}
-	return g.Reaper.DropAccount(accountID, "上游报余额不足自动删除: "+truncateReason(detail))
+	return g.Suspender.SuspendAccount(accountID, "上游报余额不足自动暂停: "+truncateReason(detail))
 }
 
-// truncateReason 截断上游报错文本，避免把大段响应写进删号记录。
+// accountGate 构造账号级频率限制的准入判定。
+//
+// 用 Peek 而不是 Allow：这里只是在候选池里试探，被跳过的账号不该白白扣掉配额。
+// 真正的记账发生在账号确定之后（recordAccountHit），与实际发出的上游请求一一对应。
+func (g *Gateway) accountGate() store.AccountGate {
+	if g.Limiter == nil {
+		return nil
+	}
+	now := time.Now()
+	return func(account *store.Account) bool {
+		limit := account.RateLimit()
+		if limit <= 0 {
+			return true
+		}
+		return g.Limiter.Peek(balancer.AccountBucket(account.ID), limit, now).Allowed
+	}
+}
+
+// recordAccountHit 给已确定的账号记一次请求，用于账号级频率限制计数。
+func (g *Gateway) recordAccountHit(accountID string) {
+	if g.Limiter == nil || accountID == "" {
+		return
+	}
+	limit := 0
+	g.Store.View(func(data *store.Data) {
+		if account := data.FindAccount(accountID); account != nil {
+			limit = account.RateLimit()
+		}
+	})
+	if limit <= 0 {
+		return
+	}
+	g.Limiter.Allow(balancer.AccountBucket(accountID), limit, time.Now())
+}
+
+// truncateReason 截断上游报错文本，避免把大段响应写进暂停原因。
 func truncateReason(text string) string {
 	trimmed := strings.TrimSpace(text)
 	runes := []rune(trimmed)
@@ -292,9 +328,12 @@ func (g *Gateway) Authenticate(ctx context.Context, secret string) (Session, *Au
 
 // AuthenticateForModel 校验网关密钥，并分配一个能承接指定模型的账号。
 //
-// 分配流程：命中密钥 → 检查密钥状态 → 挑选支持该模型的账号 → 若该账号余额数据过期则先刷新再确认。
-// 刷新后账号若已耗尽或被自动删除，就重新挑选下一个账号，最多重试 maxAccountAttempts 次，
+// 分配流程：命中密钥 → 检查密钥状态 → 挑选支持该模型、未达频率上限的账号 →
+// 若该账号余额数据过期则先刷新再确认。刷新后账号若已耗尽或被自动暂停，
+// 就重新挑选下一个账号，最多重试 maxAccountAttempts 次，
 // 从而避免“余额已经用完却继续往同一个账号打请求”。
+//
+// 返回成功即视为这一次请求会真的打到该账号，因此顺带记一次账号级频率计数。
 //
 // model 为空表示不限模型（用于 /v1/models 之类不针对单一模型的请求）。
 func (g *Gateway) AuthenticateForModel(ctx context.Context, secret, model string) (Session, *AuthError) {
@@ -308,10 +347,12 @@ func (g *Gateway) AuthenticateForModel(ctx context.Context, secret, model string
 			return Session{}, authErr
 		}
 		if staleAccount == "" {
+			g.recordAccountHit(session.AccountID)
 			return session, nil
 		}
 		// 余额数据已过期：先查一次再决定是否放行。
 		if g.Refresher == nil || g.Refresher.RefreshForRequest(ctx, staleAccount) {
+			g.recordAccountHit(session.AccountID)
 			return session, nil
 		}
 		if ctx.Err() != nil {
@@ -368,9 +409,9 @@ func keyStateError(key *store.APIKey) *AuthError {
 // noAccountMessage 生成“无可用账号”的提示，指定模型时说明是模型维度无账号可用。
 func noAccountMessage(model string) string {
 	if model == "" {
-		return "没有可用账号（余额已耗尽或未配置 API）"
+		return "没有可用账号（余额耗尽已暂停、达到频率限制或未配置 API）"
 	}
-	return "没有账号可以承接模型 " + model + "（未配置该模型、余额已耗尽或上游全部在冷却中）"
+	return "没有账号可以承接模型 " + model + "（未配置该模型、余额耗尽已暂停、达到频率限制或上游全部在冷却中）"
 }
 
 // assignSession 在一次写锁内完成密钥校验与账号分配。
@@ -382,6 +423,7 @@ func (g *Gateway) assignSession(secret, model string) (Session, string, *AuthErr
 		staleAccount string
 		authErr      *AuthError
 	)
+	gate := g.accountGate()
 
 	g.Store.Mutate(func(data *store.Data) {
 		key := data.FindKeyBySecret(secret)
@@ -401,7 +443,9 @@ func (g *Gateway) assignSession(secret, model string) (Session, string, *AuthErr
 			return
 		}
 
-		account := data.AssignAccountForModel(key, model)
+		// gate 让「已达每分钟频率上限」的账号本次不参与分配，直接换下一个账号，
+		// 而不是给调用方返回 429。
+		account := data.AssignAccountGated(key, model, gate)
 		if account == nil {
 			authErr = &AuthError{Status: http.StatusServiceUnavailable, Message: noAccountMessage(model)}
 			return
@@ -505,17 +549,17 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	stream := asBool(body["stream"])
 	attempts := []any{}
-	// accountSwitches 给“余额不足删号后换账号”设上限，
+	// accountSwitches 给“余额不足暂停后换账号”设上限，
 	// 避免大批账号同时欠费时把一次请求拖成长串串行重试。
 	accountSwitches := 0
 
-	// switchAccount 在“账号连这一次请求都付不起”时立刻删号并换一个账号，
+	// switchAccount 在“账号连这一次请求都付不起”时立刻暂停该账号并换一个账号，
 	// 成功时已就地刷新 session / candidates / maxAttempts，调用方只需重置循环下标。
 	switchAccount := func(detail string) bool {
 		if accountSwitches >= maxAccountAttempts {
 			return false
 		}
-		if !g.dropExhaustedAccount(session.AccountID, detail) {
+		if !g.suspendExhaustedAccount(session.AccountID, detail) {
 			return false
 		}
 		accountSwitches++
@@ -564,7 +608,7 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			g.reportFailure(provider.ID, statusErr)
 			attempts = append(attempts, map[string]any{"provider": provider.Name, "status": response.HTTP.StatusCode, "error": snippet})
 
-			// 上游明确说“这一次请求的余额都不够”时立刻删号，
+			// 上游明确说“这一次请求的余额都不够”时立刻暂停该账号，
 			// 并换一个账号重试，让调用方感知不到这次切换。
 			if IsBalanceExhausted(response.HTTP.StatusCode, snippet) && switchAccount(snippet) {
 				index = -1
@@ -745,7 +789,7 @@ func (g *Gateway) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		g.recordKeyUsage(keyID, false, balancer.Usage{})
 		// 向量化没有多上游重试，但账号既然连这一次都付不起，也应立即退出分配池。
 		if snippet := string(raw); IsBalanceExhausted(response.StatusCode, snippet) {
-			g.dropExhaustedAccount(session.AccountID, snippet)
+			g.suspendExhaustedAccount(session.AccountID, snippet)
 		}
 	}
 

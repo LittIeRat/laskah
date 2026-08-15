@@ -49,8 +49,11 @@ func TestBuildAccountDefaults(t *testing.T) {
 	if account.RequestRefreshSec != DefaultRequestRefreshSeconds {
 		t.Fatalf("请求时刷新间隔默认应为 %d 秒, got %d", DefaultRequestRefreshSeconds, account.RequestRefreshSec)
 	}
-	if !account.Enabled || !account.AutoDelete {
-		t.Fatalf("默认应启用且开启自动删号")
+	if !account.Enabled || !account.AutoSuspend {
+		t.Fatalf("默认应启用且开启余额耗尽自动暂停")
+	}
+	if account.Suspended || account.RateLimitPerMin != nil || account.RateLimit() != 0 {
+		t.Fatalf("默认不应暂停且不应有频率限制: %#v", account)
 	}
 	if account.Currency != "USD" {
 		t.Fatalf("默认币种应为 USD")
@@ -67,7 +70,7 @@ func TestBuildAccountDefaults(t *testing.T) {
 // TestAccountUnlimitedWhenNoBalanceQuery 覆盖“无限余额”账号的行为。
 //
 // 这类账号既不会被判定耗尽，也不需要任何额度查询，
-// 因此不会因为余额字段是 0 而被自动删除。
+// 因此不会因为余额字段是 0 而被自动暂停。
 func TestAccountUnlimitedWhenNoBalanceQuery(t *testing.T) {
 	account, verr := BuildAccount(AccountInput{Name: "free", BaseURL: "https://a.com/v1"})
 	if verr != nil {
@@ -508,7 +511,7 @@ func TestGroupSummaryAndTotals(t *testing.T) {
 		t.Fatalf("分组余额汇总错误: %#v", summary)
 	}
 	if summary["lifetimeUsed"] != 11.5 {
-		t.Fatalf("分组历史消耗应含已删号: %#v", summary)
+		t.Fatalf("分组历史消耗应含已移除账号: %#v", summary)
 	}
 	if summary["tokens"] != int64(1000) || summary["lifetimeToken"] != int64(1300) {
 		t.Fatalf("分组 token 汇总错误: %#v", summary)
@@ -755,7 +758,7 @@ func TestAccountKeyPressureCountsOnlyMatchingProviders(t *testing.T) {
 
 // TestBalanceFloorDefaultsToHalfDollar 锁定内置 0.5 USD 安全线。
 //
-// 余额只剩几毛钱时上游大概率连一次预扣费都过不了，提前删号比让调用方吃一次
+// 余额只剩几毛钱时上游大概率连一次预扣费都过不了，提前暂停比让调用方吃一次
 // 失败再换号体验好得多；账号自填的下限更高时仍然尊重账号设置。
 func TestBalanceFloorDefaultsToHalfDollar(t *testing.T) {
 	if MinBalanceFloorUSD != 0.5 {
@@ -848,6 +851,140 @@ func TestAssignAccountSkipsAccountsBelowFloor(t *testing.T) {
 	}
 	if bound.AccountID != healthy.ID {
 		t.Fatalf("改派后应更新常驻绑定: %s", bound.AccountID)
+	}
+}
+
+// TestSuspendKeepsProvidersAndBindings 验证「暂停」与「删除」的关键差别：
+// 暂停只把账号移出分配池，上游 API、余额与密钥绑定全部保留。
+func TestSuspendKeepsProvidersAndBindings(t *testing.T) {
+	account := newAccount(t, "acct", 10)
+	data := newTestData(account)
+	provider, _ := BuildProvider(ProviderInput{BaseURL: "https://x.example.com", AccountID: account.ID})
+	data.Providers = append(data.Providers, provider)
+	key, _ := BuildKey(KeyInput{Name: "k"})
+	key.AccountID = account.ID
+	data.Keys = append(data.Keys, key)
+	data.reindex()
+
+	if !account.Suspend("余额不足") {
+		t.Fatalf("首次暂停应返回 true")
+	}
+	if account.Suspend("再来一次") {
+		t.Fatalf("重复暂停应返回 false，避免刷新暂停时间与原因")
+	}
+	if account.SuspendReason != "余额不足" || account.SuspendedAt == nil {
+		t.Fatalf("应记录暂停原因与时间: %#v", account)
+	}
+	if account.Usable() {
+		t.Fatalf("暂停账号不应可用")
+	}
+	if len(data.UsableAccounts("")) != 0 {
+		t.Fatalf("暂停账号应退出分配池")
+	}
+	if data.CountAccountKeys(account.ID) != 1 {
+		t.Fatalf("暂停不应删除上游 API")
+	}
+	if key.AccountID != account.ID {
+		t.Fatalf("暂停不应解除密钥绑定: %s", key.AccountID)
+	}
+
+	view := PublicAccount(account, 1, 1)
+	if view["suspended"] != true || view["suspendReason"] != "余额不足" {
+		t.Fatalf("视图应暴露暂停状态: %#v", view)
+	}
+
+	account.Resume()
+	if account.Suspended || account.SuspendReason != "" || account.SuspendedAt != nil || !account.Enabled {
+		t.Fatalf("启用后应完全清除暂停状态: %#v", account)
+	}
+	if len(data.UsableAccounts("")) != 1 {
+		t.Fatalf("启用后账号应回到分配池")
+	}
+}
+
+// TestSuspendAccountsBatch 覆盖批量暂停：不存在的 ID 与已暂停账号都不计入结果。
+func TestSuspendAccountsBatch(t *testing.T) {
+	first := newAccount(t, "first", 10)
+	second := newAccount(t, "second", 10)
+	data := newTestData(first, second)
+
+	if names := data.SuspendAccounts([]string{first.ID, second.ID, "missing"}, "批量"); len(names) != 2 {
+		t.Fatalf("应暂停两个账号: %#v", names)
+	}
+	if names := data.SuspendAccounts([]string{first.ID}, "再来"); len(names) != 0 {
+		t.Fatalf("已暂停账号不应重复计数: %#v", names)
+	}
+}
+
+// TestBuildAccountRateLimit 覆盖账号级频率限制的解析与校验：留空即不限制。
+func TestBuildAccountRateLimit(t *testing.T) {
+	base := AccountInput{Name: "acct", BaseURL: "https://api.newapi.com/v1"}
+
+	blank := base
+	account, verr := BuildAccount(blank)
+	if verr != nil {
+		t.Fatalf("留空不应报错: %v", verr)
+	}
+	if account.RateLimitPerMin != nil || account.RateLimit() != 0 {
+		t.Fatalf("留空应表示不限制: %#v", account.RateLimitPerMin)
+	}
+
+	empty := base
+	empty.RateLimitPerMin = ""
+	if account, verr := BuildAccount(empty); verr != nil || account.RateLimit() != 0 {
+		t.Fatalf("空字符串应视为不限制: %v %#v", verr, account)
+	}
+
+	valid := base
+	valid.RateLimitPerMin = "60"
+	account, verr = BuildAccount(valid)
+	if verr != nil {
+		t.Fatalf("合法频率限制不应报错: %v", verr)
+	}
+	if account.RateLimit() != 60 {
+		t.Fatalf("应解析出每分钟 60 次: %#v", account.RateLimitPerMin)
+	}
+
+	for _, bad := range []any{0, -1, "abc", MaxAccountRateLimitPerMin + 1} {
+		input := base
+		input.RateLimitPerMin = bad
+		if _, verr := BuildAccount(input); verr == nil {
+			t.Fatalf("非法频率限制应报错: %#v", bad)
+		}
+	}
+}
+
+// TestAssignAccountGatedSkipsWithoutRebinding 验证准入判定（账号级频率限制）
+// 只影响本次落点，不改写密钥的常驻绑定。
+func TestAssignAccountGatedSkipsWithoutRebinding(t *testing.T) {
+	limited := newAccount(t, "limited", 10)
+	spare := newAccount(t, "spare", 10)
+	data := newTestData(limited, spare)
+	for _, account := range data.Accounts {
+		provider, _ := BuildProvider(ProviderInput{BaseURL: "https://x.example.com", AccountID: account.ID})
+		data.Providers = append(data.Providers, provider)
+	}
+	key, _ := BuildKey(KeyInput{Name: "k"})
+	key.AccountID = limited.ID
+	data.Keys = append(data.Keys, key)
+	data.reindex()
+
+	gate := func(account *Account) bool { return account.ID != limited.ID }
+	if chosen := data.AssignAccountGated(key, "", gate); chosen == nil || chosen.ID != spare.ID {
+		t.Fatalf("被拦下的账号应换成备用账号: %#v", chosen)
+	}
+	if key.AccountID != limited.ID {
+		t.Fatalf("限流换号不应改写常驻绑定: %s", key.AccountID)
+	}
+
+	// 窗口过去后（gate 放行）仍回到原账号。
+	if chosen := data.AssignAccountGated(key, "", nil); chosen == nil || chosen.ID != limited.ID {
+		t.Fatalf("放行后应回到原绑定账号: %#v", chosen)
+	}
+
+	// 全部账号都被拦下时没有可用账号。
+	if chosen := data.AssignAccountGated(key, "", func(*Account) bool { return false }); chosen != nil {
+		t.Fatalf("全部超限时应返回 nil: %#v", chosen)
 	}
 }
 

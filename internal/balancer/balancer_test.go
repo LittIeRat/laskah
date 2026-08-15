@@ -213,3 +213,43 @@ func TestRateLimiterSlidingWindow(t *testing.T) {
 		t.Fatalf("Prune 后应重新放行")
 	}
 }
+
+// TestRateLimiterPeekDoesNotConsumeQuota 锁定 Peek 的语义：只判定、不记账。
+//
+// 账号选择要先试探再决定，如果试探本身就扣配额，被跳过的账号会被自己的探测打满。
+func TestRateLimiterPeekDoesNotConsumeQuota(t *testing.T) {
+	limiter := NewRateLimiter()
+	now := time.Now()
+
+	if decision := limiter.Peek("acct", 0, now); !decision.Allowed || decision.Remaining != -1 {
+		t.Fatalf("limit<=0 应无限制: %#v", decision)
+	}
+
+	for i := 0; i < 5; i++ {
+		if decision := limiter.Peek("acct", 2, now); !decision.Allowed || decision.Remaining != 2 {
+			t.Fatalf("Peek 不应消耗配额: %#v", decision)
+		}
+	}
+
+	limiter.Allow("acct", 2, now)
+	limiter.Allow("acct", 2, now)
+	if decision := limiter.Peek("acct", 2, now); decision.Allowed {
+		t.Fatalf("配额用尽后 Peek 应拒绝: %#v", decision)
+	}
+	if decision := limiter.Peek("acct", 2, now.Add(61*time.Second)); !decision.Allowed {
+		t.Fatalf("窗口滑出后 Peek 应放行: %#v", decision)
+	}
+}
+
+// TestAccountBucketNamespacing 保证账号级与密钥级限流不会撞 key。
+func TestAccountBucketNamespacing(t *testing.T) {
+	if AccountBucket("abc") == "abc" {
+		t.Fatalf("账号级限流标识必须与密钥 ID 区分开")
+	}
+	limiter := NewRateLimiter()
+	now := time.Now()
+	limiter.Allow(AccountBucket("abc"), 1, now)
+	if !limiter.Allow("abc", 1, now).Allowed {
+		t.Fatalf("同名密钥不应被账号级计数影响")
+	}
+}

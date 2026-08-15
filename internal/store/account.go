@@ -33,6 +33,12 @@ const MaxRequestRefreshSeconds = 3600
 // 因此不论账号自己填的最低余额是多少，这条线都强制生效。
 const MinBalanceFloorUSD = 0.5
 
+// MaxAccountRateLimitPerMin 限制账号级频率限制的上限。
+//
+// 频率限制是「一分钟允许多少次请求」，留空（nil）表示不限制。
+// 设上限只是为了拦住明显的误输入，正常账号不会需要这么高的配额。
+const MaxAccountRateLimitPerMin = 100000
+
 // AccountStats 记录账号维度的累计用量。
 type AccountStats struct {
 	Requests    int64      `json:"requests"`
@@ -65,8 +71,28 @@ type Account struct {
 	RequestRefreshSec int  `json:"requestRefreshSec"`
 
 	Enabled    bool    `json:"enabled"`
-	AutoDelete bool    `json:"autoDelete"`
 	MinBalance float64 `json:"minBalance"`
+
+	// AutoSuspend 表示余额触及下限时自动暂停该账号（不再删除）。
+	//
+	// 暂停保留账号、上游 API 与统计数据，只是退出分配池，
+	// 管理员充值后重新启用即可立刻恢复承接流量。
+	AutoSuspend bool `json:"autoSuspend"`
+
+	// AutoDeleteLegacy 只用于读取 v4 及更早版本的 autoDelete 字段。
+	//
+	// 迁移完成后置为 nil，因此不会再写回磁盘。
+	AutoDeleteLegacy *bool `json:"autoDelete,omitempty"`
+
+	// 暂停状态：Suspended 为 true 时账号退出分配池，直到管理员重新启用。
+	Suspended     bool       `json:"suspended"`
+	SuspendReason string     `json:"suspendReason"`
+	SuspendedAt   *time.Time `json:"suspendedAt"`
+
+	// RateLimitPerMin 是账号级每分钟请求上限，nil 或 <=0 表示不限制。
+	//
+	// 触及上限时网关会换用其它账号，而不是给调用方返回 429。
+	RateLimitPerMin *int `json:"rateLimitPerMin"`
 
 	Balance      float64    `json:"balance"`
 	UsedAmount   float64    `json:"usedAmount"`
@@ -115,8 +141,10 @@ type AccountInput struct {
 	RefreshOnRequest  *bool  `json:"refreshOnRequest"`
 	RequestRefreshSec any    `json:"requestRefreshSec"`
 	Enabled           *bool  `json:"enabled"`
+	AutoSuspend       *bool  `json:"autoSuspend"`
 	AutoDelete        *bool  `json:"autoDelete"`
 	MinBalance        any    `json:"minBalance"`
+	RateLimitPerMin   any    `json:"rateLimitPerMin"`
 	Models            any    `json:"models"`
 	Note              string `json:"note"`
 }
@@ -160,6 +188,21 @@ func BuildAccount(input AccountInput) (*Account, *ValidationError) {
 		requestRefreshSec = DefaultRequestRefreshSeconds
 	}
 
+	// 频率限制留空表示无限制；填了就必须是 1-MaxAccountRateLimitPerMin 的整数。
+	var rateLimit *int
+	if !isBlank(input.RateLimitPerMin) {
+		value, okRate := toFloat(input.RateLimitPerMin, 0)
+		switch {
+		case !okRate || value < 1:
+			verr.Errorf("频率限制需要是每分钟 1-%d 次的整数，留空表示不限制", MaxAccountRateLimitPerMin)
+		case value > MaxAccountRateLimitPerMin:
+			verr.Errorf("频率限制不能超过每分钟 %d 次", MaxAccountRateLimitPerMin)
+		default:
+			converted := int(value)
+			rateLimit = &converted
+		}
+	}
+
 	name := strings.TrimSpace(input.Name)
 	if name == "" {
 		verr.Errorf("用户名称不能为空")
@@ -173,9 +216,13 @@ func BuildAccount(input AccountInput) (*Account, *ValidationError) {
 	if input.Enabled != nil {
 		enabled = *input.Enabled
 	}
-	autoDelete := true
-	if input.AutoDelete != nil {
-		autoDelete = *input.AutoDelete
+	// 余额触及下限时自动暂停（历史字段 autoDelete 仍然兼容读取）。
+	autoSuspend := true
+	switch {
+	case input.AutoSuspend != nil:
+		autoSuspend = *input.AutoSuspend
+	case input.AutoDelete != nil:
+		autoSuspend = *input.AutoDelete
 	}
 	// 默认开启请求时刷新：这是“余额用完却继续打同一个账号”的直接防线。
 	refreshOnRequest := true
@@ -197,7 +244,8 @@ func BuildAccount(input AccountInput) (*Account, *ValidationError) {
 		RefreshOnRequest:  refreshOnRequest,
 		RequestRefreshSec: int(requestRefreshSec),
 		Enabled:           enabled,
-		AutoDelete:        autoDelete,
+		AutoSuspend:       autoSuspend,
+		RateLimitPerMin:   rateLimit,
 		MinBalance:        minBalance,
 		Currency:          "USD",
 		Models:            SplitList(input.Models),
@@ -470,8 +518,9 @@ func (a *Account) BalanceFloor() float64 {
 // Usable 判断账号当前是否可以承接流量。
 //
 // 查询失败（CheckError 非空）时保持可用，避免网络抖动导致全站不可用。
+// 被暂停的账号一律不可用：余额不足只是暂停原因之一，恢复由管理员决定。
 func (a *Account) Usable() bool {
-	if !a.Enabled {
+	if !a.Enabled || a.Suspended {
 		return false
 	}
 	if a.Unlimited() {
@@ -486,12 +535,64 @@ func (a *Account) Usable() bool {
 // Exhausted 判断账号余额是否已触及下限（需已成功查询过余额）。
 //
 // 余额 <= BalanceFloor() 即视为耗尽：账号只剩不到一次请求的钱时提前退场，
-// 比等上游报「预扣费失败」再删号更早，调用方也不会先吃一次失败。
+// 比等上游报「预扣费失败」再换号更早，调用方也不会先吃一次失败。
 func (a *Account) Exhausted() bool {
 	if a.Unlimited() {
 		return false
 	}
 	return a.CheckedAt != nil && a.CheckError == "" && a.Balance <= a.BalanceFloor()
+}
+
+// RateLimit 返回账号级每分钟请求上限，0 表示不限制。
+func (a *Account) RateLimit() int {
+	if a.RateLimitPerMin == nil || *a.RateLimitPerMin <= 0 {
+		return 0
+	}
+	return *a.RateLimitPerMin
+}
+
+// Suspend 把账号标记为暂停，返回是否发生了状态变化。
+//
+// 暂停不删除任何数据：上游 API、余额与统计全部保留，
+// 密钥的粘性绑定也不解除，管理员重新启用后立即可用。
+func (a *Account) Suspend(reason string) bool {
+	if a.Suspended {
+		return false
+	}
+	now := time.Now().UTC()
+	a.Suspended = true
+	a.SuspendReason = strings.TrimSpace(reason)
+	a.SuspendedAt = &now
+	a.UpdatedAt = now
+	return true
+}
+
+// Resume 解除暂停并同时确保账号处于启用状态。
+//
+// 管理员点「启用」的意图就是让账号重新接流量，因此一次性清掉两种停用状态，
+// 避免出现「解除暂停了但仍然被禁用」这种需要点两次的体验。
+func (a *Account) Resume() {
+	now := time.Now().UTC()
+	a.Suspended = false
+	a.SuspendReason = ""
+	a.SuspendedAt = nil
+	a.Enabled = true
+	a.UpdatedAt = now
+}
+
+// SuspendAccounts 批量暂停账号，返回真正被暂停的账号名。
+func (d *Data) SuspendAccounts(ids []string, reason string) []string {
+	names := []string{}
+	for _, id := range ids {
+		account := d.FindAccount(id)
+		if account == nil {
+			continue
+		}
+		if account.Suspend(reason) {
+			names = append(names, account.Name)
+		}
+	}
+	return names
 }
 
 // QueryTimeout 返回额度查询超时时长。
@@ -557,7 +658,11 @@ func PublicAccount(a *Account, apiCount, boundKeys int) map[string]any {
 		"refreshOnRequest":  a.RefreshOnRequest,
 		"requestRefreshSec": a.RequestRefreshSec,
 		"enabled":           a.Enabled,
-		"autoDelete":        a.AutoDelete,
+		"autoSuspend":       a.AutoSuspend,
+		"suspended":         a.Suspended,
+		"suspendReason":     a.SuspendReason,
+		"suspendedAt":       a.SuspendedAt,
+		"rateLimitPerMin":   a.RateLimitPerMin,
 		"minBalance":        a.MinBalance,
 		"balanceFloor":      a.BalanceFloor(),
 		"balance":           a.Balance,

@@ -75,8 +75,8 @@ func New(options Options) (*App, error) {
 	manager := accounts.New(dataStore, wallet.NewClient())
 	// 请求路径上的余额刷新：账号余额数据过期时先查一次再分配流量。
 	gw.SetRefresher(manager)
-	// 上游明确报余额不足时立刻删号并换账号重试。
-	gw.SetReaper(manager)
+	// 上游明确报余额不足时立刻暂停该账号并换账号重试。
+	gw.SetSuspender(manager)
 	adminHandler := admin.New(dataStore, lb, upstream, manager, options.TrustProxy)
 
 	mux := http.NewServeMux()
@@ -134,7 +134,7 @@ func (a *App) maintenanceLoop() {
 	}
 }
 
-// balanceLoop 按各账号自身的“自动查询间隔”刷新额度，并清理余额耗尽的账号。
+// balanceLoop 按各账号自身的“自动查询间隔”刷新额度，并暂停余额耗尽的账号。
 //
 // 间隔为 0 的账号不会被自动查询，因此这里只做到期扫描，
 // 没有到期账号时不产生任何上游请求。
@@ -152,8 +152,8 @@ func (a *App) balanceLoop() {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			a.Accounts.RefreshDue(ctx)
 			cancel()
-			if removed := a.Accounts.SweepExhausted(); len(removed) > 0 {
-				log.Printf("余额耗尽自动删除账号: %s", strings.Join(removed, ", "))
+			if suspended := a.Accounts.SweepExhausted(); len(suspended) > 0 {
+				log.Printf("余额耗尽自动暂停账号: %s", strings.Join(suspended, ", "))
 			}
 		}
 	}

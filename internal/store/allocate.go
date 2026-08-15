@@ -57,6 +57,19 @@ func (d *Data) UsableAccounts(groupID string) []*Account {
 // model 为空表示不限模型。指定模型时，账号名下必须至少有一个启用、未冷却
 // 且声明支持该模型的上游 API，否则把请求交给它必然以“没有可用上游”失败。
 func (d *Data) UsableAccountsForModel(groupID, model string) []*Account {
+	return d.UsableAccountsGated(groupID, model, nil)
+}
+
+// AccountGate 是分配前的额外准入判定，返回 false 表示这次请求不要用该账号。
+//
+// 账号级频率限制走这条路：限流器由网关持有，store 不该依赖它，
+// 因此把判定以函数形式注入，账号选择逻辑仍然只有一份。
+type AccountGate func(*Account) bool
+
+// UsableAccountsGated 在可用账号基础上再应用一层准入判定。
+//
+// gate 为 nil 时等价于不做额外过滤。
+func (d *Data) UsableAccountsGated(groupID, model string, gate AccountGate) []*Account {
 	result := []*Account{}
 	for _, account := range d.Accounts {
 		if groupID != "" && account.GroupID != groupID {
@@ -65,9 +78,13 @@ func (d *Data) UsableAccountsForModel(groupID, model string) []*Account {
 		if !d.GroupEnabled(account.GroupID) {
 			continue
 		}
-		if account.Usable() && d.healthyProvidersForModel(account.ID, model) > 0 {
-			result = append(result, account)
+		if !account.Usable() || d.healthyProvidersForModel(account.ID, model) <= 0 {
+			continue
 		}
+		if gate != nil && !gate(account) {
+			continue
+		}
+		result = append(result, account)
 	}
 	return result
 }
@@ -145,11 +162,20 @@ func (d *Data) AssignAccount(key *APIKey) *Account {
 // 换号只影响本次请求的落点，key.AccountID 仍指向常驻绑定，
 // 避免一次冷门模型请求把密钥永久迁走、打乱既有的均摊结果。
 func (d *Data) AssignAccountForModel(key *APIKey, model string) *Account {
+	return d.AssignAccountGated(key, model, nil)
+}
+
+// AssignAccountGated 在按模型分配的基础上再应用一层准入判定。
+//
+// 被 gate 拦下的账号只是「这一次不要用」（例如已达每分钟频率上限），
+// 因此绝不解除粘性绑定：临时借一个别的账号顶上，窗口过去后仍回到原账号，
+// 否则一次限流就会把密钥永久迁走，把负载均衡的结果打乱。
+func (d *Data) AssignAccountGated(key *APIKey, model string, gate AccountGate) *Account {
 	if key == nil {
 		return nil
 	}
 
-	pool := d.accountPoolForModel(key.GroupID, model)
+	pool := d.accountPoolGated(key.GroupID, model, gate)
 
 	if key.AccountID != "" {
 		current := d.FindAccount(key.AccountID)
@@ -158,9 +184,10 @@ func (d *Data) AssignAccountForModel(key *APIKey, model string) *Account {
 		if sameGroup && containsAccount(pool, current.ID) {
 			return current
 		}
-		// 绑定账号本身仍然健康，只是不适合承接这个模型：临时借一个能接的账号，
-		// 常驻绑定留给它本来擅长的模型，避免密钥在模型间来回漂移。
-		if model != "" && sameGroup &&
+		// 绑定账号本身仍然健康，只是这次不适合承接（模型不匹配或已达频率上限）：
+		// 临时借一个能接的账号，常驻绑定保持不动。
+		if sameGroup &&
+			(model != "" || (gate != nil && !gate(current))) &&
 			d.GroupEnabled(current.GroupID) &&
 			current.Usable() &&
 			d.HealthyAccountProviders(current.ID) > 0 {
@@ -187,7 +214,12 @@ func (d *Data) AssignAccountForModel(key *APIKey, model string) *Account {
 // 模型列表留空的“什么都收”账号。没有这层优先级，请求冷门模型时很容易被
 // 分到一个没设模型限制、其实并不提供它的账号上，白跑一次上游。
 func (d *Data) accountPoolForModel(groupID, model string) []*Account {
-	pool := d.UsableAccountsForModel(groupID, model)
+	return d.accountPoolGated(groupID, model, nil)
+}
+
+// accountPoolGated 是带准入判定的候选池构造。
+func (d *Data) accountPoolGated(groupID, model string, gate AccountGate) []*Account {
+	pool := d.UsableAccountsGated(groupID, model, gate)
 	if model == "" || len(pool) == 0 {
 		return pool
 	}
@@ -298,11 +330,15 @@ func (d *Data) GroupSummary(groupID string) map[string]any {
 		apiCount    int
 	)
 	unlimitedNum := 0
+	suspendedNum := 0
 	for _, account := range d.Accounts {
 		if account.GroupID != groupID {
 			continue
 		}
 		accountNum++
+		if account.Suspended {
+			suspendedNum++
+		}
 		if account.Unlimited() {
 			unlimitedNum++
 		} else {
@@ -345,6 +381,7 @@ func (d *Data) GroupSummary(groupID string) map[string]any {
 		"requests":      requests,
 		"accounts":      accountNum,
 		"usable":        usableNum,
+		"suspended":     suspendedNum,
 		"unlimited":     unlimitedNum,
 		"apiCount":      apiCount,
 		"keys":          keyCount,
@@ -360,6 +397,7 @@ func (d *Data) AccountTotals() map[string]any {
 		usedAmount  float64
 		totalAmount float64
 		enabled     int
+		suspended   int
 		exhausted   int
 		apiCount    int
 		totalTokens int64
@@ -375,8 +413,11 @@ func (d *Data) AccountTotals() map[string]any {
 			usedAmount += account.UsedAmount
 			totalAmount += account.TotalAmount
 		}
-		if account.Enabled {
+		if account.Usable() {
 			enabled++
+		}
+		if account.Suspended {
+			suspended++
 		}
 		if account.Exhausted() {
 			exhausted++
@@ -421,6 +462,7 @@ func (d *Data) AccountTotals() map[string]any {
 		"accounts": map[string]any{
 			"total":     len(d.Accounts),
 			"enabled":   enabled,
+			"suspended": suspended,
 			"exhausted": exhausted,
 			"unlimited": unlimited,
 			"removed":   len(d.RemovedAccounts),

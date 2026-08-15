@@ -50,19 +50,20 @@
     grid.appendChild(LB.stat(
       "账号总余额",
       balanceText,
-      (account.enabled || 0) + " 个可用账号" + (unlimited ? " · " + unlimited + " 个无限额度" : ""),
+      (account.enabled || 0) + " 个可用账号" + (unlimited ? " · " + unlimited + " 个无限额度" : "") +
+      ((account.suspended || 0) ? " · " + account.suspended + " 个已暂停" : ""),
       "accent"
     ));
     grid.appendChild(LB.stat("累计消耗金额", LB.fmtMoney(balance.lifetime, balance.currency), "含已删除账号 " + LB.fmtMoney(balance.removedUsed, balance.currency)));
     grid.appendChild(LB.stat("消耗 tokens 总数", LB.fmtNumber(token.lifetime), "在册账号 " + LB.fmtNumber(token.accounts)));
     grid.appendChild(LB.stat("网关请求数", LB.fmtNumber(request.keys), "上游请求 " + LB.fmtNumber(request.accounts)));
-    grid.appendChild(LB.stat("上游 API 数", LB.fmtNumber(account.apiCount), (account.total || 0) + " 个账号 / 自动删除 " + (account.removed || 0) + " 个"));
+    grid.appendChild(LB.stat("上游 API 数", LB.fmtNumber(account.apiCount), (account.total || 0) + " 个账号 / 已暂停 " + (account.suspended || 0) + " 个"));
     if (isSuper) {
       grid.appendChild(LB.stat("网关密钥", LB.fmtNumber(keyTotals.total), "已分配账号 " + LB.fmtNumber(keyTotals.assigned), (keyTotals.total && !keyTotals.assigned) ? "warn" : ""));
     }
 
-    el("totals-hint").textContent = (account.exhausted || 0) > 0
-      ? "有 " + account.exhausted + " 个账号余额已触及 $0.50 下限，等待自动清理"
+    el("totals-hint").textContent = (account.suspended || 0) > 0
+      ? "有 " + account.suspended + " 个账号已暂停（多为余额触及 $0.50 下限），充值后在「分组与账号」里重新启用"
       : "分组 " + groups.length + " 个 · 负载均衡策略 " + (totals.strategy || "-");
   }
 
@@ -413,9 +414,9 @@
     try {
       var response = await LB.request("POST", "/admin/accounts/refresh-all");
       var results = response.data || [];
-      var deleted = results.filter(function (item) { return item.deleted; }).length;
+      var suspended = results.filter(function (item) { return item.suspended; }).length;
       var failed = results.filter(function (item) { return item.error; }).length;
-      LB.toast("已刷新 " + results.length + " 个账号，自动删除 " + deleted + " 个，失败 " + failed + " 个", failed ? "error" : "ok");
+      LB.toast("已刷新 " + results.length + " 个账号，自动暂停 " + suspended + " 个，失败 " + failed + " 个", failed ? "error" : "ok");
       await loadAll();
     } catch (err) {
       LB.toast(err.message, "error");
@@ -444,7 +445,7 @@
         renderKeys();
       }
       el("refresh-hint").textContent = "共 " + (totals.accounts ? totals.accounts.total : 0) +
-        " 个账号 · 刷新后余额低于 $0.50 的账号会被自动删除";
+        " 个账号 · 刷新后余额低于 $0.50 的账号会被自动暂停";
     } catch (err) {
       LB.toast(err.message, "error");
     }

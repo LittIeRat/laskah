@@ -11,7 +11,7 @@
 param(
   [Parameter(Mandatory = $true)][string] $Token,
   [string] $Repo = 'laskah',
-  [string] $Description = 'Laskah — OpenAI 兼容的 API 负载均衡网关，Go 单二进制，多账号自动分配与余额耗尽自动删号',
+  [string] $Description = 'Laskah — OpenAI 兼容的 API 负载均衡网关，Go 单二进制，多账号自动分配、余额耗尽自动暂停与账号级频率限制',
   [switch] $Private,
   # 留空则在直连不通时自动沿用系统代理（IE/WinINET 设置）
   [string] $Proxy = ''

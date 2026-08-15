@@ -205,6 +205,17 @@ func (h *harness) createGroup(name string) string {
 }
 
 // fakeSite 模拟 New API 站点：/api/status 提供换算单位，/api/user/self 提供余额。
+// findAccount 从 /admin/accounts 列表里取出指定账号，找不到返回 nil。
+func findAccount(list []any, id string) map[string]any {
+	for _, item := range list {
+		account, ok := item.(map[string]any)
+		if ok && account["id"] == id {
+			return account
+		}
+	}
+	return nil
+}
+
 func fakeSite(t *testing.T, quota, used *float64) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -629,7 +640,9 @@ func TestKeyBulkCreationAndAccountLocalBalancing(t *testing.T) {
 	}
 }
 
-func TestExhaustedAccountIsRemovedAndTrafficFailsOver(t *testing.T) {
+// TestExhaustedAccountIsSuspendedAndTrafficFailsOver 验证余额耗尽走「暂停」而不是删除：
+// 账号与上游 API 全部保留，只是退出分配池，流量无缝切到健康账号。
+func TestExhaustedAccountIsSuspendedAndTrafficFailsOver(t *testing.T) {
 	h := newHarness(t)
 	healthyQuota, healthyUsed := 5000000.0, 0.0
 	drainQuota, drainUsed := 5000000.0, 0.0
@@ -667,7 +680,7 @@ func TestExhaustedAccountIsRemovedAndTrafficFailsOver(t *testing.T) {
 	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client", "accountId": drainedID})
 	secret := keyBody["data"].(map[string]any)["key"].(string)
 
-	// 余额清零后刷新，应自动删号。
+	// 余额清零后刷新，应自动暂停。
 	drainQuota = 0
 	drainUsed = 500000
 	response, refreshed := h.admin(http.MethodPost, "/admin/accounts/"+drainedID+"/refresh", nil)
@@ -675,19 +688,34 @@ func TestExhaustedAccountIsRemovedAndTrafficFailsOver(t *testing.T) {
 		t.Fatalf("刷新余额失败: %d %#v", response.StatusCode, refreshed)
 	}
 	result := refreshed["data"].(map[string]any)
-	if result["exhausted"] != true || result["deleted"] != true {
-		t.Fatalf("余额耗尽应自动删号: %#v", result)
+	if result["exhausted"] != true || result["suspended"] != true {
+		t.Fatalf("余额耗尽应自动暂停: %#v", result)
+	}
+	if result["deleted"] == true {
+		t.Fatalf("余额耗尽不应再删除账号: %#v", result)
 	}
 
 	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
 	accounts := list["data"].([]any)
-	if len(accounts) != 1 || accounts[0].(map[string]any)["id"] != healthyID {
-		t.Fatalf("只应保留健康账号: %#v", accounts)
+	if len(accounts) != 2 {
+		t.Fatalf("暂停不应删除账号: %#v", accounts)
 	}
-	removed := list["removed"].([]any)
-	reason := removed[0].(map[string]any)["reason"].(string)
-	if len(removed) != 1 || !strings.Contains(reason, "余额触及下限") || !strings.Contains(reason, "下限 0.50") {
-		t.Fatalf("应记录删号原因与生效下限: %#v", removed)
+	if len(list["removed"].([]any)) != 0 {
+		t.Fatalf("暂停不应写入移除记录: %#v", list["removed"])
+	}
+	drained := findAccount(accounts, drainedID)
+	if drained == nil || drained["suspended"] != true || drained["usable"] != false {
+		t.Fatalf("耗尽账号应处于暂停且不可用状态: %#v", drained)
+	}
+	if drained["apiCount"].(float64) != 1 {
+		t.Fatalf("暂停应保留账号名下的上游 API: %#v", drained)
+	}
+	reason := drained["suspendReason"].(string)
+	if !strings.Contains(reason, "余额触及下限") || !strings.Contains(reason, "下限 0.50") {
+		t.Fatalf("应记录暂停原因与生效下限: %q", reason)
+	}
+	if healthy := findAccount(accounts, healthyID); healthy == nil || healthy["suspended"] != false {
+		t.Fatalf("健康账号不应被暂停: %#v", healthy)
 	}
 
 	// 调用方无需改动，请求自动切到健康账号。
@@ -698,16 +726,28 @@ func TestExhaustedAccountIsRemovedAndTrafficFailsOver(t *testing.T) {
 		t.Fatalf("应命中健康账号的 API: %#v", hitsHealthy)
 	}
 	if len(hitsDrain) != 0 {
-		t.Fatalf("已删号账号不应再被调用: %#v", hitsDrain)
+		t.Fatalf("已暂停账号不应再被调用: %#v", hitsDrain)
 	}
 
 	_, totalsBody := h.admin(http.MethodGet, "/admin/accounts/totals", nil)
 	balance := totalsBody["data"].(map[string]any)["balance"].(map[string]any)
 	if balance["total"].(float64) != 10 {
-		t.Fatalf("总余额应只统计存活账号: %#v", balance)
+		t.Fatalf("总余额应等于健康账号余额（暂停账号余额为 0）: %#v", balance)
 	}
-	if balance["removedUsed"].(float64) != 1 || balance["lifetime"].(float64) != 1 {
-		t.Fatalf("已删号消耗应保留在累计口径: %#v", balance)
+	if balance["removedUsed"].(float64) != 0 || balance["lifetime"].(float64) != 1 {
+		t.Fatalf("暂停账号的消耗应留在在册口径而非移除口径: %#v", balance)
+	}
+	if suspended := totalsBody["data"].(map[string]any)["accounts"].(map[string]any)["suspended"].(float64); suspended != 1 {
+		t.Fatalf("汇总应统计已暂停账号数: %#v", suspended)
+	}
+
+	// 管理员重新启用后账号立刻回到分配池。
+	drainQuota = 5000000
+	drainUsed = 0
+	if response, enabled := h.admin(http.MethodPost, "/admin/accounts/"+drainedID+"/enable", map[string]any{"enabled": true}); response.StatusCode != http.StatusOK {
+		t.Fatalf("启用账号失败: %d %#v", response.StatusCode, enabled)
+	} else if account := enabled["data"].(map[string]any); account["suspended"] != false || account["usable"] != true {
+		t.Fatalf("启用后账号应恢复可用: %#v", account)
 	}
 }
 
@@ -727,7 +767,7 @@ func TestNoUsableAccountReturnsServiceUnavailable(t *testing.T) {
 		"userId":      "1",
 		"accessToken": "tok",
 		"keys":        "sk-only",
-		"autoDelete":  false,
+		"autoSuspend": false,
 	})
 	if response.StatusCode != http.StatusCreated {
 		t.Fatalf("创建账号失败: %d %#v", response.StatusCode, body)
@@ -740,8 +780,8 @@ func TestNoUsableAccountReturnsServiceUnavailable(t *testing.T) {
 	quota = 0
 	used = 500000
 	_, refreshed := h.admin(http.MethodPost, "/admin/accounts/"+accountID+"/refresh", nil)
-	if refreshed["data"].(map[string]any)["deleted"] == true {
-		t.Fatalf("关闭自动删号后不应删除账号")
+	if refreshed["data"].(map[string]any)["suspended"] == true {
+		t.Fatalf("关闭自动暂停后不应暂停账号")
 	}
 
 	response, chat := h.do(http.MethodPost, "/v1/chat/completions", chatBody(), secret)
@@ -910,11 +950,14 @@ func TestRequestTimeRefreshSwitchesAccountWhenBalanceRunsOut(t *testing.T) {
 		t.Fatalf("应切换到健康账号: %#v", hitsHealthy)
 	}
 
-	// 耗尽账号已被自动删除，密钥重新绑定到健康账号。
+	// 耗尽账号已被自动暂停，密钥重新绑定到健康账号。
 	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
 	accounts := list["data"].([]any)
-	if len(accounts) != 1 || accounts[0].(map[string]any)["id"] != healthyID {
-		t.Fatalf("耗尽账号应被自动删除: %#v", accounts)
+	if len(accounts) != 2 {
+		t.Fatalf("暂停不应删除账号: %#v", accounts)
+	}
+	if drained := findAccount(accounts, drainedID); drained == nil || drained["suspended"] != true {
+		t.Fatalf("耗尽账号应被自动暂停: %#v", drained)
 	}
 	_, dashboard := h.admin(http.MethodGet, "/admin/dashboard", nil)
 	keys := dashboard["keys"].([]any)
@@ -1262,8 +1305,8 @@ func TestGroupEnableDisableStopsTraffic(t *testing.T) {
 	}
 }
 
-// TestUpstreamInsufficientBalanceDropsAccount 验证上游报余额不足时立即删号并换账号重试。
-func TestUpstreamInsufficientBalanceDropsAccount(t *testing.T) {
+// TestUpstreamInsufficientBalanceSuspendsAccount 验证上游报余额不足时立即暂停账号并换账号重试。
+func TestUpstreamInsufficientBalanceSuspendsAccount(t *testing.T) {
 	h := newHarness(t)
 
 	brokeHits := 0
@@ -1309,23 +1352,26 @@ func TestUpstreamInsufficientBalanceDropsAccount(t *testing.T) {
 		t.Fatalf("应切换到健康账号: %#v", healthyHits)
 	}
 
-	// 欠费账号已被删除，并写入删号记录。
+	// 欠费账号已被暂停，原因保留上游文案。
 	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
 	accounts := list["data"].([]any)
-	if len(accounts) != 1 || accounts[0].(map[string]any)["name"] != "healthy" {
-		t.Fatalf("欠费账号应被自动删除: %#v", accounts)
+	if len(accounts) != 2 {
+		t.Fatalf("暂停不应删除账号: %#v", accounts)
 	}
-	removed := list["removed"].([]any)
-	if len(removed) != 1 || !strings.Contains(removed[0].(map[string]any)["reason"].(string), "余额不足") {
-		t.Fatalf("应记录删号原因: %#v", removed)
+	brokeView := findAccount(accounts, brokeID)
+	if brokeView == nil || brokeView["suspended"] != true {
+		t.Fatalf("欠费账号应被自动暂停: %#v", accounts)
+	}
+	if !strings.Contains(brokeView["suspendReason"].(string), "余额不足") {
+		t.Fatalf("应记录暂停原因: %#v", brokeView["suspendReason"])
 	}
 }
 
-// TestPrechargeShortfallDropsAccount 验证 New API 的“预扣费额度失败”也会立即删号换号。
+// TestPrechargeShortfallSuspendsAccount 验证 New API 的“预扣费额度失败”也会立即暂停换号。
 //
 // 这类文案只给出两个金额（剩余 < 需要），不含“不足”字样，
 // 是实际部署里最常见的余额耗尽表现，必须与显式“余额不足”同等处理。
-func TestPrechargeShortfallDropsAccount(t *testing.T) {
+func TestPrechargeShortfallSuspendsAccount(t *testing.T) {
 	h := newHarness(t)
 
 	brokeHits := 0
@@ -1372,15 +1418,12 @@ func TestPrechargeShortfallDropsAccount(t *testing.T) {
 
 	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
 	accounts := list["data"].([]any)
-	if len(accounts) != 1 || accounts[0].(map[string]any)["name"] != "precharge-healthy" {
-		t.Fatalf("预扣费失败的账号应被自动删除: %#v", accounts)
+	brokeView := findAccount(accounts, brokeID)
+	if brokeView == nil || brokeView["suspended"] != true {
+		t.Fatalf("预扣费失败的账号应被自动暂停: %#v", accounts)
 	}
-	removed := list["removed"].([]any)
-	if len(removed) != 1 {
-		t.Fatalf("应写入一条删号记录: %#v", removed)
-	}
-	if reason := removed[0].(map[string]any)["reason"].(string); !strings.Contains(reason, "预扣费额度失败") {
-		t.Fatalf("删号原因应保留上游文案: %q", reason)
+	if reason := brokeView["suspendReason"].(string); !strings.Contains(reason, "预扣费额度失败") {
+		t.Fatalf("暂停原因应保留上游文案: %q", reason)
 	}
 }
 
@@ -1417,7 +1460,7 @@ func TestUnlimitedAccountWithoutBalanceQuery(t *testing.T) {
 	}
 	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
 	if len(list["data"].([]any)) != 1 {
-		t.Fatalf("无限额度账号不应被自动删除: %#v", list["data"])
+		t.Fatalf("无限额度账号不应被自动暂停或删除: %#v", list["data"])
 	}
 
 	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client"})
@@ -1594,9 +1637,9 @@ func streamUpstream(t *testing.T, mode *string, hits *[]string) *httptest.Server
 }
 
 // TestBalanceFloorDropsAccountBeforeUpstreamFails 验证 0.5 USD 安全线：
-// 余额掉到安全线以下时刷新即删号，流量立刻转到余额充足的账号，
+// 余额掉到安全线以下时刷新即暂停，流量立刻转到余额充足的账号，
 // 调用方不会先吃一次上游的「预扣费失败」。
-func TestBalanceFloorDropsAccountBeforeUpstreamFails(t *testing.T) {
+func TestBalanceFloorSuspendsAccountBeforeUpstreamFails(t *testing.T) {
 	h := newHarness(t)
 	thinQuota, thinUsed := 5000000.0, 0.0
 	richQuota, richUsed := 5000000.0, 0.0
@@ -1646,14 +1689,17 @@ func TestBalanceFloorDropsAccountBeforeUpstreamFails(t *testing.T) {
 	if result["balance"].(float64) >= 0.5 {
 		t.Fatalf("测试前置条件错误，余额应低于安全线: %#v", result["balance"])
 	}
-	if result["exhausted"] != true || result["deleted"] != true {
-		t.Fatalf("余额低于 0.5 USD 应判定耗尽并删号: %#v", result)
+	if result["exhausted"] != true || result["suspended"] != true {
+		t.Fatalf("余额低于 0.5 USD 应判定耗尽并暂停: %#v", result)
 	}
 
 	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
 	accounts := list["data"].([]any)
-	if len(accounts) != 1 || accounts[0].(map[string]any)["id"] != richID {
-		t.Fatalf("只应保留余额充足的账号: %#v", accounts)
+	if thin := findAccount(accounts, thinID); thin == nil || thin["suspended"] != true {
+		t.Fatalf("余额不足的账号应被暂停: %#v", accounts)
+	}
+	if rich := findAccount(accounts, richID); rich == nil || rich["suspended"] != false {
+		t.Fatalf("余额充足的账号应保持可用: %#v", accounts)
 	}
 
 	if response, chat := h.do(http.MethodPost, "/v1/chat/completions", chatBody(), secret); response.StatusCode != http.StatusOK {
@@ -1665,7 +1711,7 @@ func TestBalanceFloorDropsAccountBeforeUpstreamFails(t *testing.T) {
 }
 
 // TestStreamBalanceShortfallSwitchesAccountTransparently 覆盖流式响应里
-// 「一个字节都还没下发就发现余额不足」的场景：删号后换账号重来，调用方看到的是完整流。
+// 「一个字节都还没下发就发现余额不足」的场景：暂停后换账号重来，调用方看到的是完整流。
 func TestStreamBalanceShortfallSwitchesAccountTransparently(t *testing.T) {
 	h := newHarness(t)
 	quotaA, usedA := 5000000.0, 0.0
@@ -1724,22 +1770,20 @@ func TestStreamBalanceShortfallSwitchesAccountTransparently(t *testing.T) {
 		t.Fatalf("应重试到健康账号: %#v", goodHits)
 	}
 
-	// 欠费账号已被删除。
+	// 欠费账号已被暂停。
 	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
-	for _, item := range list["data"].([]any) {
-		if item.(map[string]any)["id"] == brokeID {
-			t.Fatalf("欠费账号应被自动删除: %#v", list["data"])
-		}
+	broke := findAccount(list["data"].([]any), brokeID)
+	if broke == nil || broke["suspended"] != true {
+		t.Fatalf("欠费账号应被自动暂停: %#v", list["data"])
 	}
-	removed := list["removed"].([]any)
-	if len(removed) != 1 || !strings.Contains(removed[0].(map[string]any)["reason"].(string), "余额不足") {
-		t.Fatalf("应记录余额不足删号原因: %#v", removed)
+	if !strings.Contains(broke["suspendReason"].(string), "余额不足") {
+		t.Fatalf("应记录余额不足暂停原因: %#v", broke["suspendReason"])
 	}
 }
 
 // TestStreamBalanceShortfallMidStreamTruncates 覆盖「已经下发部分内容后才发现余额不足」：
 // 已发出的内容撤不回来，此时必须立刻截断并正常收尾（finish_reason=length + [DONE]），
-// 同时删号换账号，下一次请求就落到健康账号上。
+// 同时暂停账号并换号，下一次请求就落到健康账号上。
 func TestStreamBalanceShortfallMidStreamTruncates(t *testing.T) {
 	h := newHarness(t)
 	quotaA, usedA := 5000000.0, 0.0
@@ -1799,12 +1843,10 @@ func TestStreamBalanceShortfallMidStreamTruncates(t *testing.T) {
 		t.Fatalf("截断后应以 [DONE] 收尾，避免客户端干等: %q", raw)
 	}
 
-	// 账号已被删除，下一次请求直接落到健康账号。
+	// 账号已被暂停，下一次请求直接落到健康账号。
 	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
-	for _, item := range list["data"].([]any) {
-		if item.(map[string]any)["id"] == brokeID {
-			t.Fatalf("欠费账号应被自动删除: %#v", list["data"])
-		}
+	if broke := findAccount(list["data"].([]any), brokeID); broke == nil || broke["suspended"] != true {
+		t.Fatalf("欠费账号应被自动暂停: %#v", list["data"])
 	}
 
 	if response, retry := h.doRaw(http.MethodPost, "/v1/chat/completions", payload, secret); response.StatusCode != http.StatusOK || !strings.Contains(retry, "完整") {
@@ -1881,10 +1923,8 @@ func TestNonStreamBalanceShortfallInBodySwitchesAccount(t *testing.T) {
 	}
 
 	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
-	for _, item := range list["data"].([]any) {
-		if item.(map[string]any)["id"] == brokeID {
-			t.Fatalf("欠费账号应被自动删除: %#v", list["data"])
-		}
+	if broke := findAccount(list["data"].([]any), brokeID); broke == nil || broke["suspended"] != true {
+		t.Fatalf("欠费账号应被自动暂停: %#v", list["data"])
 	}
 }
 
@@ -1927,12 +1967,164 @@ func TestStreamBalanceShortfallWithoutFallbackReturns503(t *testing.T) {
 		t.Fatalf("失败响应应是 JSON: %s", contentType)
 	}
 
-	// 欠费账号仍然要被删掉。
+	// 欠费账号仍然要被暂停。
 	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
-	for _, item := range list["data"].([]any) {
-		if item.(map[string]any)["id"] == accountID {
-			t.Fatalf("欠费账号应被自动删除: %#v", list["data"])
+	if account := findAccount(list["data"].([]any), accountID); account == nil || account["suspended"] != true {
+		t.Fatalf("欠费账号应被自动暂停: %#v", list["data"])
+	}
+}
+
+// TestAccountRateLimitSwitchesAccount 验证账号级频率限制：
+// 达到「一分钟 N 次」上限后，网关换用其它账号，而不是给调用方返回 429。
+func TestAccountRateLimitSwitchesAccount(t *testing.T) {
+	h := newHarness(t)
+
+	limitedHits := []string{}
+	spareHits := []string{}
+	limitedUpstream := fakeUpstream(t, &limitedHits)
+	spareUpstream := fakeUpstream(t, &spareHits)
+
+	groupID := h.createGroup("限流分组")
+	response, limitedBody := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":            "limited",
+		"groupId":         groupID,
+		"baseUrl":         limitedUpstream.URL + "/v1",
+		"keys":            "sk-limited",
+		"rateLimitPerMin": 2,
+	})
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("创建限流账号失败: %d %#v", response.StatusCode, limitedBody)
+	}
+	limitedAccount := limitedBody["data"].(map[string]any)
+	limitedID := limitedAccount["id"].(string)
+	if limitedAccount["rateLimitPerMin"].(float64) != 2 {
+		t.Fatalf("应回显账号频率限制: %#v", limitedAccount["rateLimitPerMin"])
+	}
+
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client", "accountId": limitedID})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+
+	// 前两次请求用完该账号的每分钟配额。
+	for index := 0; index < 2; index++ {
+		if response, chat := h.do(http.MethodPost, "/v1/chat/completions", chatBody(), secret); response.StatusCode != http.StatusOK {
+			t.Fatalf("第 %d 次请求应成功: %d %#v", index+1, response.StatusCode, chat)
 		}
+	}
+	if len(limitedHits) != 2 {
+		t.Fatalf("前两次请求应落在限流账号: %#v", limitedHits)
+	}
+
+	// 此时没有别的账号可换，达到上限只能返回 503（而不是把请求硬塞给已超限的账号）。
+	if response, _ := h.do(http.MethodPost, "/v1/chat/completions", chatBody(), secret); response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("超限且无备用账号时应返回 503, got %d", response.StatusCode)
+	}
+	if len(limitedHits) != 2 {
+		t.Fatalf("超限后不应继续调用该账号: %#v", limitedHits)
+	}
+
+	// 加入一个不限速的账号后，超限请求自动切过去。
+	h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":    "spare",
+		"groupId": groupID,
+		"baseUrl": spareUpstream.URL + "/v1",
+		"keys":    "sk-spare",
+	})
+	if response, chat := h.do(http.MethodPost, "/v1/chat/completions", chatBody(), secret); response.StatusCode != http.StatusOK {
+		t.Fatalf("超限应自动换号成功: %d %#v", response.StatusCode, chat)
+	}
+	if len(limitedHits) != 2 {
+		t.Fatalf("超限账号不应再被调用: %#v", limitedHits)
+	}
+	if len(spareHits) != 1 || spareHits[0] != "sk-spare" {
+		t.Fatalf("应切换到未限速账号: %#v", spareHits)
+	}
+
+	// 粘性绑定不因一次限流而改写：限流只是「这一次不要用」。
+	_, dashboard := h.admin(http.MethodGet, "/admin/dashboard", nil)
+	if accountID := dashboard["keys"].([]any)[0].(map[string]any)["accountId"]; accountID != limitedID {
+		t.Fatalf("限流换号不应改写常驻绑定: %#v", accountID)
+	}
+}
+
+// TestAccountRateLimitValidation 验证频率限制的输入校验：留空表示不限制。
+func TestAccountRateLimitValidation(t *testing.T) {
+	h := newHarness(t)
+	hits := []string{}
+	upstream := fakeUpstream(t, &hits)
+	groupID := h.createGroup("校验分组")
+
+	if response, body := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":            "bad",
+		"groupId":         groupID,
+		"baseUrl":         upstream.URL + "/v1",
+		"keys":            "sk-bad",
+		"rateLimitPerMin": 0,
+	}); response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("频率限制为 0 应报错: %d %#v", response.StatusCode, body)
+	}
+
+	_, body := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":            "blank",
+		"groupId":         groupID,
+		"baseUrl":         upstream.URL + "/v1",
+		"keys":            "sk-blank",
+		"rateLimitPerMin": "",
+	})
+	if account := body["data"].(map[string]any); account["rateLimitPerMin"] != nil {
+		t.Fatalf("留空应表示不限制: %#v", account["rateLimitPerMin"])
+	}
+}
+
+// TestManualAccountSuspendAndEnable 验证管理员手动暂停/启用账号。
+//
+// 暂停后账号立即退出分配池且不删除任何数据，重新启用即恢复承接流量。
+func TestManualAccountSuspendAndEnable(t *testing.T) {
+	h := newHarness(t)
+	hits := []string{}
+	upstream := fakeUpstream(t, &hits)
+
+	groupID := h.createGroup("手动启停")
+	_, body := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":    "solo",
+		"groupId": groupID,
+		"baseUrl": upstream.URL + "/v1",
+		"keys":    "sk-solo",
+	})
+	accountID := body["data"].(map[string]any)["id"].(string)
+
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client"})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+
+	response, suspended := h.admin(http.MethodPost, "/admin/accounts/"+accountID+"/enable", map[string]any{"enabled": false})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("暂停账号失败: %d %#v", response.StatusCode, suspended)
+	}
+	account := suspended["data"].(map[string]any)
+	if account["suspended"] != true || account["enabled"] != false || account["usable"] != false {
+		t.Fatalf("暂停后账号应不可用: %#v", account)
+	}
+	if account["apiCount"].(float64) != 1 {
+		t.Fatalf("暂停应保留上游 API: %#v", account)
+	}
+
+	if response, _ := h.do(http.MethodPost, "/v1/chat/completions", chatBody(), secret); response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("暂停后应无可用账号: %d", response.StatusCode)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("暂停账号不应被调用: %#v", hits)
+	}
+
+	if response, enabled := h.admin(http.MethodPost, "/admin/accounts/"+accountID+"/enable", map[string]any{"enabled": true}); response.StatusCode != http.StatusOK {
+		t.Fatalf("启用账号失败: %d %#v", response.StatusCode, enabled)
+	} else if account := enabled["data"].(map[string]any); account["suspended"] != false || account["enabled"] != true {
+		t.Fatalf("启用后应解除暂停: %#v", account)
+	}
+
+	if response, chat := h.do(http.MethodPost, "/v1/chat/completions", chatBody(), secret); response.StatusCode != http.StatusOK {
+		t.Fatalf("启用后应恢复承接流量: %d %#v", response.StatusCode, chat)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("启用后账号应被调用一次: %#v", hits)
 	}
 }
 

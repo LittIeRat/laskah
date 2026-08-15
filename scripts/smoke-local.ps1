@@ -225,10 +225,67 @@ Step 'GET /admin/accounts 不回显任何凭据' {
   '凭据未回显'
 }
 
-Step 'PATCH 账号配置不被允许（保存后只能查余额或删号）' {
+Step 'PATCH 账号配置不被允许（保存后只能查余额、启停或删除）' {
   $r = Api PATCH ('/admin/accounts/' + $accountA) @{ name = '改名尝试' } -Session $superSession -Csrf $superCsrf
   if ($r.Status -lt 400) { throw ('账号配置被修改成功，HTTP ' + $r.Status) }
   'HTTP ' + $r.Status
+}
+
+Step '账号频率限制：留空表示不限制' {
+  $r = Api GET '/admin/accounts' -Session $superSession -Expect 200
+  $acct = $r.Data.data | Where-Object { $_.id -eq $accountA }
+  if ($null -ne $acct.rateLimitPerMin) { throw ('rateLimitPerMin=' + $acct.rateLimitPerMin + '，期望 null') }
+  if ($acct.suspended) { throw '新建账号不应处于暂停状态' }
+  'rateLimitPerMin=null suspended=false'
+}
+
+$rateLimitedAccount = ''
+
+Step 'POST /admin/accounts 创建带频率限制的账号' {
+  $payload = @{
+    groupId         = $groupB
+    name            = '限速账号'
+    baseUrl         = 'https://upstream.example.com/v1'
+    keys            = 'sk-ratelimit-0123456789abcdef'
+    rateLimitPerMin = 30
+  }
+  $r = Api POST '/admin/accounts' $payload -Session $superSession -Csrf $superCsrf -Expect 201
+  $script:rateLimitedAccount = $r.Data.data.id
+  if ($r.Data.data.rateLimitPerMin -ne 30) { throw ('rateLimitPerMin=' + $r.Data.data.rateLimitPerMin + '，期望 30') }
+  'rateLimitPerMin=30'
+}
+
+Step '频率限制为 0 被拒绝' {
+  $payload = @{
+    groupId         = $groupB
+    name            = '非法限速'
+    baseUrl         = 'https://upstream.example.com/v1'
+    keys            = 'sk-badrate-0123456789abcdef'
+    rateLimitPerMin = 0
+  }
+  $r = Api POST '/admin/accounts' $payload -Session $superSession -Csrf $superCsrf -Expect 400
+  'HTTP 400'
+}
+
+Step '账号暂停后退出分配池且不删除数据' {
+  $off = Api POST ('/admin/accounts/' + $rateLimitedAccount + '/enable') @{ enabled = $false } -Session $superSession -Csrf $superCsrf -Expect 200
+  $acct = $off.Data.data
+  if (-not $acct.suspended) { throw '暂停未生效' }
+  if ($acct.usable) { throw '暂停后 usable 应为 false' }
+  if ($acct.apiCount -ne 1) { throw ('暂停不应删除上游 API，apiCount=' + $acct.apiCount) }
+  $list = Api GET '/admin/accounts' -Session $superSession -Expect 200
+  $still = $list.Data.data | Where-Object { $_.id -eq $rateLimitedAccount }
+  if (-not $still) { throw '暂停账号不应从列表消失' }
+  'suspended=true usable=false apiCount=1'
+}
+
+Step '账号重新启用后恢复可用' {
+  $on = Api POST ('/admin/accounts/' + $rateLimitedAccount + '/enable') @{ enabled = $true } -Session $superSession -Csrf $superCsrf -Expect 200
+  $acct = $on.Data.data
+  if ($acct.suspended) { throw '启用后仍处于暂停' }
+  if (-not $acct.enabled) { throw '启用后 enabled 应为 true' }
+  if (-not $acct.usable) { throw '启用后 usable 应为 true' }
+  'suspended=false usable=true'
 }
 
 Step 'POST 账号手动刷新余额（无限额度不打上游）' {

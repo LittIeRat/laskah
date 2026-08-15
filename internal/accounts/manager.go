@@ -1,4 +1,4 @@
-// Package accounts 负责账号额度刷新与余额耗尽后的自动清理。
+// Package accounts 负责账号额度刷新与余额耗尽后的自动暂停。
 package accounts
 
 import (
@@ -28,7 +28,8 @@ type Manager struct {
 type refreshCall struct {
 	done      chan struct{}
 	usable    bool
-	deleted   bool
+	missing   bool
+	suspended bool
 	exhausted bool
 	failed    bool
 }
@@ -41,7 +42,7 @@ func New(dataStore *store.Store, client *wallet.Client) *Manager {
 	return &Manager{Store: dataStore, Wallet: client, pending: map[string]*refreshCall{}}
 }
 
-// Refresh 查询单个账号额度，写回结果，并在余额耗尽且开启自动删除时清理账号。
+// Refresh 查询单个账号额度，写回结果，并在余额耗尽且开启自动暂停时暂停账号。
 //
 // 未配置额度查询的账号按无限余额处理，直接返回而不产生任何上游请求。
 func (m *Manager) Refresh(ctx context.Context, id string) map[string]any {
@@ -65,6 +66,7 @@ func unlimitedResult(id, name string) map[string]any {
 		"ok":        true,
 		"unlimited": true,
 		"exhausted": false,
+		"suspended": false,
 		"deleted":   false,
 	}
 }
@@ -105,7 +107,7 @@ func (m *Manager) credentials(id string) (wallet.Credentials, string, bool) {
 
 func (m *Manager) apply(id, name string, snapshot wallet.Snapshot) map[string]any {
 	var (
-		deleted   bool
+		suspended bool
 		balance   float64
 		used      float64
 		total     float64
@@ -155,9 +157,13 @@ func (m *Manager) apply(id, name string, snapshot wallet.Snapshot) map[string]an
 		planName = account.PlanName
 		exhausted = account.Exhausted()
 
-		if exhausted && account.AutoDelete {
-			data.RemoveAccounts([]string{account.ID}, exhaustedReason(account))
-			deleted = true
+		// 余额触及下限：暂停而不是删除，账号与上游 API 全部保留，
+		// 管理员充值后在 /manage 点「启用」即恢复。
+		if exhausted && account.AutoSuspend {
+			suspended = account.Suspend(exhaustedReason(account))
+		}
+		if account.Suspended {
+			suspended = true
 		}
 		return nil
 	})
@@ -172,7 +178,9 @@ func (m *Manager) apply(id, name string, snapshot wallet.Snapshot) map[string]an
 		"planName":    planName,
 		"source":      snapshot.Source,
 		"exhausted":   exhausted,
-		"deleted":     deleted,
+		"suspended":   suspended,
+		// deleted 保留为兼容字段：余额耗尽已改为暂停，恒为 false。
+		"deleted": false,
 	}
 	if checkErr != "" {
 		result["error"] = checkErr
@@ -207,13 +215,13 @@ func (m *Manager) RefreshForRequest(ctx context.Context, accountID string) bool 
 	result := m.Refresh(ctx, accountID)
 	switch {
 	case result == nil:
-		// 账号已不存在（可能刚被其他请求触发的刷新删掉）。
-		call.deleted = true
+		// 账号已不存在（例如管理员刚删掉）。
+		call.missing = true
 	default:
-		call.deleted, _ = result["deleted"].(bool)
+		call.suspended, _ = result["suspended"].(bool)
 		call.exhausted, _ = result["exhausted"].(bool)
 		_, call.failed = result["error"]
-		call.usable = call.failed || (!call.deleted && !call.exhausted)
+		call.usable = call.failed || (!call.suspended && !call.exhausted)
 	}
 
 	m.pendingMu.Lock()
@@ -310,50 +318,48 @@ func (m *Manager) refreshMany(ctx context.Context, ids []string) []any {
 	return results
 }
 
-// DropAccount 立即删除一个账号，用于上游明确报告余额不足的场景。
+// SuspendAccount 立即暂停一个账号，用于上游明确报告余额不足的场景。
 //
-// 不看 AutoDelete 开关：上游已经拒绝了这次请求，继续留着只会持续失败。
-// 返回是否真的删除了账号（并发下可能已被其他请求删掉）。
-func (m *Manager) DropAccount(accountID, reason string) bool {
+// 不看 AutoSuspend 开关：上游已经拒绝了这次请求，继续放流量只会持续失败。
+// 返回该账号此刻是否处于暂停状态（并发下可能已被其它请求暂停）。
+func (m *Manager) SuspendAccount(accountID, reason string) bool {
 	if accountID == "" {
 		return false
 	}
 	if reason == "" {
-		reason = "上游报余额不足自动删除"
+		reason = "上游报余额不足自动暂停"
 	}
-	removed := false
+	suspended := false
 	_ = m.Store.Update(func(data *store.Data) error {
-		if data.FindAccount(accountID) == nil {
+		account := data.FindAccount(accountID)
+		if account == nil {
 			return nil
 		}
-		removed = len(data.RemoveAccounts([]string{accountID}, reason)) > 0
+		account.Suspend(reason)
+		suspended = account.Suspended
 		return nil
 	})
-	return removed
+	return suspended
 }
 
-// exhaustedReason 生成删号原因，带上余额与生效下限，便于事后核对。
+// exhaustedReason 生成暂停原因，带上余额与生效下限，便于事后核对。
 func exhaustedReason(account *store.Account) string {
-	return fmt.Sprintf("余额触及下限自动删除（余额 %.6f / 下限 %.2f %s）",
+	return fmt.Sprintf("余额触及下限自动暂停（余额 %.6f / 下限 %.2f %s）",
 		account.Balance, account.BalanceFloor(), account.Currency)
 }
 
-// SweepExhausted 清理余额已耗尽且开启自动删除的账号，返回被删除的账号名。
+// SweepExhausted 暂停余额已耗尽且开启自动暂停的账号，返回被暂停的账号名。
 func (m *Manager) SweepExhausted() []string {
 	names := []string{}
 	_ = m.Store.Update(func(data *store.Data) error {
-		ids := []string{}
-		reasons := []string{}
 		for _, account := range data.Accounts {
-			if account.AutoDelete && account.Exhausted() {
-				ids = append(ids, account.ID)
-				reasons = append(reasons, exhaustedReason(account))
+			if !account.AutoSuspend || account.Suspended || !account.Exhausted() {
+				continue
+			}
+			// 逐个暂停：暂停原因要带上各自的余额与下限。
+			if account.Suspend(exhaustedReason(account)) {
 				names = append(names, account.Name)
 			}
-		}
-		// 逐个删除而不是批量：删号原因要带上各自的余额与下限。
-		for index, id := range ids {
-			data.RemoveAccounts([]string{id}, reasons[index])
 		}
 		return nil
 	})

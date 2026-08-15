@@ -278,7 +278,7 @@ func TestProviderModelNamesDropsWildcards(t *testing.T) {
 	}
 }
 
-// TestIsBalanceExhausted 明确划定“余额不足自动删号”的判定边界。
+// TestIsBalanceExhausted 明确划定“余额不足自动暂停”的判定边界。
 //
 // 关键是不能把限流或上游故障误判成余额耗尽，否则会误删正常账号。
 func TestIsBalanceExhausted(t *testing.T) {
@@ -313,7 +313,7 @@ func TestIsBalanceExhausted(t *testing.T) {
 		{503, "insufficient balance"},
 		{400, `{"error":{"message":"model not found"}}`},
 		{200, "insufficient quota"},
-		// 剩余额度足够覆盖本次预扣费，属于正常提示，不能删号。
+		// 剩余额度足够覆盖本次预扣费，属于正常提示，不能暂停账号。
 		{400, "预扣费额度校验: 用户剩余额度: ＄12.50, 需要预扣费额度: ＄0.29"},
 		// 只有一个金额时无法比较，不能凭空判定。
 		{400, "用户剩余额度: ＄0.18"},
@@ -341,7 +341,7 @@ func TestNormalizeErrorText(t *testing.T) {
 	}
 }
 
-// TestTruncateReason 保证删号原因不会写入超长上游响应。
+// TestTruncateReason 保证暂停原因不会写入超长上游响应。
 func TestTruncateReason(t *testing.T) {
 	if got := truncateReason("  余额不足  "); got != "余额不足" {
 		t.Fatalf("应去掉首尾空白: %q", got)
@@ -392,7 +392,7 @@ func TestBalanceExhaustedInPayload(t *testing.T) {
 		t.Fatalf("应从 error 字段识别余额不足: %q %v", detail, ok)
 	}
 
-	// 正常回答里出现相关字样不能触发删号。
+	// 正常回答里出现相关字样不能触发暂停。
 	normal := map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "余额不足请充值"}}}}
 	if _, ok := balanceExhaustedInPayload(normal); ok {
 		t.Fatalf("正文内容不应触发余额不足判定")

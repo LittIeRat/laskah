@@ -48,7 +48,7 @@ func defaultKeyFile(dataFile string) string {
 
 func newData() *Data {
 	data := &Data{
-		Version:         4,
+		Version:         5,
 		Config:          Config{Strategy: "weighted-random", MaxRetries: 3, CreatedAt: time.Now().UTC()},
 		Groups:          []*Group{},
 		Accounts:        []*Account{},
@@ -127,8 +127,10 @@ func (s *Store) normalizeLocked() {
 	legacyAccounts := data.Version < 3
 	// v4 引入分组启用开关与多管理员：旧分组默认启用。
 	legacyGroups := data.Version < 4
-	if data.Version < 4 {
-		data.Version = 4
+	// v5 把「余额耗尽自动删号」换成「自动暂停」：旧数据按原 autoDelete 开关迁移。
+	legacyAutoDelete := data.Version < 5
+	if data.Version < 5 {
+		data.Version = 5
 	}
 	if data.Config.Users == nil {
 		data.Config.Users = []*AdminUser{}
@@ -183,6 +185,19 @@ func (s *Store) normalizeLocked() {
 		}
 		if legacyAccounts {
 			account.RefreshOnRequest = true
+		}
+		if legacyAutoDelete {
+			// 旧字段缺失时默认开启：与 v4 之前 BuildAccount 的默认值一致。
+			account.AutoSuspend = account.AutoDeleteLegacy == nil || *account.AutoDeleteLegacy
+		}
+		// 迁移后丢弃历史字段，避免继续写回磁盘。
+		account.AutoDeleteLegacy = nil
+		if account.RateLimitPerMin != nil && *account.RateLimitPerMin <= 0 {
+			account.RateLimitPerMin = nil
+		}
+		if !account.Suspended {
+			account.SuspendReason = ""
+			account.SuspendedAt = nil
 		}
 	}
 	for _, key := range data.Keys {
