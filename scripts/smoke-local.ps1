@@ -293,6 +293,93 @@ Step 'POST 账号手动刷新余额（无限额度不打上游）' {
   'HTTP 200'
 }
 
+$manualAccount = ''
+
+Step 'POST /admin/accounts 创建手动余额 + 按量计价账号' {
+  $payload = @{
+    groupId        = $groupB
+    name           = '手动计费账号'
+    baseUrl        = 'https://upstream.example.com/v1'
+    keys           = 'sk-manual-0123456789abcdef'
+    billingMode    = 'per_mtoken'
+    pricePerMToken = 2.5
+    manualBalance  = $true
+    initialBalance = 20
+  }
+  $r = Api POST '/admin/accounts' $payload -Session $superSession -Csrf $superCsrf -Expect 201
+  $script:manualAccount = $r.Data.data.id
+  $acct = $r.Data.data
+  if ($acct.billingMode -ne 'per_mtoken') { throw ('billingMode=' + $acct.billingMode) }
+  if ($acct.pricePerMToken -ne 2.5) { throw ('pricePerMToken=' + $acct.pricePerMToken) }
+  if (-not $acct.manualBalance) { throw '手动余额未生效' }
+  if ($acct.unlimited) { throw '手动余额账号不应被视为无限额度' }
+  if ([math]::Abs($acct.balance - 20) -gt 0.0001) { throw ('初始余额=' + $acct.balance + '，期望 20') }
+  'billingMode=per_mtoken price=2.5/Mtoken balance=20 unlimited=false'
+}
+
+Step '手动余额账号刷新走本地口径（不打上游）' {
+  $r = Api POST ('/admin/accounts/' + $manualAccount + '/refresh') -Session $superSession -Csrf $superCsrf -Expect 200
+  if ($r.Data.data.source -ne 'local') { throw ('source=' + $r.Data.data.source + '，期望 local') }
+  if ($r.Data.data.unlimited) { throw '手动余额账号不应返回无限额度' }
+  'source=local unlimited=false'
+}
+
+Step '计价方式非法被拒绝' {
+  $payload = @{
+    groupId     = $groupB
+    name        = '非法计价'
+    baseUrl     = 'https://upstream.example.com/v1'
+    keys        = 'sk-badbilling-0123456789abcdef'
+    billingMode = 'per_banana'
+  }
+  $r = Api POST '/admin/accounts' $payload -Session $superSession -Csrf $superCsrf -Expect 400
+  'HTTP 400'
+}
+
+Step '自定义完整端点必须是绝对地址' {
+  $payload = @{
+    groupId = $groupB
+    name    = '相对端点'
+    baseUrl = 'https://upstream.example.com/v1'
+    keys    = 'sk-badendpoint-0123456789abcdef'
+    chatUrl = '/v1/chat/completions'
+  }
+  $r = Api POST '/admin/accounts' $payload -Session $superSession -Csrf $superCsrf -Expect 400
+  'HTTP 400'
+}
+
+Step '自定义 chat / responses / models 完整地址被接受但不回显' {
+  $payload = @{
+    groupId      = $groupB
+    name         = '自定义端点账号'
+    baseUrl      = 'https://upstream.example.com/v1'
+    keys         = 'sk-endpoint-0123456789abcdef'
+    chatUrl      = 'https://upstream.example.com/openai/v1/chat/completions'
+    responsesUrl = 'https://upstream.example.com/openai/v1/responses'
+    modelsUrl    = 'https://upstream.example.com/openai/v1/models'
+  }
+  $r = Api POST '/admin/accounts' $payload -Session $superSession -Csrf $superCsrf -Expect 201
+  $acct = $r.Data.data
+  if (-not $acct.hasCustomChatUrl) { throw '未记录自定义 chat 地址' }
+  if (-not $acct.hasCustomRespUrl) { throw '未记录自定义 responses 地址' }
+  if (-not $acct.hasCustomModelsUrl) { throw '未记录自定义 models 地址' }
+  if ($r.Text -match 'openai/v1/chat/completions') { throw '自定义端点被回显' }
+  'hasCustomChatUrl/RespUrl/ModelsUrl=true 且不回显'
+}
+
+Step 'POST /admin/accounts/balance-query 查询总余额并拆分来源' {
+  $r = Api POST '/admin/accounts/balance-query' -Session $superSession -Csrf $superCsrf -Expect 200
+  $d = $r.Data.data
+  if ($null -eq $d.queried) { throw '缺少 queried 计数' }
+  if ($null -eq $d.failed) { throw '缺少 failed 计数' }
+  if ($null -eq $d.totals.balance.queriedBalance) { throw '缺少上游查询余额小计' }
+  if ($null -eq $d.totals.balance.manualAmount) { throw '缺少手动余额小计' }
+  if ([math]::Abs($d.totals.balance.manualAmount - 20) -gt 0.0001) { throw ('manualAmount=' + $d.totals.balance.manualAmount + '，期望 20') }
+  if ($null -eq $d.totals.tokens.selfMetered) { throw '缺少自算计量标记' }
+  if (-not $d.groups) { throw '缺少分组汇总' }
+  'queried=' + $d.queried + ' failed=' + $d.failed + ' manualAmount=' + $d.totals.balance.manualAmount
+}
+
 Step 'POST 分组手动刷新余额' {
   $r = Api POST ('/admin/groups/' + $groupA + '/refresh') -Session $superSession -Csrf $superCsrf -Expect 200
   'HTTP 200'
@@ -347,8 +434,16 @@ Step 'GET /admin/dashboard 汇总余额与用量' {
   'groups=' + $names + ' apiCount=' + $d.accounts.apiCount + ' unlimited=' + $d.accounts.unlimited
 }
 
-Step 'GET /v1/models 需要网关密钥' {
-  $r = Api GET '/v1/models' -Expect 401
+Step 'GET /v1/models 匿名返回 200 空列表（便于客户端探活）' {
+  $r = Api GET '/v1/models' -Expect 200
+  if ($r.Data.object -ne 'list') { throw 'object 不是 list' }
+  if (@($r.Data.data).Count -ne 0) { throw '匿名访问不应列出任何模型' }
+  if (-not $r.Data.hint) { throw '匿名响应缺少 hint 提示' }
+  'HTTP 200 空列表 + hint'
+}
+
+Step 'GET /v1/models 携带无效密钥仍然 401' {
+  $r = Api GET '/v1/models' -Bearer 'sk-not-a-real-key' -Expect 401
   'HTTP 401'
 }
 

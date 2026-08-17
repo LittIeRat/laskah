@@ -36,26 +36,61 @@ type ModelList struct {
 	Data   []ModelEntry `json:"data"`
 }
 
+// AnonymousModelList 是未携带密钥时的响应体。
+//
+// 保持 object/data 结构不变，确保 OpenAI 客户端仍能正常解析；
+// 额外的 hint 只是给用手动打开链接的人看的说明。
+type AnonymousModelList struct {
+	Object string       `json:"object"`
+	Data   []ModelEntry `json:"data"`
+	Hint   string       `json:"hint"`
+}
+
+// anonymousModelsHint 说明匿名访问看不到模型的原因与正确用法。
+const anonymousModelsHint = "未提供 API Key，返回空列表。请在请求头带上 Authorization: Bearer <本站 API Key> 以查看该密钥可调用的模型。"
+
 // HandleModels 处理 /v1/models 与 /v1/models/{id}。
 //
 // 列表严格按 OpenAI 规范输出：object=list，data 按 id 升序排列，
 // 每项只含 id / object / created / owned_by 四个规范字段。
 // 列表覆盖「该密钥能落到的全部账号」，而不只是当前绑定的那一个：
 // 请求某个模型时网关会自动切到提供它的账号，因此可调用范围就是分组内的并集。
+//
+// 未携带任何密钥（浏览器直接打开该地址）时返回 200 + 空 data，并在 hint 里说明要带密钥：
+// 直接回 401 会让人以为服务坏了，但把全站模型并集暴露给匿名访问者
+// 等于泄露了上游供货范围，因此空列表是这里唯一站得住的折中。
+// 带了密钥但密钥无效/禁用/过期时仍然照实返回 401/403，不做任何遮掩。
 func (g *Gateway) HandleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		httpx.Error(w, http.StatusMethodNotAllowed, "仅支持 GET", nil)
 		return
 	}
 
+	requested := requestedModelID(r.URL.Path)
+	secret := httpx.BearerToken(r)
+
+	// 完全没带密钥（例如浏览器直接打开该地址）时给出可解析的空列表而不是 401。
+	// 带了密钥但无效仍然按 401 处理：那是明确的鉴权失败，不该被静默成空结果。
+	if strings.TrimSpace(secret) == "" {
+		if requested != "" {
+			httpx.Error(w, http.StatusNotFound, "模型不存在或当前密钥无权访问: "+requested, nil)
+			return
+		}
+		httpx.JSON(w, http.StatusOK, AnonymousModelList{
+			Object: "list",
+			Data:   []ModelEntry{},
+			Hint:   anonymousModelsHint,
+		})
+		return
+	}
+
 	// 只验密钥、不分配账号：列举模型不该触发余额查询或改动粘性绑定。
-	keyID, authErr := g.ValidateKey(httpx.BearerToken(r))
+	keyID, authErr := g.ValidateKey(secret)
 	if authErr != nil {
 		httpx.Error(w, authErr.Status, authErr.Message, nil)
 		return
 	}
 
-	requested := requestedModelID(r.URL.Path)
 	entries := g.availableModels(keyID)
 
 	if requested == "" {

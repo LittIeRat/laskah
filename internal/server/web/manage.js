@@ -223,6 +223,9 @@
       badges.push(h("span", { class: "badge info", text: "∞ 无限余额" }));
     } else {
       badges.push(h("span", { class: "badge info", text: "余额 " + LB.fmtMoney(account.balance, account.currency) }));
+      if (account.manualBalance) {
+        badges.push(h("span", { class: "badge", text: "手动余额" }));
+      }
       // 余额已进入「下一次刷新就会暂停」的区间时提前提示，避免管理员措手不及。
       var floor = account.balanceFloor || 0;
       if (!account.exhausted && floor > 0 && account.balance <= floor * 2) {
@@ -234,6 +237,17 @@
     }
     badges.push(h("span", { class: "badge", text: account.apiCount + "/" + account.maxApiCount + " API" }));
     return badges;
+  }
+
+  // billingLabel 描述账号的计价方式，便于核对金额口径。
+  function billingLabel(account) {
+    if (account.billingMode === "per_mtoken") {
+      return "按量 " + LB.fmtMoney(account.pricePerMToken, account.currency) + " / 1M token";
+    }
+    if (account.billingMode === "per_call") {
+      return "按次 " + LB.fmtMoney(account.pricePerCall, account.currency) + " / 次";
+    }
+    return "未计价";
   }
 
   function renderAccounts() {
@@ -248,14 +262,22 @@
     accounts.forEach(function (account) {
       var detail = "分组 " + (names[account.groupId] || "未分组");
       if (account.unlimited) {
-        detail += " · 未配置额度查询，视为无限余额";
+        detail += " · 未配置额度查询与手动余额，视为无限余额";
+      } else if (account.manualBalance && !account.hasBalanceQuery) {
+        detail += " · 已用 " + LB.fmtMoney(account.usedAmount, account.currency) +
+          " · 余额下限 " + LB.fmtMoney(account.balanceFloor || 0, account.currency) +
+          " · 本地计费于 " + LB.fmtTime(account.checkedAt);
       } else {
         detail += " · 已用 " + LB.fmtMoney(account.usedAmount, account.currency) +
           " · 余额下限 " + LB.fmtMoney(account.balanceFloor || 0, account.currency) +
           " · 查询于 " + LB.fmtTime(account.checkedAt);
       }
-      detail += " · " + LB.fmtNumber(account.stats.totalTokens) + " tokens · " +
+      detail += " · " + billingLabel(account);
+      detail += " · " + LB.fmtNumber(account.stats.totalTokens) + " tokens（本站自算）· " +
         LB.fmtNumber(account.stats.requests) + " 次请求";
+      if (account.cost) {
+        detail += " · 自算消耗 " + LB.fmtMoney(account.cost, account.currency);
+      }
       if (account.checkError) {
         detail += " · " + account.checkError;
       }
@@ -272,10 +294,12 @@
         ]),
         h("div", { class: "row-actions" }, [
           h("button", {
-            class: "btn btn-sm" + (account.hasBalanceQuery ? " btn-primary" : ""),
-            text: account.hasBalanceQuery ? "手动刷新" : "查看余额",
-            disabled: !account.hasBalanceQuery,
-            title: account.hasBalanceQuery ? "立即查询该账号余额" : "未配置额度查询，余额视为无限",
+            class: "btn btn-sm" + (account.hasBalanceQuery || account.manualBalance ? " btn-primary" : ""),
+            text: account.hasBalanceQuery ? "手动刷新" : (account.manualBalance ? "查看余额" : "查看余额"),
+            disabled: !account.hasBalanceQuery && !account.manualBalance,
+            title: account.hasBalanceQuery
+              ? "立即查询该账号余额"
+              : (account.manualBalance ? "手动余额由本站按自算 token 扣减，点击刷新当前数值" : "未配置额度查询，余额视为无限"),
             onClick: function (event) {
               refreshAccount(account, event.currentTarget);
             }
@@ -447,6 +471,43 @@
     var reqRefreshInput = h("input", { type: "number", min: 1, max: 3600, value: "60" });
     var autoSuspend = h("input", { type: "checkbox", checked: true });
     var refreshOnRequest = h("input", { type: "checkbox", checked: true });
+    // 自定义端点：留空按 Base URL 拼默认后缀；填了必须是完整地址。
+    var chatUrlInput = h("input", { type: "text", placeholder: "https://api.example.com/v1/chat/completions", spellcheck: false });
+    var modelsUrlInput = h("input", { type: "text", placeholder: "https://api.example.com/v1/models", spellcheck: false });
+    var responsesUrlInput = h("input", { type: "text", placeholder: "https://api.example.com/v1/responses", spellcheck: false });
+
+    // 计价：本站按自己统计的 token 折算金额，不采信上游自报用量。
+    var billingSelect = h("select", {});
+    billingSelect.appendChild(h("option", { value: "none", text: "不计价（只统计 token）" }));
+    billingSelect.appendChild(h("option", { value: "per_mtoken", text: "按量计费（每 100 万 token）" }));
+    billingSelect.appendChild(h("option", { value: "per_call", text: "按次计费（每次请求）" }));
+    var priceMTokenInput = h("input", { type: "number", min: 0, step: "0.0001", placeholder: "例如：2.5" });
+    var priceCallInput = h("input", { type: "number", min: 0, step: "0.000001", placeholder: "例如：0.002" });
+    var manualBalance = h("input", { type: "checkbox" });
+    var initialBalanceInput = h("input", { type: "number", min: 0, step: "0.0001", placeholder: "例如：20", disabled: true });
+
+    var priceMTokenField = field("每 100 万 token 价格（USD）", priceMTokenInput, "按本站自算的输入+输出 token 总数折算金额");
+    var priceCallField = field("每次请求价格（USD）", priceCallInput, "无论 token 多少，每次成功请求收取固定金额");
+    var initialBalanceField = field("初始余额（USD）", initialBalanceInput, "本站按上面的单价从这个余额里扣减，扣到下限自动暂停账号");
+    priceMTokenField.style.display = "none";
+    priceCallField.style.display = "none";
+    initialBalanceField.style.display = "none";
+
+    function syncBilling() {
+      var mode = billingSelect.value;
+      priceMTokenField.style.display = mode === "per_mtoken" ? "" : "none";
+      priceCallField.style.display = mode === "per_call" ? "" : "none";
+      // 没有单价就无从扣减，手动余额必须依附于某种计价方式。
+      manualBalance.disabled = mode === "none";
+      if (mode === "none") {
+        manualBalance.checked = false;
+      }
+      initialBalanceInput.disabled = !manualBalance.checked;
+      initialBalanceField.style.display = manualBalance.checked ? "" : "none";
+    }
+    billingSelect.addEventListener("change", syncBilling);
+    manualBalance.addEventListener("change", syncBilling);
+
 
     // 频率限制：默认不限制；勾选后才要求填写「一分钟能请求多少次」。
     var rateLimited = h("input", { type: "checkbox" });
@@ -479,7 +540,7 @@
           keysInput,
           keysCount
         ]),
-        field("Base URL", baseInput, "请求时自动拼接 /chat/completions，走 OpenAI chat completions 兼容协议", true),
+        field("Base URL", baseInput, "请求时自动拼接 /chat/completions、/responses、/models，走 OpenAI 兼容协议", true),
         h("div", { class: "field full" }, [
           h("label", { text: "模型列表" }),
           h("div", { class: "btn-row" }, [probeButton, selectAll, clearAll, modelStatus]),
@@ -489,7 +550,7 @@
       ]),
       h("div", { class: "section-head" }, [
         h("h2", { text: "凭证配置" }),
-        h("span", { class: "hint", text: "留空则自动使用供应商配置；留空即视为无限余额" })
+        h("span", { class: "hint", text: "留空则自动使用供应商配置；留空且未开启手动余额时视为无限余额" })
       ]),
       h("div", { class: "form-grid" }, [
         field("请求地址", siteInput, "New API 站点地址，留空则用 Base URL 去掉 /v1"),
@@ -503,6 +564,26 @@
         switchBlock("请求时刷新余额", refreshOnRequest, "调用到达时先确认余额，防止余额用完仍继续使用该账号")
       ]),
       h("div", { class: "section-head" }, [
+        h("h2", { text: "自定义端点（可选）" }),
+        h("span", { class: "hint", text: "留空按 Base URL 拼默认后缀；填写则必须是完整地址" })
+      ]),
+      h("div", { class: "form-grid" }, [
+        field("对话端点完整地址", chatUrlInput, "留空 = Base URL + /chat/completions"),
+        field("Responses 端点完整地址", responsesUrlInput, "留空 = Base URL + /responses，供 /v1/responses 兼容调用使用"),
+        field("模型列表端点完整地址", modelsUrlInput, "留空 = Base URL + /models")
+      ]),
+      h("div", { class: "section-head" }, [
+        h("h2", { text: "计价与手动余额" }),
+        h("span", { class: "hint", text: "金额按本站自算的 token 折算，不采信上游自报用量" })
+      ]),
+      h("div", { class: "form-grid" }, [
+        field("计价方式", billingSelect, "本站用自己的 tokenizer 统计输入与输出 token，避免上游谎报用量"),
+        priceMTokenField,
+        priceCallField,
+        switchBlock("手动配置余额（本地扣减）", manualBalance, "由本站按上面的单价扣减余额，不依赖上游额度接口；需先选择计价方式"),
+        initialBalanceField
+      ]),
+      h("div", { class: "section-head" }, [
         h("h2", { text: "频率限制" }),
         h("span", { class: "hint", text: "留空则不限制" })
       ]),
@@ -513,6 +594,7 @@
     ]);
 
     renderModels();
+    syncBilling();
 
     LB.modal({
       title: "创建账号",
@@ -538,6 +620,27 @@
           LB.toast("请填写每分钟请求次数，或关闭频率限制", "error");
           return false;
         }
+        if (billingSelect.value === "per_mtoken" && !(Number(priceMTokenInput.value) > 0)) {
+          LB.toast("请填写每 100 万 token 的价格", "error");
+          return false;
+        }
+        if (billingSelect.value === "per_call" && !(Number(priceCallInput.value) > 0)) {
+          LB.toast("请填写每次请求的价格", "error");
+          return false;
+        }
+        if (manualBalance.checked && !(Number(initialBalanceInput.value) > 0)) {
+          LB.toast("启用手动余额时请填写初始余额", "error");
+          return false;
+        }
+        // 自定义端点必须是完整地址，否则会被拼到 Base URL 后面变成无效地址。
+        var badEndpoint = [chatUrlInput, modelsUrlInput, responsesUrlInput].some(function (input) {
+          var value = input.value.trim();
+          return value && !/^https?:\/\//i.test(value);
+        });
+        if (badEndpoint) {
+          LB.toast("自定义端点需要填写完整地址（以 http:// 或 https:// 开头）", "error");
+          return false;
+        }
 
         var response = await LB.request("POST", "/admin/accounts", {
           groupId: groupSelect.value,
@@ -553,6 +656,14 @@
           rateLimitPerMin: rateLimited.checked ? rateLimitInput.value : "",
           autoSuspend: autoSuspend.checked,
           refreshOnRequest: refreshOnRequest.checked,
+          chatUrl: chatUrlInput.value.trim(),
+          modelsUrl: modelsUrlInput.value.trim(),
+          responsesUrl: responsesUrlInput.value.trim(),
+          billingMode: billingSelect.value,
+          pricePerMToken: billingSelect.value === "per_mtoken" ? priceMTokenInput.value : "",
+          pricePerCall: billingSelect.value === "per_call" ? priceCallInput.value : "",
+          manualBalance: manualBalance.checked,
+          initialBalance: manualBalance.checked ? initialBalanceInput.value : "",
           keyList: keys,
           selectedModels: Object.keys(selected)
         });
@@ -563,6 +674,8 @@
         }
         if (response.data && response.data.checkError) {
           LB.toast(message + "；余额查询失败：" + response.data.checkError, "error");
+        } else if (response.data && response.data.manualBalance) {
+          LB.toast(message + "，手动余额 " + LB.fmtMoney(response.data.balance) + "，按本站自算 token 扣减", "ok");
         } else if (response.data && response.data.unlimited) {
           LB.toast(message + "，未配置额度查询，按无限余额处理", "ok");
         } else {

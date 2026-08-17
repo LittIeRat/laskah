@@ -106,6 +106,8 @@ func (h *Handler) createAccount(w http.ResponseWriter, r *http.Request) {
 				APIKey:    apiKey,
 				Models:    models,
 				TimeoutMS: payload.TimeoutMS,
+				// 账号填了完整端点地址时优先使用它，否则按 baseUrl 拼默认后缀。
+				Paths: endpointPaths(account),
 			})
 			if buildErr != nil {
 				errorList = append(errorList, "第 "+strconv.Itoa(index+1)+" 条: "+buildErr.Error())
@@ -144,6 +146,17 @@ func (h *Handler) createAccount(w http.ResponseWriter, r *http.Request) {
 		"skipped": skipped,
 		"errors":  errorList,
 	})
+}
+
+// endpointPaths 把账号自填的完整端点地址转成上游路径覆盖。
+//
+// 全部留空时返回 nil，让 BuildProvider 使用协议默认路径。
+func endpointPaths(account *store.Account) *store.Paths {
+	if account.Endpoints.Chat == "" && account.Endpoints.Models == "" && account.Endpoints.Responses == "" {
+		return nil
+	}
+	paths := account.Endpoints
+	return &paths
 }
 
 // parseKeyLines 从批量粘贴文本或数组中提取 API Key，忽略空行、注释与重复项。
@@ -204,6 +217,8 @@ func (h *Handler) handleAccountItem(w http.ResponseWriter, r *http.Request) {
 		h.handleAccountTotals(w)
 	case resource == "refresh-all" && r.Method == http.MethodPost:
 		h.handleRefreshAll(w, r)
+	case resource == "balance-query" && r.Method == http.MethodPost:
+		h.handleBalanceQuery(w, r)
 	case resource == "batch" && r.Method == http.MethodDelete:
 		h.handleAccountBatchDelete(w, r)
 	case action == "refresh" && r.Method == http.MethodPost:
@@ -327,6 +342,58 @@ func (h *Handler) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
 		totals = data.AccountTotals()
 	})
 	httpx.JSON(w, http.StatusOK, map[string]any{"data": results, "totals": totals})
+}
+
+// handleBalanceQuery 先刷新全部账号，再返回一份「总余额」汇总。
+//
+// 与 refresh-all 的区别是它按余额来源把结果拆开：上游查询到的余额、本地手动扣减的余额、
+// 无限额度账号数量、以及查询失败的账号数量。总余额只有配上失败数才有意义——
+// 少查到一个账号就少一笔钱，直接给一个总数会让人误判额度。
+func (h *Handler) handleBalanceQuery(w http.ResponseWriter, r *http.Request) {
+	if h.Accounts == nil {
+		httpx.Error(w, http.StatusServiceUnavailable, "额度查询组件未就绪", nil)
+		return
+	}
+	results := h.Accounts.RefreshAll(r.Context())
+
+	failed := 0
+	deleted := 0
+	suspended := 0
+	for _, item := range results {
+		row, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if text, _ := row["error"].(string); text != "" {
+			failed++
+		}
+		if flag, _ := row["deleted"].(bool); flag {
+			deleted++
+		}
+		if flag, _ := row["suspended"].(bool); flag {
+			suspended++
+		}
+	}
+
+	totals := map[string]any{}
+	groups := []any{}
+	h.Store.View(func(data *store.Data) {
+		totals = data.AccountTotals()
+		for _, group := range data.Groups {
+			groups = append(groups, store.PublicGroup(group, data.GroupSummary(group.ID)))
+		}
+	})
+
+	httpx.JSON(w, http.StatusOK, map[string]any{
+		"data": map[string]any{
+			"queried":   len(results),
+			"failed":    failed,
+			"deleted":   deleted,
+			"suspended": suspended,
+			"totals":    totals,
+			"groups":    groups,
+		},
+	})
 }
 
 func (h *Handler) handleAccountDelete(w http.ResponseWriter, id string) {

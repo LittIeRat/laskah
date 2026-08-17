@@ -51,11 +51,51 @@ func (m *Manager) Refresh(ctx context.Context, id string) map[string]any {
 		return nil
 	}
 	if creds.AccessToken == "" || creds.UserID == "" {
+		// 手动余额账号的数字完全由本地计费维护，不存在可查询的上游额度接口，
+		// 因此直接回报当前本地状态，而不是谎称“无限余额”。
+		if local := m.localResult(id, name); local != nil {
+			return local
+		}
 		return unlimitedResult(id, name)
 	}
 
 	snapshot := m.Wallet.Fetch(ctx, creds)
 	return m.apply(id, name, snapshot)
+}
+
+// localResult 返回手动余额账号的本地余额视图，非手动余额账号返回 nil。
+//
+// 顺带执行一次耗尽判定：管理员点「刷新」时若余额已被扣到下限，
+// 应当立刻看到账号被暂停，而不是等下一次调用才发现。
+func (m *Manager) localResult(id, name string) map[string]any {
+	var result map[string]any
+	_ = m.Store.Update(func(data *store.Data) error {
+		account := data.FindAccount(id)
+		if account == nil || !account.HasManualBalance() {
+			return nil
+		}
+		exhausted := account.Exhausted()
+		suspended := account.Suspended
+		if exhausted && account.AutoSuspend && account.Suspend(exhaustedReason(account)) {
+			suspended = true
+		}
+		result = map[string]any{
+			"id":          id,
+			"name":        name,
+			"ok":          true,
+			"balance":     account.Balance,
+			"usedAmount":  account.UsedAmount,
+			"totalAmount": account.TotalAmount,
+			"planName":    account.PlanName,
+			"source":      "local",
+			"exhausted":   exhausted,
+			"suspended":   suspended,
+			"unlimited":   false,
+			"deleted":     false,
+		}
+		return nil
+	})
+	return result
 }
 
 // unlimitedResult 是无限额度账号的固定查询结果。
@@ -292,7 +332,7 @@ func (m *Manager) refreshMany(ctx context.Context, ids []string) []any {
 			if !found {
 				return
 			}
-			// 无限额度账号不查上游，直接记为跳过。
+			// 无上游额度接口的账号不发网络请求：手动余额走本地视图，其余按无限额度跳过。
 			if creds.AccessToken == "" || creds.UserID == "" {
 				outcomes[slot] = outcome{id: accountID, name: name, found: true, unlimited: true}
 				return
@@ -308,6 +348,10 @@ func (m *Manager) refreshMany(ctx context.Context, ids []string) []any {
 			continue
 		}
 		if item.unlimited {
+			if local := m.localResult(item.id, item.name); local != nil {
+				results = append(results, local)
+				continue
+			}
 			results = append(results, unlimitedResult(item.id, item.name))
 			continue
 		}

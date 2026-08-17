@@ -323,7 +323,11 @@ func (d *Data) GroupSummary(groupID string) map[string]any {
 		balance     float64
 		usedAmount  float64
 		totalAmount float64
+		localCost   float64
 		tokens      int64
+		promptTok   int64
+		outputTok   int64
+		upstreamTok int64
 		requests    int64
 		accountNum  int
 		usableNum   int
@@ -331,6 +335,9 @@ func (d *Data) GroupSummary(groupID string) map[string]any {
 	)
 	unlimitedNum := 0
 	suspendedNum := 0
+	manualNum := 0
+	queriedBalance := 0.0
+	manualAmount := 0.0
 	for _, account := range d.Accounts {
 		if account.GroupID != groupID {
 			continue
@@ -339,6 +346,12 @@ func (d *Data) GroupSummary(groupID string) map[string]any {
 		if account.Suspended {
 			suspendedNum++
 		}
+		if account.HasManualBalance() {
+			manualNum++
+			manualAmount += account.Balance
+		} else if account.HasBalanceQuery() {
+			queriedBalance += account.Balance
+		}
 		if account.Unlimited() {
 			unlimitedNum++
 		} else {
@@ -346,7 +359,12 @@ func (d *Data) GroupSummary(groupID string) map[string]any {
 			usedAmount += account.UsedAmount
 			totalAmount += account.TotalAmount
 		}
+		// 本地计费金额与余额来源无关：即使余额走上游查询，也要有一份自算口径。
+		localCost += account.Stats.Cost
 		tokens += account.Stats.TotalTokens
+		promptTok += account.Stats.PromptTokens
+		outputTok += account.Stats.CompletionTokens
+		upstreamTok += account.Stats.UpstreamTokens
 		requests += account.Stats.Requests
 		apiCount += d.CountAccountKeys(account.ID)
 		if account.Usable() {
@@ -372,21 +390,28 @@ func (d *Data) GroupSummary(groupID string) map[string]any {
 	}
 
 	return map[string]any{
-		"balance":       round4(balance),
-		"usedAmount":    round4(usedAmount),
-		"totalAmount":   round4(totalAmount),
-		"lifetimeUsed":  round4(usedAmount + removedUsed),
-		"tokens":        tokens,
-		"lifetimeToken": tokens + removedTokens,
-		"requests":      requests,
-		"accounts":      accountNum,
-		"usable":        usableNum,
-		"suspended":     suspendedNum,
-		"unlimited":     unlimitedNum,
-		"apiCount":      apiCount,
-		"keys":          keyCount,
-		"currency":      "USD",
-		"enabled":       d.GroupEnabled(groupID),
+		"balance":          round4(balance),
+		"queriedBalance":   round4(queriedBalance),
+		"manualAmount":     round4(manualAmount),
+		"usedAmount":       round4(usedAmount),
+		"totalAmount":      round4(totalAmount),
+		"localCost":        round4(localCost),
+		"lifetimeUsed":     round4(usedAmount + removedUsed),
+		"tokens":           tokens,
+		"promptTokens":     promptTok,
+		"completionTokens": outputTok,
+		"upstreamTokens":   upstreamTok,
+		"lifetimeToken":    tokens + removedTokens,
+		"requests":         requests,
+		"accounts":         accountNum,
+		"usable":           usableNum,
+		"suspended":        suspendedNum,
+		"unlimited":        unlimitedNum,
+		"manualBalance":    manualNum,
+		"apiCount":         apiCount,
+		"keys":             keyCount,
+		"currency":         "USD",
+		"enabled":          d.GroupEnabled(groupID),
 	}
 }
 
@@ -396,14 +421,24 @@ func (d *Data) AccountTotals() map[string]any {
 		balance     float64
 		usedAmount  float64
 		totalAmount float64
+		localCost   float64
 		enabled     int
 		suspended   int
 		exhausted   int
 		apiCount    int
 		totalTokens int64
+		promptTok   int64
+		outputTok   int64
+		upstreamTok int64
 		requests    int64
 	)
 	unlimited := 0
+	manualBalance := 0
+	queriedBalance := 0.0
+	manualAmount := 0.0
+	queriedNum := 0
+	var checkedAt *time.Time
+	staleNum := 0
 	for _, account := range d.Accounts {
 		// 无限额度账号不参与金额汇总，否则 0 余额会把总额拉低造成误解。
 		if account.Unlimited() {
@@ -412,6 +447,18 @@ func (d *Data) AccountTotals() map[string]any {
 			balance += account.Balance
 			usedAmount += account.UsedAmount
 			totalAmount += account.TotalAmount
+		}
+		if account.HasManualBalance() {
+			manualBalance++
+			manualAmount += account.Balance
+		} else if account.HasBalanceQuery() {
+			queriedNum++
+			queriedBalance += account.Balance
+			if account.CheckedAt == nil {
+				staleNum++
+			} else if checkedAt == nil || account.CheckedAt.After(*checkedAt) {
+				checkedAt = account.CheckedAt
+			}
 		}
 		if account.Usable() {
 			enabled++
@@ -423,18 +470,24 @@ func (d *Data) AccountTotals() map[string]any {
 			exhausted++
 		}
 		apiCount += d.CountAccountKeys(account.ID)
+		localCost += account.Stats.Cost
 		totalTokens += account.Stats.TotalTokens
+		promptTok += account.Stats.PromptTokens
+		outputTok += account.Stats.CompletionTokens
+		upstreamTok += account.Stats.UpstreamTokens
 		requests += account.Stats.Requests
 	}
 
 	var (
 		keyTokens   int64
 		keyRequests int64
+		keyCost     float64
 		assigned    int
 	)
 	for _, key := range d.Keys {
 		keyTokens += key.Stats.TotalTokens
 		keyRequests += key.Stats.Requests
+		keyCost += key.Stats.Cost
 		if key.AccountID != "" {
 			assigned++
 		}
@@ -460,27 +513,42 @@ func (d *Data) AccountTotals() map[string]any {
 	return map[string]any{
 		"groups": groups,
 		"accounts": map[string]any{
-			"total":     len(d.Accounts),
-			"enabled":   enabled,
-			"suspended": suspended,
-			"exhausted": exhausted,
-			"unlimited": unlimited,
-			"removed":   len(d.RemovedAccounts),
-			"apiCount":  apiCount,
+			"total":         len(d.Accounts),
+			"enabled":       enabled,
+			"suspended":     suspended,
+			"exhausted":     exhausted,
+			"unlimited":     unlimited,
+			"manualBalance": manualBalance,
+			"queried":       queriedNum,
+			"neverChecked":  staleNum,
+			"removed":       len(d.RemovedAccounts),
+			"apiCount":      apiCount,
 		},
 		"balance": map[string]any{
-			"total":       round4(balance),
-			"currency":    "USD",
-			"usedAmount":  round4(usedAmount),
-			"totalAmount": round4(totalAmount),
-			"removedUsed": round4(removedUsed),
-			"lifetime":    round4(usedAmount + removedUsed),
+			"total": round4(balance),
+			// queriedBalance / manualAmount 把总余额拆成「上游查询得到的」与「本地手动扣减的」两部分，
+			// 便于判断某个数字到底该信谁。
+			"queriedBalance": round4(queriedBalance),
+			"manualAmount":   round4(manualAmount),
+			"checkedAt":      checkedAt,
+			"currency":       "USD",
+			"usedAmount":     round4(usedAmount),
+			"totalAmount":    round4(totalAmount),
+			"removedUsed":    round4(removedUsed),
+			"lifetime":       round4(usedAmount + removedUsed),
+			// localCost 是完全由本站 tokenizer 与单价算出的消耗，用于对照上游账单。
+			"localCost": round4(localCost),
+			"keyCost":   round4(keyCost),
 		},
 		"tokens": map[string]any{
-			"accounts":  totalTokens,
-			"keys":      keyTokens,
-			"providers": providerTokens,
-			"lifetime":  totalTokens + removedTokens,
+			"accounts":    totalTokens,
+			"keys":        keyTokens,
+			"providers":   providerTokens,
+			"prompt":      promptTok,
+			"completion":  outputTok,
+			"upstream":    upstreamTok,
+			"lifetime":    totalTokens + removedTokens,
+			"selfMetered": true,
 		},
 		"requests": map[string]any{
 			"accounts": requests,

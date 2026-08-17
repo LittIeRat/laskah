@@ -17,7 +17,7 @@
 <div class="wrap">
   <div class="page-hero">
     <h2 class="page-title">数据看板</h2>
-    <p class="page-sub">汇总各分组余额与消耗。未配置额度查询的账号按无限余额处理；余额耗尽或上游报余额不足的账号会被自动暂停，充值后重新启用即可恢复。</p>
+    <p class="page-sub">汇总各分组余额与消耗。tokens 与金额全部由本站自算，不采用上游自报的 usage。既未配额度查询也未开手动余额的账号按无限余额处理；余额耗尽或上游报余额不足的账号会被自动暂停，充值后重新启用即可恢复。</p>
   </div>
 
   <div class="section-head">
@@ -26,15 +26,17 @@
   </div>
   <div class="card">
     <div class="stat-grid" id="totals-grid"></div>
+    <div class="code-block" id="balance-report" hidden></div>
   </div>
 
   <div class="section-head">
     <h2>分组余额</h2>
-    <span class="hint">余额总量 · 消耗金额 · 消耗 tokens</span>
+    <span class="hint">余额总量 · 自算消耗 · 消耗 tokens</span>
   </div>
   <div class="card">
     <div class="btn-row" style="margin-top:0">
       <button class="btn btn-primary" id="refresh-balances" type="button">手动刷新全部余额</button>
+      <button class="btn" id="query-total" type="button">查询总余额</button>
       <button class="btn btn-quiet" id="reload-dashboard" type="button">重新加载数据</button>
       <span class="hint-text" id="refresh-hint"></span>
     </div>
@@ -109,7 +111,7 @@
 
   <div class="section-head">
     <h2>调用说明</h2>
-    <span class="hint">OpenAI chat completions 兼容</span>
+    <span class="hint">OpenAI chat completions / responses 兼容</span>
   </div>
   <div class="card">
     <div class="form-grid">
@@ -122,8 +124,16 @@
         <div class="code-block" id="usage-models"></div>
       </div>
       <div class="field full">
-        <label>请求示例</label>
+        <label>请求示例（chat completions）</label>
         <div class="code-block" id="usage-curl"></div>
+      </div>
+      <div class="field full">
+        <label>请求示例（responses）</label>
+        <div class="code-block" id="usage-responses"></div>
+      </div>
+      <div class="field full">
+        <label>计量口径</label>
+        <div class="code-block" id="usage-metering"></div>
       </div>
     </div>
     <div class="btn-row">

@@ -55,16 +55,28 @@
       "accent"
     ));
     grid.appendChild(LB.stat("累计消耗金额", LB.fmtMoney(balance.lifetime, balance.currency), "含已删除账号 " + LB.fmtMoney(balance.removedUsed, balance.currency)));
-    grid.appendChild(LB.stat("消耗 tokens 总数", LB.fmtNumber(token.lifetime), "在册账号 " + LB.fmtNumber(token.accounts)));
+    grid.appendChild(LB.stat(
+      "本站自算消耗金额",
+      LB.fmtMoney(balance.localCost, balance.currency),
+      "按本站 tokenizer + 账号单价结算 · 网关密钥侧 " + LB.fmtMoney(balance.keyCost, balance.currency)
+    ));
+    grid.appendChild(LB.stat(
+      "消耗 tokens 总数",
+      LB.fmtNumber(token.lifetime),
+      (token.selfMetered ? "本站自算" : "上游口径") +
+        " · 输入 " + LB.fmtNumber(token.prompt) + " / 输出 " + LB.fmtNumber(token.completion) +
+        " · 上游自报 " + LB.fmtNumber(token.upstream)
+    ));
     grid.appendChild(LB.stat("网关请求数", LB.fmtNumber(request.keys), "上游请求 " + LB.fmtNumber(request.accounts)));
     grid.appendChild(LB.stat("上游 API 数", LB.fmtNumber(account.apiCount), (account.total || 0) + " 个账号 / 已暂停 " + (account.suspended || 0) + " 个"));
     if (isSuper) {
       grid.appendChild(LB.stat("网关密钥", LB.fmtNumber(keyTotals.total), "已分配账号 " + LB.fmtNumber(keyTotals.assigned), (keyTotals.total && !keyTotals.assigned) ? "warn" : ""));
     }
 
-    el("totals-hint").textContent = (account.suspended || 0) > 0
-      ? "有 " + account.suspended + " 个账号已暂停（多为余额触及 $0.50 下限），充值后在「分组与账号」里重新启用"
-      : "分组 " + groups.length + " 个 · 负载均衡策略 " + (totals.strategy || "-");
+    var meterNote = token.selfMetered ? " · tokens 与金额均由本站自算，上游自报值仅作对照" : "";
+    el("totals-hint").textContent = ((account.suspended || 0) > 0
+      ? "有 " + account.suspended + " 个账号已暂停（余额触及下限或频率异常），充值后在「分组与账号」里重新启用"
+      : "分组 " + groups.length + " 个 · 负载均衡策略 " + (totals.strategy || "-")) + meterNote;
   }
 
   function renderGroups() {
@@ -87,9 +99,12 @@
           h("div", {
             class: "row-sub",
             text: "消耗金额 " + LB.fmtMoney(group.lifetimeUsed, group.currency) +
+              " · 自算消耗 " + LB.fmtMoney(group.localCost, group.currency) +
               " · 消耗 tokens " + LB.fmtNumber(group.lifetimeToken) +
+              "（输入 " + LB.fmtNumber(group.promptTokens) + " / 输出 " + LB.fmtNumber(group.completionTokens) + "）" +
               " · 请求 " + LB.fmtNumber(group.requests) +
-              " · " + group.apiCount + " 个上游 API · " + group.keys + " 个网关密钥"
+              " · " + group.apiCount + " 个上游 API · " + group.keys + " 个网关密钥" +
+              (group.manualBalance ? " · " + group.manualBalance + " 个手动余额账号" : "")
           }),
           (group.totalAmount > 0) ? LB.progressBar(ratio, ratio < 0.15) : null
         ])
@@ -191,13 +206,33 @@
       "GET  " + base + "/models/{model}  # 查询单个模型",
       "",
       "响应严格遵循 OpenAI 规范：",
-      '{"object":"list","data":[{"id":"gpt-4o-mini","object":"model","created":1700000000,"owned_by":"laskah"}]}'
+      '{"object":"list","data":[{"id":"gpt-4o-mini","object":"model","created":1700000000,"owned_by":"laskah"}]}',
+      "",
+      "不带 Authorization 头时返回 200 与空列表（附 hint 字段），带无效密钥仍返回 401/403。"
     ].join("\n");
     el("usage-curl").textContent = [
       "curl " + base + "/chat/completions \\",
       '  -H "Authorization: Bearer <网关密钥>" \\',
       '  -H "Content-Type: application/json" \\',
       '  -d \'{"model":"gpt-4o-mini","messages":[{"role":"user","content":"你好"}]}\''
+    ].join("\n");
+    el("usage-responses").textContent = [
+      "curl " + base + "/responses \\",
+      '  -H "Authorization: Bearer <网关密钥>" \\',
+      '  -H "Content-Type: application/json" \\',
+      '  -d \'{"model":"gpt-4o-mini","input":"你好"}\'',
+      "",
+      "同时支持 stream:true；流式与非流式都会被重写为本站自算 usage。"
+    ].join("\n");
+    el("usage-metering").textContent = [
+      "tokens 由本站 tokenizer 统计，不采用上游返回的 usage（部分站点会谎报）。",
+      "上游自报值仍会保留在统计里，字段 upstreamTokens，仅用于对照。",
+      "账号可选计价方式：",
+      "  none        不计价，仅统计 tokens",
+      "  per_mtoken  按每 1M tokens 单价结算（输入+输出合并计量）",
+      "  per_call    按每次请求固定单价结算",
+      "开启手动余额后，余额由初始额度减去本站自算消耗得出，无需上游额度查询接口。",
+      "未配置额度查询且未开启手动余额的账号显示为「∞ 无限」。"
     ].join("\n");
   }
 
@@ -426,6 +461,49 @@
     }
   }
 
+  // queryTotalBalance：先强制刷新全部账号，再把「总余额」按来源拆开显示。
+  // 只给一个总数容易误判——查询失败的账号余额是旧值，必须一起说清楚。
+  async function queryTotalBalance(button) {
+    var original = button.textContent;
+    button.disabled = true;
+    button.textContent = "查询中…";
+    try {
+      var response = await LB.request("POST", "/admin/accounts/balance-query");
+      var data = response.data || {};
+      var t = data.totals || {};
+      var balance = t.balance || {};
+      var account = t.accounts || {};
+      var token = t.tokens || {};
+      var box = el("balance-report");
+      var lines = [
+        "总余额（可计金额账号合计）  " + LB.fmtMoney(balance.total, balance.currency),
+        "  ├ 上游查询得到          " + LB.fmtMoney(balance.queriedBalance, balance.currency) + "   " + (account.queried || 0) + " 个账号",
+        "  └ 手动余额本地扣减      " + LB.fmtMoney(balance.manualAmount, balance.currency) + "   " + (account.manualBalance || 0) + " 个账号",
+        "无限额度账号              " + (account.unlimited || 0) + " 个（不计入总额）",
+        "累计消耗金额              " + LB.fmtMoney(balance.lifetime, balance.currency) + "（含已删除账号 " + LB.fmtMoney(balance.removedUsed, balance.currency) + "）",
+        "本站自算消耗金额          " + LB.fmtMoney(balance.localCost, balance.currency),
+        "消耗 tokens（本站自算）   " + LB.fmtNumber(token.lifetime) + "（上游自报 " + LB.fmtNumber(token.upstream) + "）",
+        "",
+        "本次查询 " + (data.queried || 0) + " 个账号 · 失败 " + (data.failed || 0) + " 个 · 暂停 " + (data.suspended || 0) + " 个 · 删除 " + (data.deleted || 0) + " 个",
+        (data.failed ? "失败账号沿用上次余额，总额可能偏高，请在「分组与账号」里单独复查。" : "全部账号查询成功，总额为最新值。"),
+        "统计时间 " + LB.fmtTime(new Date().toISOString())
+      ];
+      box.hidden = false;
+      box.textContent = lines.join("\n");
+      totals = t;
+      totals.strategy = response.strategy || totals.strategy;
+      groups = data.groups || totals.groups || [];
+      renderTotals();
+      renderGroups();
+      LB.toast("总余额 " + LB.fmtMoney(balance.total, balance.currency) + (data.failed ? "（" + data.failed + " 个账号查询失败）" : ""), data.failed ? "warn" : "ok");
+    } catch (err) {
+      LB.toast(err.message, "error");
+    } finally {
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
+
   async function loadAll() {
     try {
       var response = await LB.request("GET", "/admin/dashboard");
@@ -444,8 +522,10 @@
         renderGroupOptions();
         renderKeys();
       }
-      el("refresh-hint").textContent = "共 " + (totals.accounts ? totals.accounts.total : 0) +
-        " 个账号 · 刷新后余额低于 $0.50 的账号会被自动暂停";
+      var accountTotals = totals.accounts || {};
+      el("refresh-hint").textContent = "共 " + (accountTotals.total || 0) + " 个账号（上游查询 " +
+        (accountTotals.queried || 0) + " · 手动余额 " + (accountTotals.manualBalance || 0) + " · 无限 " +
+        (accountTotals.unlimited || 0) + "）· 刷新后余额触及各自下限的账号会被自动暂停";
     } catch (err) {
       LB.toast(err.message, "error");
     }
@@ -463,6 +543,12 @@
     // 密钥管理与余额刷新都属于超管能力，普通管理员只读看板。
     el("keys-area").hidden = !isSuper;
     el("refresh-balances").hidden = !isSuper;
+    el("query-total").hidden = !isSuper;
+    if (isSuper) {
+      el("query-total").addEventListener("click", function (event) {
+        queryTotalBalance(event.currentTarget);
+      });
+    }
 
     if (isSuper) {
       el("key-create").addEventListener("click", function (event) {

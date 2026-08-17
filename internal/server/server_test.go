@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"laskah/internal/store"
+	"laskah/internal/tokenizer"
 )
 
 // 测试用超级管理员凭据：真实部署由 /setup 页面创建，测试里直接注入。
@@ -615,9 +616,18 @@ func TestKeyBulkCreationAndAccountLocalBalancing(t *testing.T) {
 	if !strings.Contains(first["keyMasked"].(string), "******") {
 		t.Fatalf("密钥应脱敏展示: %#v", first["keyMasked"])
 	}
+	// token 计量以本站自己的估算为准（上游自报的 7/次仅作对照）：
+	// 上游会谎报用量，因此看板与计费都不能采信它的数字。
 	tokens := dashboard["data"].(map[string]any)["tokens"].(map[string]any)
-	if tokens["keys"].(float64) != 21 {
-		t.Fatalf("密钥累计 tokens 应为 3*7=21, got %#v", tokens["keys"])
+	wantPerCall := tokenizer.CountPrompt(chatBody()) + tokenizer.CountText("hi")
+	if tokens["keys"].(float64) != float64(3*wantPerCall) {
+		t.Fatalf("密钥累计 tokens 应为本地估算 3*%d, got %#v", wantPerCall, tokens["keys"])
+	}
+	if tokens["upstream"].(float64) != 21 {
+		t.Fatalf("上游自报 tokens 应单独留存 3*7=21, got %#v", tokens["upstream"])
+	}
+	if tokens["selfMetered"] != true {
+		t.Fatalf("看板应标明使用本站自算口径: %#v", tokens)
 	}
 
 	keyID := first["id"].(string)
@@ -739,6 +749,29 @@ func TestExhaustedAccountIsSuspendedAndTrafficFailsOver(t *testing.T) {
 	}
 	if suspended := totalsBody["data"].(map[string]any)["accounts"].(map[string]any)["suspended"].(float64); suspended != 1 {
 		t.Fatalf("汇总应统计已暂停账号数: %#v", suspended)
+	}
+
+	// 「查询总余额」先刷新再汇总，并按来源拆分余额，同时报告失败账号数。
+	response, queryBody := h.admin(http.MethodPost, "/admin/accounts/balance-query", nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("总余额查询应成功: %d %#v", response.StatusCode, queryBody)
+	}
+	report := queryBody["data"].(map[string]any)
+	if report["queried"].(float64) != 2 {
+		t.Fatalf("应刷新两个账号: %#v", report)
+	}
+	if report["failed"].(float64) != 0 {
+		t.Fatalf("上游可用时不应有失败账号: %#v", report)
+	}
+	queried := report["totals"].(map[string]any)["balance"].(map[string]any)
+	if queried["queriedBalance"].(float64) != queried["total"].(float64) {
+		t.Fatalf("两个账号都配了额度查询，总额应全部来自上游查询: %#v", queried)
+	}
+	if queried["manualAmount"].(float64) != 0 {
+		t.Fatalf("没有手动余额账号时手动额度应为 0: %#v", queried)
+	}
+	if groupsView, ok := report["groups"].([]any); !ok || len(groupsView) != 1 {
+		t.Fatalf("总余额查询应附带分组汇总: %#v", report["groups"])
 	}
 
 	// 管理员重新启用后账号立刻回到分配池。
@@ -872,6 +905,19 @@ func TestModelsEndpointFollowsOpenAISchema(t *testing.T) {
 	}
 	if response, _ := h.do(http.MethodGet, "/v1/models", nil, "sk-nope"); response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("非法密钥应返回 401, got %d", response.StatusCode)
+	}
+
+	// 完全不带密钥（浏览器直接打开）返回可解析的空列表 + 说明，避免看到裸 401。
+	// 这里刻意不暴露任何模型名：匿名访问者不该看到本站的上游供货范围。
+	response, anonymous := h.do(http.MethodGet, "/v1/models", nil, "")
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("匿名访问应返回 200, got %d", response.StatusCode)
+	}
+	if len(anonymous["data"].([]any)) != 0 {
+		t.Fatalf("匿名访问不应泄露模型列表: %#v", anonymous["data"])
+	}
+	if !strings.Contains(anonymous["hint"].(string), "Authorization") {
+		t.Fatalf("匿名响应应提示如何携带密钥: %#v", anonymous["hint"])
 	}
 
 	// 密钥白名单应收窄模型列表。

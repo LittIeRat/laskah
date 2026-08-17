@@ -478,13 +478,105 @@
     }
   });
 
-  async function copyText(text) {
+  // copyText：明文 HTTP 访问时 navigator.clipboard 不可用（非安全上下文），
+  // 逐级回落到 execCommand，再不行就把文本选中并提示用户手动 Ctrl+C。
+  function legacyCopy(text) {
+    var area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "readonly");
+    area.style.position = "fixed";
+    area.style.top = "0";
+    area.style.left = "0";
+    area.style.width = "1px";
+    area.style.height = "1px";
+    area.style.padding = "0";
+    area.style.border = "none";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    var ok = false;
     try {
-      await navigator.clipboard.writeText(text);
-      toast("已复制到剪贴板", "ok");
+      area.focus();
+      area.select();
+      area.setSelectionRange(0, text.length);
+      ok = document.execCommand("copy");
     } catch (err) {
-      toast("复制失败，请手动选择文本", "error");
+      ok = false;
     }
+    document.body.removeChild(area);
+    return ok;
+  }
+
+  function selectFallback(text) {
+    var box = document.createElement("div");
+    box.className = "copy-fallback";
+    var panel = document.createElement("div");
+    panel.className = "copy-fallback-panel";
+    var area = document.createElement("textarea");
+    area.className = "copy-fallback-text";
+    area.value = text;
+    area.rows = Math.min(8, text.split("\n").length + 1);
+    var tip = document.createElement("div");
+    tip.className = "hint";
+    tip.textContent = "当前为非安全上下文（HTTP），浏览器禁止自动写入剪贴板。文本已全选，按 Ctrl+C / ⌘C 复制。";
+    var close = document.createElement("button");
+    close.type = "button";
+    close.className = "btn btn-quiet";
+    close.textContent = "关闭";
+
+    function dismiss() {
+      if (box.parentNode) {
+        box.parentNode.removeChild(box);
+      }
+      document.removeEventListener("keydown", onKey);
+    }
+    function onKey(event) {
+      // 组字中按 Esc 只取消候选词，与主弹窗行为保持一致。
+      if (event.key === "Escape" && !event.isComposing) {
+        dismiss();
+      }
+    }
+
+    close.addEventListener("click", dismiss);
+    // 只在遮罩本身被点到时关闭，拖选文本时鼠标落在面板内不会误关。
+    box.addEventListener("click", function (event) {
+      if (event.target === box) {
+        dismiss();
+      }
+    });
+    document.addEventListener("keydown", onKey);
+
+    panel.appendChild(tip);
+    panel.appendChild(area);
+    panel.appendChild(close);
+    box.appendChild(panel);
+    document.body.appendChild(box);
+    area.focus();
+    area.select();
+    try { area.setSelectionRange(0, text.length); } catch (err) { /* 忽略 */ }
+  }
+
+  async function copyText(text) {
+    var value = String(text == null ? "" : text);
+    if (!value) {
+      toast("没有可复制的内容", "error");
+      return false;
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(value);
+        toast("已复制到剪贴板", "ok");
+        return true;
+      } catch (err) {
+        // 继续回落
+      }
+    }
+    if (legacyCopy(value)) {
+      toast("已复制到剪贴板", "ok");
+      return true;
+    }
+    selectFallback(value);
+    toast("浏览器拒绝自动复制，已全选文本请手动复制", "warn");
+    return false;
   }
 
   initTheme();

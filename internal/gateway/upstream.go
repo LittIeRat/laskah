@@ -58,6 +58,15 @@ func ModelsURL(p *store.Provider) string {
 	return JoinURL(p.BaseURL, endpoint)
 }
 
+// ResponsesURL 返回 OpenAI Responses 端点完整地址。
+func ResponsesURL(p *store.Provider) string {
+	endpoint := p.Paths.Responses
+	if endpoint == "" {
+		endpoint = store.DefaultPaths(p.Type).Responses
+	}
+	return JoinURL(p.BaseURL, endpoint)
+}
+
 // AuthHeaders 按协议类型构造鉴权与自定义请求头。
 func AuthHeaders(p *store.Provider) http.Header {
 	header := http.Header{}
@@ -269,7 +278,26 @@ func (u *Upstream) SendChat(parent context.Context, provider *store.Provider, bo
 	if provider.Type == store.TypeAnthropic {
 		payload = ToAnthropicBody(payload)
 	}
+	return u.Post(parent, provider, ChatURL(provider), payload)
+}
 
+// SendResponses 向指定提供商发送 OpenAI Responses 请求。
+//
+// Responses 请求体原样转发（只重写 model），因为字段集合仍在演进，
+// 网关做字段裁剪只会让新参数无法透传。
+func (u *Upstream) SendResponses(parent context.Context, provider *store.Provider, body map[string]any) (*Response, error) {
+	payload := map[string]any{}
+	for key, value := range body {
+		payload[key] = value
+	}
+	payload["model"] = provider.UpstreamModel(store.MustString(body["model"]))
+	return u.Post(parent, provider, ResponsesURL(provider), payload)
+}
+
+// Post 向指定地址发送 JSON 请求，超时按提供商配置。
+//
+// 调用方负责关闭 Response.HTTP.Body 并调用 Response.Cancel。
+func (u *Upstream) Post(parent context.Context, provider *store.Provider, target string, payload map[string]any) (*Response, error) {
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("序列化上游请求失败: %w", err)
@@ -281,7 +309,6 @@ func (u *Upstream) SendChat(parent context.Context, provider *store.Provider, bo
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 
-	target := ChatURL(provider)
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(encoded))
 	if err != nil {
 		cancel()

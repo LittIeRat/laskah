@@ -801,6 +801,48 @@ textarea {
   background: rgba(48, 209, 88, 0.95);
 }
 
+.toast.warn {
+  background: rgba(255, 159, 10, 0.96);
+}
+
+/* 复制回落面板：非安全上下文（明文 HTTP）下浏览器禁止写剪贴板，
+   把文本放进可全选的文本域，让用户手动 Ctrl+C。
+   自带遮罩，避免半透明面板压在卡片上看起来像页面的一部分。 */
+.copy-fallback {
+  position: fixed;
+  inset: 0;
+  background: var(--overlay);
+  backdrop-filter: blur(6px);
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  z-index: 320;
+}
+
+.copy-fallback-panel {
+  width: min(560px, calc(100vw - 48px));
+  background: var(--bg-grouped);
+  border-radius: 20px;
+  box-shadow: var(--shadow-modal);
+  padding: 20px;
+  display: grid;
+  gap: 12px;
+  text-align: left;
+}
+
+.copy-fallback-text {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--separator);
+  background: var(--bg-elevated);
+  color: var(--label);
+  resize: vertical;
+}
+
 .empty {
   text-align: center;
   color: var(--label-tertiary);

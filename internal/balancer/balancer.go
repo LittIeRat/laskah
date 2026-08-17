@@ -233,10 +233,15 @@ func (b *Balancer) weightedShuffle(list []*store.Provider) []*store.Provider {
 }
 
 // Usage 表示一次调用消耗的 token。
+//
+// PromptTokens / CompletionTokens / TotalTokens 由本站自己的 tokenizer 估算，
+// 计费与配额都以它们为准；UpstreamTokens 是上游自报的总量，仅作对照，
+// 因为部分站点会谎报用量。
 type Usage struct {
 	PromptTokens     int64
 	CompletionTokens int64
 	TotalTokens      int64
+	UpstreamTokens   int64
 }
 
 // ReportSuccess 记录成功调用并解除冷却。
@@ -254,6 +259,7 @@ func (b *Balancer) ReportSuccess(provider *store.Provider, latency time.Duration
 	stats.PromptTokens += usage.PromptTokens
 	stats.CompletionTokens += usage.CompletionTokens
 	stats.TotalTokens += usage.TotalTokens
+	stats.UpstreamTokens += usage.UpstreamTokens
 	stats.LastUsedAt = &now
 	stats.LastError = nil
 

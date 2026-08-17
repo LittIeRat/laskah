@@ -254,14 +254,32 @@ sudo -u laskah env $(grep -E '^(DATA_FILE|MASTER_KEY)=' /etc/laskah/laskah.env |
 2. **创建账号**：点「创建账号」后在居中弹窗里填
    - 用户名称（仅用于界面识别）
    - API Key 批量粘贴框：每行一个，**单账号上限 5 个**
-   - Base URL：如 `https://api.newapi.com/v1`，请求时自动拼 `/chat/completions`
+   - Base URL：如 `https://api.newapi.com/v1`，请求时自动拼 `/chat/completions` / `/responses` / `/models`
+   - 自定义端点（可选）：chat / responses / models 各自的**完整地址**，用于上游路径不标准的站点；
+     必须是带域名的 `http(s)://` 绝对地址，只填其中一个也可以，其余仍按 Base URL 拼
    - 「获取模型列表」→ 勾选要开放的模型（留空表示接受全部）
+   - 计价方式（可选）：`不计价` / `按量`（每 1M tokens 单价）/ `按次`（每次请求单价）
+   - 手动配置余额（可选）：开启后填初始余额（USD），余额 = 初始余额 − 本站自算消耗
    - 额度查询（可选）：请求地址、访问令牌、用户 ID、超时秒数、自动查询间隔（分钟，0 = 不自动查）
    - 频率限制（可选）：不开启 = 无限制；开启后填「每分钟请求次数」，达到上限时网关自动换号
 3. **确定保存配置**。保存后该账号**只能查余额、启停或删除**，配置不可修改也不会回显。
 
-未配置额度查询的账号按「∞ 无限余额」处理，既不会被余额清理逻辑暂停，
-也不会去打上游额度接口。
+既未配置额度查询、也未开启手动余额的账号按「∞ 无限余额」处理，既不会被余额清理逻辑暂停，
+也不会去打上游额度接口。开了手动余额的账号则始终按本地数字判定，点「刷新」返回本地余额视图。
+
+### token 计量与计费口径
+
+**上游返回的 `usage` 不参与任何计费与额度判定**，只作为对照值存进 `upstreamTokens`：
+实测存在中转站放大 token 数的情况。本站自己数输入与输出 token（流式按分片累计，
+半个 UTF-8 字符留到下一片），并把响应体里的 `usage` 改写成本站口径后再返回给下游。
+
+金额按账号计价方式结算：`per_mtoken` 为 `单价 × 总 token / 1e6`，`per_call` 为 `单价 × 次数`。
+手动余额账号每次结算后直接扣本地余额，扣到下限即暂停；下限取
+`max(自填最低余额, 一次请求的预估花费)`，不套用上游查询模式那条 $0.50 固定安全线。
+
+`/dashboard` 的「查询总余额」会先刷新全部账号，再把总额拆成「上游查询得到」与
+「手动余额本地扣减」两部分，并报告本次查询失败 / 暂停 / 删除的账号数——
+有账号查询失败时总额沿用旧值，报告会明确提示可能偏高。
 
 ### 自动暂停的三条触发路径
 
@@ -304,10 +322,21 @@ curl https://your-domain.com/v1/chat/completions \
 | 端点 | 说明 |
 | --- | --- |
 | `POST /v1/chat/completions` | 主入口，支持 `stream:true` |
+| `POST /v1/responses` | OpenAI Responses 兼容，支持 `stream:true` |
 | `POST /v1/completions` | 旧版补全，内部转成 messages |
 | `POST /v1/embeddings` | 向量化 |
-| `GET /v1/models` | 严格 OpenAI 规范：`{"object":"list","data":[{"id","object","created","owned_by"}]}` |
+| `GET /v1/models` | 严格 OpenAI 规范：`{"object":"list","data":[{"id","object","created","owned_by"}]}`；不带密钥时返回 200 空列表 |
 | `GET /v1/models/{id}` | 单模型查询 |
+
+`/v1/responses` 与 `/v1/chat/completions` 共用同一套账号分配、余额判定、频率限制、
+截断换号与本地计量逻辑，只是请求 / 响应结构不同：
+
+```bash
+curl https://your-domain.com/v1/responses \
+  -H "Authorization: Bearer <网关密钥>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","input":"你好"}'
+```
 
 Base URL 填 `https://your-domain.com/v1`。不带 `/v1` 前缀的同名路径也受支持，
 方便某些只认 `/chat/completions` 的客户端。

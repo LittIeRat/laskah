@@ -48,7 +48,7 @@ func defaultKeyFile(dataFile string) string {
 
 func newData() *Data {
 	data := &Data{
-		Version:         5,
+		Version:         6,
 		Config:          Config{Strategy: "weighted-random", MaxRetries: 3, CreatedAt: time.Now().UTC()},
 		Groups:          []*Group{},
 		Accounts:        []*Account{},
@@ -129,8 +129,11 @@ func (s *Store) normalizeLocked() {
 	legacyGroups := data.Version < 4
 	// v5 把「余额耗尽自动删号」换成「自动暂停」：旧数据按原 autoDelete 开关迁移。
 	legacyAutoDelete := data.Version < 5
-	if data.Version < 5 {
-		data.Version = 5
+	// v6 引入本地 token 计量、手动余额与自定义端点：旧账号一律按「不计价」迁移，
+	// 余额来源与行为保持原样，避免升级后突然开始扣本地余额。
+	legacyBilling := data.Version < 6
+	if data.Version < 6 {
+		data.Version = 6
 	}
 	if data.Config.Users == nil {
 		data.Config.Users = []*AdminUser{}
@@ -154,13 +157,16 @@ func (s *Store) normalizeLocked() {
 		if provider.Tags == nil {
 			provider.Tags = []string{}
 		}
-		if provider.Paths.Chat == "" || provider.Paths.Models == "" {
+		if provider.Paths.Chat == "" || provider.Paths.Models == "" || provider.Paths.Responses == "" {
 			defaults := DefaultPaths(provider.Type)
 			if provider.Paths.Chat == "" {
 				provider.Paths.Chat = defaults.Chat
 			}
 			if provider.Paths.Models == "" {
 				provider.Paths.Models = defaults.Models
+			}
+			if provider.Paths.Responses == "" {
+				provider.Paths.Responses = defaults.Responses
 			}
 		}
 		provider.CooldownUntil = time.Time{}
@@ -194,6 +200,17 @@ func (s *Store) normalizeLocked() {
 		account.AutoDeleteLegacy = nil
 		if account.RateLimitPerMin != nil && *account.RateLimitPerMin <= 0 {
 			account.RateLimitPerMin = nil
+		}
+		if legacyBilling {
+			account.BillingMode = BillingNone
+			account.ManualBalance = false
+		}
+		if account.BillingMode == "" || !ValidBillingMode(string(account.BillingMode)) {
+			account.BillingMode = BillingNone
+		}
+		if account.BillingMode == BillingNone {
+			// 没有计价方式就无从扣减，手动余额必须同时关闭，否则账号会永久卡在当前余额。
+			account.ManualBalance = false
 		}
 		if !account.Suspended {
 			account.SuspendReason = ""

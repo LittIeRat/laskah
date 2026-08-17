@@ -166,11 +166,15 @@ func BuildProvider(input ProviderInput) (*Provider, *ValidationError) {
 	now := time.Now().UTC()
 	paths := DefaultPaths(ProviderType(providerType))
 	if input.Paths != nil {
-		if strings.TrimSpace(input.Paths.Chat) != "" {
-			paths.Chat = strings.TrimSpace(input.Paths.Chat)
+		// 允许填完整地址：JoinURL 见到绝对 URL 会直接使用，因此这里不做前缀加工。
+		if trimmed := strings.TrimSpace(input.Paths.Chat); trimmed != "" {
+			paths.Chat = trimmed
 		}
-		if strings.TrimSpace(input.Paths.Models) != "" {
-			paths.Models = strings.TrimSpace(input.Paths.Models)
+		if trimmed := strings.TrimSpace(input.Paths.Models); trimmed != "" {
+			paths.Models = trimmed
+		}
+		if trimmed := strings.TrimSpace(input.Paths.Responses); trimmed != "" {
+			paths.Responses = trimmed
 		}
 	}
 

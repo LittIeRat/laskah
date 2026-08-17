@@ -33,6 +33,43 @@ const MaxRequestRefreshSeconds = 3600
 // 因此不论账号自己填的最低余额是多少，这条线都强制生效。
 const MinBalanceFloorUSD = 0.5
 
+// BillingMode 是账号的本地计价方式。
+type BillingMode string
+
+// 支持的计价方式。
+//
+// 计价只影响本站自己的金额统计与手动余额扣减，不改变发往上游的任何内容。
+const (
+	// BillingNone 不计价：只统计 token，不产生金额。
+	BillingNone BillingMode = "none"
+	// BillingPerMToken 按量计费：每 100 万 token 多少钱。
+	BillingPerMToken BillingMode = "per_mtoken"
+	// BillingPerCall 按次计费：每次成功请求多少钱。
+	BillingPerCall BillingMode = "per_call"
+)
+
+// BillingModes 列出全部合法计价方式。
+var BillingModes = []BillingMode{BillingNone, BillingPerMToken, BillingPerCall}
+
+// ValidBillingMode 判断计价方式是否受支持。
+func ValidBillingMode(mode string) bool {
+	for _, item := range BillingModes {
+		if string(item) == mode {
+			return true
+		}
+	}
+	return false
+}
+
+// MaxUnitPrice 限制单价上限，用于拦住明显的误输入（如把分当成元填）。
+const MaxUnitPrice = 100000
+
+// ReserveTokensPerCall 是按量计费时「预留一次请求」的假定 token 数。
+//
+// 手动余额是本地精确扣减的，不存在上游预扣费那套安全线；但余额掉到连一次
+// 普通请求都付不起时仍应提前退场，否则最后一次调用会在中途把余额打成负数。
+const ReserveTokensPerCall = 4000
+
 // MaxAccountRateLimitPerMin 限制账号级频率限制的上限。
 //
 // 频率限制是「一分钟允许多少次请求」，留空（nil）表示不限制。
@@ -40,12 +77,20 @@ const MinBalanceFloorUSD = 0.5
 const MaxAccountRateLimitPerMin = 100000
 
 // AccountStats 记录账号维度的累计用量。
+//
+// TotalTokens / PromptTokens / CompletionTokens 全部来自本站自己的 token 估算：
+// 部分上游站点会谎报 usage，用它们的数字做计费和配额判断会失真。
+// UpstreamTokens 保留上游自报值，仅用于对照排查。
 type AccountStats struct {
-	Requests    int64      `json:"requests"`
-	Success     int64      `json:"success"`
-	Failure     int64      `json:"failure"`
-	TotalTokens int64      `json:"totalTokens"`
-	LastUsedAt  *time.Time `json:"lastUsedAt"`
+	Requests         int64      `json:"requests"`
+	Success          int64      `json:"success"`
+	Failure          int64      `json:"failure"`
+	PromptTokens     int64      `json:"promptTokens"`
+	CompletionTokens int64      `json:"completionTokens"`
+	TotalTokens      int64      `json:"totalTokens"`
+	UpstreamTokens   int64      `json:"upstreamTokens"`
+	Cost             float64    `json:"cost"`
+	LastUsedAt       *time.Time `json:"lastUsedAt"`
 }
 
 // Account 是一个上游站点账号，名下包含多个 API 用于账号内负载均衡。
@@ -69,6 +114,19 @@ type Account struct {
 	// 请求时刷新：调用到达时若余额数据超过 RequestRefreshSec 秒未更新，先查一次再分配。
 	RefreshOnRequest  bool `json:"refreshOnRequest"`
 	RequestRefreshSec int  `json:"requestRefreshSec"`
+
+	Endpoints Paths `json:"endpoints"`
+
+	// 计价配置：本站按自己统计的 token 折算金额，不采信上游自报用量。
+	BillingMode    BillingMode `json:"billingMode"`
+	PricePerMToken float64     `json:"pricePerMToken"`
+	PricePerCall   float64     `json:"pricePerCall"`
+
+	// ManualBalance 表示余额由管理员手填并按本地计费扣减，而不是查询上游。
+	//
+	// 与额度查询互斥地覆盖「无限余额」：两者都没配置才视为无限。
+	ManualBalance  bool    `json:"manualBalance"`
+	InitialBalance float64 `json:"initialBalance"`
 
 	Enabled    bool    `json:"enabled"`
 	MinBalance float64 `json:"minBalance"`
@@ -147,6 +205,18 @@ type AccountInput struct {
 	RateLimitPerMin   any    `json:"rateLimitPerMin"`
 	Models            any    `json:"models"`
 	Note              string `json:"note"`
+
+	// 自定义完整端点地址：留空则按 baseUrl 拼接默认后缀。
+	ChatURL      string `json:"chatUrl"`
+	ModelsURL    string `json:"modelsUrl"`
+	ResponsesURL string `json:"responsesUrl"`
+
+	// 手动余额与计价。
+	BillingMode    string `json:"billingMode"`
+	PricePerMToken any    `json:"pricePerMToken"`
+	PricePerCall   any    `json:"pricePerCall"`
+	ManualBalance  *bool  `json:"manualBalance"`
+	InitialBalance any    `json:"initialBalance"`
 }
 
 // BuildAccount 校验输入并生成规范化账号对象。
@@ -208,6 +278,69 @@ func BuildAccount(input AccountInput) (*Account, *ValidationError) {
 		verr.Errorf("用户名称不能为空")
 	}
 
+	// 自定义端点必须是完整地址：填了却不是绝对 URL 就直接报错，
+	// 否则会被拼到 base url 后面，产出一个谁都没预期的地址。
+	endpoints := Paths{}
+	for _, item := range []struct {
+		label string
+		raw   string
+		field *string
+	}{
+		{"对话端点地址", input.ChatURL, &endpoints.Chat},
+		{"模型列表端点地址", input.ModelsURL, &endpoints.Models},
+		{"Responses 端点地址", input.ResponsesURL, &endpoints.Responses},
+	} {
+		value, ok := FullEndpoint(item.raw)
+		if !ok {
+			verr.Errorf("%s需要填写完整地址（以 http:// 或 https:// 开头）", item.label)
+			continue
+		}
+		*item.field = value
+	}
+
+	billingMode := BillingMode(strings.TrimSpace(input.BillingMode))
+	if billingMode == "" {
+		billingMode = BillingNone
+	}
+	if !ValidBillingMode(string(billingMode)) {
+		verr.Errorf("计价方式必须是 none / per_mtoken / per_call")
+		billingMode = BillingNone
+	}
+
+	pricePerMToken, ok := toFloat(input.PricePerMToken, 0)
+	if !ok || pricePerMToken < 0 || pricePerMToken > MaxUnitPrice {
+		verr.Errorf("每 100 万 token 单价需要是 0-%d 的数字", MaxUnitPrice)
+		pricePerMToken = 0
+	}
+	pricePerCall, ok := toFloat(input.PricePerCall, 0)
+	if !ok || pricePerCall < 0 || pricePerCall > MaxUnitPrice {
+		verr.Errorf("每次请求单价需要是 0-%d 的数字", MaxUnitPrice)
+		pricePerCall = 0
+	}
+	switch billingMode {
+	case BillingPerMToken:
+		if pricePerMToken <= 0 {
+			verr.Errorf("按量计费需要填写每 100 万 token 的价格")
+		}
+	case BillingPerCall:
+		if pricePerCall <= 0 {
+			verr.Errorf("按次计费需要填写每次请求的价格")
+		}
+	}
+
+	initialBalance, ok := toFloat(input.InitialBalance, 0)
+	if !ok || initialBalance < 0 {
+		verr.Errorf("手动余额必须是非负数字")
+		initialBalance = 0
+	}
+	manualBalance := false
+	if input.ManualBalance != nil {
+		manualBalance = *input.ManualBalance
+	}
+	if manualBalance && billingMode == BillingNone {
+		verr.Errorf("启用手动余额时必须选择按量或按次计价，否则余额永远不会扣减")
+	}
+
 	if verr.HasErrors() {
 		return nil, verr
 	}
@@ -243,6 +376,14 @@ func BuildAccount(input AccountInput) (*Account, *ValidationError) {
 		QueryIntervalMin:  int(intervalMin),
 		RefreshOnRequest:  refreshOnRequest,
 		RequestRefreshSec: int(requestRefreshSec),
+		Endpoints:         endpoints,
+		BillingMode:       billingMode,
+		PricePerMToken:    pricePerMToken,
+		PricePerCall:      pricePerCall,
+		ManualBalance:     manualBalance,
+		InitialBalance:    initialBalance,
+		Balance:           manualBalanceStart(manualBalance, initialBalance),
+		TotalAmount:       manualBalanceStart(manualBalance, initialBalance),
 		Enabled:           enabled,
 		AutoSuspend:       autoSuspend,
 		RateLimitPerMin:   rateLimit,
@@ -493,22 +634,99 @@ func (d *Data) RemoveAccounts(ids []string, reason string) []RemovedAccount {
 
 // HasBalanceQuery 判断账号是否配置了余额查询凭据。
 //
-// 未配置时余额无从得知，按“无限额度”处理：既不判定耗尽，也不做请求时刷新，
-// 避免把没有额度概念的自建上游误删。
+// 未配置时余额无从上游得知；若也没有启用手动余额，就按“无限额度”处理，
+// 既不判定耗尽，也不做请求时刷新，避免把没有额度概念的自建上游误停。
 func (a *Account) HasBalanceQuery() bool {
 	return strings.TrimSpace(a.AccessToken) != "" && strings.TrimSpace(a.UserID) != ""
 }
 
+// HasManualBalance 判断账号是否使用管理员手填余额。
+//
+// 手动余额由本站按自己统计的 token 与单价扣减，完全不依赖上游自报数据，
+// 因此上游谎报用量时余额依然准确。
+func (a *Account) HasManualBalance() bool {
+	return a.ManualBalance && a.BillingMode != BillingNone && a.BillingMode != ""
+}
+
 // Unlimited 判断账号是否按无限额度对待。
 func (a *Account) Unlimited() bool {
-	return !a.HasBalanceQuery()
+	return !a.HasBalanceQuery() && !a.HasManualBalance()
+}
+
+// EstimatedCallCost 估算本账号一次普通请求的金额，未计价时为 0。
+//
+// 按量计费按 ReserveTokensPerCall 个 token 折算：这只是「够不够再来一次」的判断基准，
+// 真实扣费仍按实际统计到的 token 结算。
+func (a *Account) EstimatedCallCost() float64 {
+	switch a.BillingMode {
+	case BillingPerMToken:
+		return a.PricePerMToken * ReserveTokensPerCall / 1e6
+	case BillingPerCall:
+		return a.PricePerCall
+	default:
+		return 0
+	}
+}
+
+// CostFor 按账号计价方式折算一次请求的金额。
+//
+// tokens 是本站自己统计出的总 token 数，calls 是本次要计费的请求次数。
+func (a *Account) CostFor(tokens int64, calls int64) float64 {
+	switch a.BillingMode {
+	case BillingPerMToken:
+		if tokens <= 0 {
+			return 0
+		}
+		return a.PricePerMToken * float64(tokens) / 1e6
+	case BillingPerCall:
+		if calls <= 0 {
+			return 0
+		}
+		return a.PricePerCall * float64(calls)
+	default:
+		return 0
+	}
+}
+
+// Charge 记账一次调用的金额，并在手动余额模式下扣减余额。
+//
+// 无论是否手动余额都累计 Stats.Cost：管理员即使用上游查询余额，也需要一份
+// 完全由本站计量的消耗口径来对照上游账单。余额不会被扣成负数。
+func (a *Account) Charge(tokens int64, calls int64) float64 {
+	cost := a.CostFor(tokens, calls)
+	if cost <= 0 {
+		return 0
+	}
+	a.Stats.Cost = round6(a.Stats.Cost + cost)
+	if !a.HasManualBalance() {
+		return cost
+	}
+	a.Balance = round6(a.Balance - cost)
+	if a.Balance < 0 {
+		a.Balance = 0
+	}
+	a.UsedAmount = round6(a.UsedAmount + cost)
+	now := time.Now().UTC()
+	a.CheckedAt = &now
+	a.CheckError = ""
+	a.BalanceFrom = "local"
+	return cost
 }
 
 // BalanceFloor 返回该账号真正生效的余额下限。
 //
-// 取「账号自填的最低余额」与内置安全线 MinBalanceFloorUSD 的较大值：
-// 填 0（默认）也会被抬到 0.5 USD，填得更高则尊重账号自己的设置。
+// 上游查询余额时取「账号自填的最低余额」与内置安全线 MinBalanceFloorUSD 的较大值：
+// 上游预扣费按预估价格执行，余额只剩几分钱时必然失败，提前退场比吃一次报错好。
+// 手动余额是本地精确扣减的，不存在预扣费误差，因此只需守住「够再来一次」，
+// 否则 0.5 USD 的固定安全线会把按次计价 $0.001 的账号浪费掉绝大部分额度。
 func (a *Account) BalanceFloor() float64 {
+	if a.HasManualBalance() && !a.HasBalanceQuery() {
+		floor := a.EstimatedCallCost()
+		if a.MinBalance > floor {
+			return a.MinBalance
+		}
+		return floor
+	}
 	if a.MinBalance > MinBalanceFloorUSD {
 		return a.MinBalance
 	}
@@ -517,7 +735,8 @@ func (a *Account) BalanceFloor() float64 {
 
 // Usable 判断账号当前是否可以承接流量。
 //
-// 查询失败（CheckError 非空）时保持可用，避免网络抖动导致全站不可用。
+// 上游查询失败（CheckError 非空）时保持可用，避免网络抖动导致全站不可用；
+// 手动余额不受这条豁免影响，因为它的数字本来就是本地算出来的，不会“查失败”。
 // 被暂停的账号一律不可用：余额不足只是暂停原因之一，恢复由管理员决定。
 func (a *Account) Usable() bool {
 	if !a.Enabled || a.Suspended {
@@ -526,21 +745,47 @@ func (a *Account) Usable() bool {
 	if a.Unlimited() {
 		return true
 	}
+	if a.HasManualBalance() && !a.HasBalanceQuery() {
+		return a.Balance > a.BalanceFloor()
+	}
 	if a.CheckedAt == nil || a.CheckError != "" {
 		return true
 	}
 	return a.Balance > a.BalanceFloor()
 }
 
-// Exhausted 判断账号余额是否已触及下限（需已成功查询过余额）。
+// Exhausted 判断账号余额是否已触及下限。
 //
 // 余额 <= BalanceFloor() 即视为耗尽：账号只剩不到一次请求的钱时提前退场，
 // 比等上游报「预扣费失败」再换号更早，调用方也不会先吃一次失败。
+// 上游查询模式要求确实成功查过一次，手动余额则以本地数字为准。
 func (a *Account) Exhausted() bool {
 	if a.Unlimited() {
 		return false
 	}
+	if a.HasManualBalance() && !a.HasBalanceQuery() {
+		return a.Balance <= a.BalanceFloor()
+	}
 	return a.CheckedAt != nil && a.CheckError == "" && a.Balance <= a.BalanceFloor()
+}
+
+// manualBalanceStart 返回创建账号时的初始余额，仅手动余额模式生效。
+func manualBalanceStart(manual bool, initial float64) float64 {
+	if !manual {
+		return 0
+	}
+	return initial
+}
+
+// round6 把金额收敛到 6 位小数，避免浮点累加产生长尾误差。
+func round6(value float64) float64 {
+	scaled := value * 1e6
+	if scaled >= 0 {
+		scaled += 0.5
+	} else {
+		scaled -= 0.5
+	}
+	return float64(int64(scaled)) / 1e6
 }
 
 // RateLimit 返回账号级每分钟请求上限，0 表示不限制。
@@ -606,7 +851,7 @@ func (a *Account) QueryTimeout() time.Duration {
 
 // DueForQuery 判断按账号自身间隔是否到了自动查询时间。
 func (a *Account) DueForQuery(now time.Time) bool {
-	if a.QueryIntervalMin <= 0 || a.Unlimited() {
+	if a.QueryIntervalMin <= 0 || !a.HasBalanceQuery() {
 		return false
 	}
 	if a.CheckedAt == nil {
@@ -632,7 +877,7 @@ func (a *Account) RequestRefreshInterval() time.Duration {
 // 从未成功查询过的账号必须先查一次，否则余额未知就直接放流量；
 // 已查询过的账号只在超过节流窗口后才重查。
 func (a *Account) NeedsRequestRefresh(now time.Time) bool {
-	if !a.RefreshOnRequest || !a.Enabled || a.Unlimited() {
+	if !a.RefreshOnRequest || !a.Enabled || !a.HasBalanceQuery() {
 		return false
 	}
 	if a.CheckedAt == nil {
@@ -646,44 +891,53 @@ func (a *Account) NeedsRequestRefresh(now time.Time) bool {
 // 保存后不回显任何凭据：只暴露是否已配置的布尔标记与余额、用量。
 func PublicAccount(a *Account, apiCount, boundKeys int) map[string]any {
 	return map[string]any{
-		"id":                a.ID,
-		"groupId":           a.GroupID,
-		"name":              a.Name,
-		"hasSiteUrl":        a.SiteURL != "",
-		"hasBaseUrl":        a.BaseURL != "",
-		"hasAccessToken":    a.AccessToken != "",
-		"hasUserId":         a.UserID != "",
-		"timeoutSeconds":    a.TimeoutSeconds,
-		"queryIntervalMin":  a.QueryIntervalMin,
-		"refreshOnRequest":  a.RefreshOnRequest,
-		"requestRefreshSec": a.RequestRefreshSec,
-		"enabled":           a.Enabled,
-		"autoSuspend":       a.AutoSuspend,
-		"suspended":         a.Suspended,
-		"suspendReason":     a.SuspendReason,
-		"suspendedAt":       a.SuspendedAt,
-		"rateLimitPerMin":   a.RateLimitPerMin,
-		"minBalance":        a.MinBalance,
-		"balanceFloor":      a.BalanceFloor(),
-		"balance":           a.Balance,
-		"usedAmount":        a.UsedAmount,
-		"totalAmount":       a.TotalAmount,
-		"currency":          a.Currency,
-		"planName":          a.PlanName,
-		"balanceFrom":       a.BalanceFrom,
-		"checkedAt":         a.CheckedAt,
-		"checkError":        a.CheckError,
-		"models":            a.Models,
-		"createdAt":         a.CreatedAt,
-		"updatedAt":         a.UpdatedAt,
-		"stats":             a.Stats,
-		"apiCount":          apiCount,
-		"maxApiCount":       MaxKeysPerAccount,
-		"boundKeys":         boundKeys,
-		"usable":            a.Usable(),
-		"exhausted":         a.Exhausted(),
-		"unlimited":         a.Unlimited(),
-		"hasBalanceQuery":   a.HasBalanceQuery(),
+		"id":                 a.ID,
+		"groupId":            a.GroupID,
+		"name":               a.Name,
+		"hasSiteUrl":         a.SiteURL != "",
+		"hasBaseUrl":         a.BaseURL != "",
+		"hasAccessToken":     a.AccessToken != "",
+		"hasUserId":          a.UserID != "",
+		"timeoutSeconds":     a.TimeoutSeconds,
+		"queryIntervalMin":   a.QueryIntervalMin,
+		"refreshOnRequest":   a.RefreshOnRequest,
+		"requestRefreshSec":  a.RequestRefreshSec,
+		"enabled":            a.Enabled,
+		"autoSuspend":        a.AutoSuspend,
+		"suspended":          a.Suspended,
+		"suspendReason":      a.SuspendReason,
+		"suspendedAt":        a.SuspendedAt,
+		"rateLimitPerMin":    a.RateLimitPerMin,
+		"minBalance":         a.MinBalance,
+		"balanceFloor":       a.BalanceFloor(),
+		"billingMode":        string(a.BillingMode),
+		"pricePerMToken":     a.PricePerMToken,
+		"pricePerCall":       a.PricePerCall,
+		"manualBalance":      a.HasManualBalance(),
+		"initialBalance":     a.InitialBalance,
+		"hasCustomChatUrl":   a.Endpoints.Chat != "",
+		"hasCustomModelsUrl": a.Endpoints.Models != "",
+		"hasCustomRespUrl":   a.Endpoints.Responses != "",
+		"balance":            a.Balance,
+		"usedAmount":         a.UsedAmount,
+		"totalAmount":        a.TotalAmount,
+		"currency":           a.Currency,
+		"planName":           a.PlanName,
+		"balanceFrom":        a.BalanceFrom,
+		"checkedAt":          a.CheckedAt,
+		"checkError":         a.CheckError,
+		"models":             a.Models,
+		"createdAt":          a.CreatedAt,
+		"updatedAt":          a.UpdatedAt,
+		"stats":              a.Stats,
+		"apiCount":           apiCount,
+		"maxApiCount":        MaxKeysPerAccount,
+		"boundKeys":          boundKeys,
+		"usable":             a.Usable(),
+		"exhausted":          a.Exhausted(),
+		"unlimited":          a.Unlimited(),
+		"hasBalanceQuery":    a.HasBalanceQuery(),
+		"cost":               round6(a.Stats.Cost),
 	}
 }
 

@@ -142,13 +142,20 @@ sudo systemctl restart laskah
 2. **创建账号** → 居中弹窗里填：
    - 用户名称（只是界面上认人用的）
    - API Key 批量粘贴框，一行一个，**单账号上限 5 个**
-   - Base URL，如 `https://api.newapi.com/v1`，请求时自动拼 `/chat/completions`
+   - Base URL，如 `https://api.newapi.com/v1`，请求时自动拼 `/chat/completions` / `/responses` / `/models`
+   - 自定义端点（可选）：上游路径不标准时，分别填 chat / responses / models 的**完整地址**（必须带 `http(s)://` 和域名）
    - 点「获取模型列表」→ 勾选要开放的模型（留空 = 全部接受）
+   - 计价（可选）：不计价 / 按量（每 1M tokens 多少钱）/ 按次（一次多少钱）
+   - 手动配置余额（可选）：开启后填初始余额，本站按自算 token 扣减，不依赖上游额度接口
    - 额度查询（可选）：请求地址、访问令牌、用户 ID、超时秒数、自动查询间隔
    - 频率限制（可选）：不开启 = 无限制；开启后填「一分钟能请求多少次」
 3. **确定保存**。保存后这个账号**只能查余额、启停或删除**，配置不可修改、也不会回显给任何人。
 
-没配额度查询的账号按「∞ 无限余额」处理，不参与金额汇总，也不会被余额清理逻辑暂停。
+既没配额度查询、也没开手动余额的账号按「∞ 无限余额」处理，不参与金额汇总，也不会被余额清理逻辑暂停。
+开了手动余额的账号不算无限：余额由「初始余额 − 本站自算消耗」得出，扣到下限同样自动暂停。
+
+**token 数与金额全部由本站自己算**，不采用上游返回的 `usage`——有些中转站会谎报 token。
+上游自报的数字仍会记在 `upstreamTokens` 里供对照，返回给下游的 `usage` 则是本站口径。
 
 **余额安全线 $0.50**：实际生效的下限是 `max(你填的最低余额, 0.50)`，
 账号行上会显示当前生效的「余额下限」，快到线时提前挂一个「接近下限」提示。
@@ -189,8 +196,26 @@ curl https://你的域名/v1/chat/completions \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-Base URL 填 `https://你的域名/v1`，兼容 `/chat/completions`、`/completions`、
+Responses 兼容端点同样可用：
+
+```bash
+curl https://你的域名/v1/responses \
+  -H "Authorization: Bearer 你的网关密钥" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","input":"你好"}'
+```
+
+Base URL 填 `https://你的域名/v1`，兼容 `/chat/completions`、`/responses`、`/completions`、
 `/embeddings`、`/models`。`stream:true` 走 SSE。
+
+**不带密钥直接打开 `/v1/models`** 会返回 `200` 与空列表加一句提示，方便客户端探活；
+带了错误密钥仍是 401 / 403。
+
+`/dashboard` 上的「查询总余额」会先刷新全部账号再给一份报告，把总额拆成
+「上游查询得到」与「手动余额本地扣减」，并说明有几个账号查询失败（失败账号沿用旧余额）。
+
+> 用 `http://ip:port` 明文访问时，浏览器禁止网页写系统剪贴板，所以「复制」按钮会回落成
+> 「弹出一个已全选的文本框，请按 Ctrl+C」。配好域名与 HTTPS 后即可一键复制。
 
 `GET /v1/models` 只返回你在账号里勾选过的模型，每项固定 `id` / `object` / `created` / `owned_by`
 四个字段，`owned_by` 统一署名 `laskah`，不泄露真实上游。

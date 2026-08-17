@@ -2,6 +2,9 @@
 
 Go 单二进制实现的 OpenAI 兼容负载均衡网关：把多个 New API 站点账号（每账号最多 **5** 个上游 API Key）聚合成一个入口，自动给调用方分配账号、在账号内轮转 Key，按需查询余额，余额耗尽自动暂停账号（不删数据），并支持账号级频率限制自动换号。
 
+**token 与金额一律本站自算**：上游返回的 `usage` 只作对照记录，不参与计费与额度判定——部分中转站会谎报 token 数。
+额度既可以走上游查询接口，也可以纯手动配置（初始余额 + 按量 / 按次单价），由本站按自算 token 扣减。
+
 不依赖 Python / Node.js / Java，也不需要数据库。前端由 `go:embed` 打进二进制，运行时只要一个可执行文件加一个 JSON 数据文件。
 
 开源许可 MIT，见 [LICENSE](LICENSE)。
@@ -114,19 +117,40 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-支持 `stream: true`（SSE 原样透传）。端点：
+支持 `stream: true`（SSE 逐块转发，同时在本站累计输出 token）。端点：
 
 - `POST /v1/chat/completions`（`/chat/completions` 亦可）
+- `POST /v1/responses`（`/responses` 亦可，OpenAI Responses 兼容，支持 `stream: true`）
 - `POST /v1/completions`（内部转成 chat 调用）
 - `POST /v1/embeddings`
 - `GET /v1/models`、`GET /v1/models/{model}`
 - `GET /health`
 
+Responses 示例：
+
+```bash
+curl http://127.0.0.1:8787/v1/responses \
+  -H "Authorization: Bearer sk-你的网关密钥" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","input":"hi"}'
+```
+
+两个端点的账号分配、余额判定、频率限制、截断换号与本地计量逻辑完全一致，只是请求 / 响应结构不同。
+账号默认按 Base URL 拼 `/chat/completions`、`/responses`、`/models`；上游路径不标准时可在创建账号时逐个填**完整地址**覆盖。
+
 上游类型支持 OpenAI 兼容与 Anthropic（`type: anthropic` 时自动做请求 / 响应 / 流式格式转换）。
 
 ## /v1/models 输出格式
 
-严格遵循 OpenAI 规范，需要携带网关密钥（匿名 401）。列表：
+严格遵循 OpenAI 规范。**完全不带 `Authorization` 头**时返回 200 与空列表，附一个 `hint` 字段说明要带密钥——
+很多客户端会先探一次 `/v1/models` 判断服务是否存活，直接 401 会被当成服务不可用。
+带了密钥但密钥无效 / 被禁用时仍返回 401 / 403，不会泄露上游供货范围。
+
+```json
+{ "object": "list", "data": [], "hint": "未提供 API Key，请在 Authorization: Bearer <key> 中提供" }
+```
+
+携带有效密钥时的列表：
 
 ```json
 {
@@ -159,8 +183,13 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 | 所属分组 | 必选，账号归属的用户分组 |
 | 用户名称 | 仅用于界面识别 |
 | API Key 批量粘贴 | 大文本框，每行一个，**上限 5 个** |
-| Base URL | 上游地址，请求时自动拼 `/chat/completions` |
+| Base URL | 上游地址，请求时自动拼 `/chat/completions` / `/responses` / `/models` |
+| 自定义 chat / responses / models 完整地址 | 选填，上游路径不标准时逐个覆盖；必须是带 host 的 `http(s)://` 绝对地址 |
 | 获取模型列表 | 拉取上游 `/models` 后勾选要启用的模型，留空表示接受全部 |
+| 计价方式 | `不计价` / `按量（每 1M tokens 单价）` / `按次（每次请求单价）` |
+| 单价 | 按量填每 1M tokens 的美元价，按次填每次请求的美元价，上限 100000 |
+| 手动配置余额 | 开启后本账号不依赖上游额度接口，由初始余额减本站自算消耗得出当前余额 |
+| 初始余额 | 手动余额模式下的起始额度（USD） |
 | 请求地址 | 额度查询站点，留空复用 Base URL（默认 `https://api.newapi.com`） |
 | 访问令牌 | New API「个人设置 → 安全设置」生成的 access_token |
 | 用户 ID | New API 里的数字用户 ID，例如 `114514` |
@@ -180,8 +209,35 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 与 `pointerup` 都落在遮罩上且没有选区），已填的内容不会因为选文本而丢失。
 输入法组字时按 Esc 只取消候选词，不关弹窗。
 
-**未配置额度查询的账号显示「∞ 无限余额」**：既不参与金额汇总（避免 0 余额把总额拉低），
+**既没配额度查询、也没开手动余额的账号显示「∞ 无限余额」**：既不参与金额汇总（避免 0 余额把总额拉低），
 也不会被余额清理逻辑删掉，刷新时直接返回无限结果、不打上游。
+开了手动余额的账号即使没有上游查询接口也**不算无限**：点刷新返回本地余额视图，扣到下限同样自动暂停。
+
+## token 计量与手动计费
+
+上游 `usage` 不可信（实测有中转站放大 token 数），因此本站自己数：
+
+| 环节 | 口径 |
+| --- | --- |
+| 输入 token | 请求体里的 messages / input 全量估算，含每条消息 4 token、每次请求 3 token 的结构开销 |
+| 输出 token | 非流式解析响应文本；流式按分片累计，半个 UTF-8 字符会留到下一片再算 |
+| 图片分段 | 每个 image 部分按固定 300 token 计 |
+| 中英文 | ASCII 约 4 字符 / token，CJK 约 1 字 / token，标点各 1 |
+| 上游自报 | 原样存进 `upstreamTokens`，只用于和自算值对照，不参与计费 |
+
+响应体里的 `usage` 会被**改写成本站自算值**再返回给调用方，所以下游看到的账单口径与本站统计一致。
+
+计价按账号配置执行：
+
+| 计价方式 | 结算公式 | 适用 |
+| --- | --- | --- |
+| `none` | 不计金额，只累计 token | 只想看用量 |
+| `per_mtoken` | `单价 × 总 token / 1e6` | 按量计费的中转站 |
+| `per_call` | `单价 × 请求次数` | 按次计费的套餐 |
+
+开启「手动配置余额」后，每次请求结算完直接从本地余额扣减，扣到下限即暂停账号，全程不打上游。
+手动余额账号的余额下限取 `max(自填最低余额, 一次请求的预估花费)`，而不是统一的 $0.50 安全线——
+按次计价 $0.001 的账号若也守 $0.50，会白扔掉绝大部分额度。
 
 **余额安全线 $0.50**（`store.MinBalanceFloorUSD`）：实际生效的下限是
 `max(账号自填最低余额, 0.50)`，账号视图里的 `balanceFloor` 就是这个值。
@@ -194,13 +250,20 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 ## 在 /dashboard 看数据与建密钥
 
-- 顶部卡片：**账号总余额**（全部无限时显示 `∞ 无限`）、**累计消耗金额**（含已移除账号历史）、**消耗 Tokens 总数**、网关请求数、上游 API 数（附已暂停账号数）、网关密钥数。
-- 分组卡片：每个分组各自的余额总量、消耗金额、消耗 Tokens、可用账号比例、启停状态。
+- 顶部卡片：**账号总余额**（全部无限时显示 `∞ 无限`）、**累计消耗金额**（含已移除账号历史）、**本站自算消耗金额**、**消耗 Tokens 总数**（附输入 / 输出 / 上游自报拆分）、网关请求数、上游 API 数（附已暂停账号数）、网关密钥数。
+- 分组卡片：每个分组各自的余额总量、消耗金额、自算消耗、消耗 Tokens（输入 / 输出）、可用账号比例、启停状态、手动余额账号数。
+- **查询总余额**按钮：先强制刷新全部账号，再给一份纯文本报告——总余额按「上游查询得到」与「手动余额本地扣减」拆开，
+  同时列出无限额度账号数、本次查询失败 / 暂停 / 删除的账号数。失败账号沿用上次余额，报告会明说总额可能偏高，
+  避免把一个不完整的数字当成准确额度。
 - 单个创建密钥：名称、前缀、限定分组、模型白名单、Token 额度、每分钟限流、过期时间。
 - 批量创建：数量 1–500 加名称前缀，生成 `前缀-01 … 前缀-NN`，每个密钥独立随机串。
 - 支持导出 CSV、查看完整密钥、重置用量、批量删除。
 
 密钥明文只在创建时和显式「查看明文」时返回，列表接口只给掩码。
+
+**复制按钮在明文 HTTP 下也能用**：`navigator.clipboard` 只在安全上下文（HTTPS 或 localhost）可用，
+所以「复制」依次尝试 Clipboard API → `execCommand("copy")` → 弹出一个全选好的文本框让你按 Ctrl+C，
+不会再出现点了没反应或只提示「复制失败」的情况。用域名 + HTTPS 访问时走第一条路径，一步到位。
 
 ## 余额查询与刷新
 
@@ -301,6 +364,7 @@ Go 默认的 `Go-http-client/1.1` 会被 Cloudflare 一类的 WAF 直接判成�
 | GET / POST | `/admin/accounts` | 列表（含移除记录与汇总）/ 创建 |
 | GET | `/admin/accounts/totals` | 全站汇总 |
 | POST | `/admin/accounts/refresh-all` | 刷新全部账号余额 |
+| POST | `/admin/accounts/balance-query` | 查询总余额：先刷新全部账号，再返回按来源拆分的汇总与失败计数 |
 | DELETE | `/admin/accounts/batch` | 批量删除（体 `{"ids":[...]}`） |
 | GET | `/admin/accounts/{id}` 或 `/balance` | 只读余额视图 |
 | POST | `/admin/accounts/{id}/refresh` | 手动刷新单个账号 |
@@ -397,10 +461,12 @@ Token 额度 `quotaTokens` 同样在网关侧强制。
 
 ## 数据迁移
 
-`db.json` 带 `version` 字段（当前 4），启动时自动归一化：
+`db.json` 带 `version` 字段（当前 6），启动时自动归一化：
 
 - `version < 3`：补齐请求时刷新字段并**默认开启** `refreshOnRequest`（60 秒），升级后无需手工改配置。
 - `version < 4`：旧分组默认 `enabled = true`；`config.users` 补成空数组（已有账户则标记为已初始化）。
+- `version < 6`：旧账号一律置为 `billingMode = none` + `manualBalance = false`，
+  即行为与升级前完全一致（余额仍走上游查询或按无限处理），要用手动计费需新建账号。
 - 缺失或越界的 `requestRefreshSec` 回落默认 60、上限截断 3600。
 
 迁移是单向的，跨版本升级前先备份。
@@ -415,7 +481,7 @@ go vet ./...
 go test ./... -count=1
 ```
 
-接口级冒烟，40 项断言（Windows；会重置本地数据并留下一套演示数据）：
+接口级冒烟，52 项断言（Windows；会重置本地数据并留下一套演示数据）：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-local.ps1

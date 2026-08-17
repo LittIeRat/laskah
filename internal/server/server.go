@@ -186,6 +186,9 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/completions", a.handleLegacyCompletions)
 	mux.HandleFunc("/embeddings", a.Gateway.HandleEmbeddings)
 	mux.HandleFunc("/v1/embeddings", a.Gateway.HandleEmbeddings)
+	// Responses 是 OpenAI 的新形态兼容接口，与 chat 走同一套账号分配与计费。
+	mux.HandleFunc("/responses", a.Gateway.HandleResponses)
+	mux.HandleFunc("/v1/responses", a.Gateway.HandleResponses)
 	// 列表与单模型查询共用一个处理器：/v1/models 与 /v1/models/{id}。
 	mux.HandleFunc("/models", a.Gateway.HandleModels)
 	mux.HandleFunc("/models/", a.Gateway.HandleModels)

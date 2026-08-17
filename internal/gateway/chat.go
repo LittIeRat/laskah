@@ -16,6 +16,7 @@ import (
 	"laskah/internal/balancer"
 	"laskah/internal/httpx"
 	"laskah/internal/store"
+	"laskah/internal/tokenizer"
 )
 
 // retryableStatus 列出值得切换提供商重试的状态码。
@@ -463,11 +464,24 @@ func (g *Gateway) assignSession(secret, model string) (Session, string, *AuthErr
 }
 
 // HandleChatCompletions 是 /v1/chat/completions 的入口。
+func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	g.handleInference(w, r, chatSpec())
+}
+
+// HandleResponses 是 /v1/responses 的入口（OpenAI Responses 兼容）。
+func (g *Gateway) HandleResponses(w http.ResponseWriter, r *http.Request) {
+	g.handleInference(w, r, responsesSpec())
+}
+
+// handleInference 是两个推理端点共享的主流程。
 //
 // 顺序刻意是「先验密钥 → 再读 model → 最后分配账号」：
 // 账号分配必须知道请求的是哪个模型，才能只挑真正提供该模型的账号，
 // 否则会把请求交给不支持它的账号，白跑一次上游甚至误伤统计。
-func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
+//
+// token 用量一律以本站自己的估算为准（上游自报值只留作对照），
+// 因此账号计费与密钥配额不会被谎报用量的站点带偏。
+func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request, spec inferenceSpec) {
 	secret := httpx.BearerToken(r)
 	keyID, authErr := g.ValidateKey(secret)
 	if authErr != nil {
@@ -481,9 +495,8 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	messages, ok := body["messages"].([]any)
-	if !ok || len(messages) == 0 {
-		httpx.Error(w, http.StatusBadRequest, "messages 字段必须是非空数组", nil)
+	if message := spec.validate(body); message != "" {
+		httpx.Error(w, http.StatusBadRequest, message, nil)
 		return
 	}
 	model := strings.TrimSpace(store.MustString(body["model"]))
@@ -491,6 +504,9 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		httpx.Error(w, http.StatusBadRequest, "model 字段不能为空", nil)
 		return
 	}
+
+	// 输入 token 在发出请求前就能算出来，与上游是否返回 usage 无关。
+	promptTokens := countPromptTokens(body)
 
 	var (
 		allowsModel bool
@@ -520,7 +536,7 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 				seconds = 1
 			}
 			w.Header().Set("Retry-After", fmt.Sprint(seconds))
-			g.recordKeyUsage(keyID, false, balancer.Usage{})
+			g.recordKeyUsage(keyID, false, Usage{})
 			httpx.Error(w, http.StatusTooManyRequests, "触发速率限制，请稍后再试", nil)
 			return
 		}
@@ -588,7 +604,7 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		provider := candidates[index]
 		g.adjustInflight(provider.ID, 1)
 
-		response, sendErr := g.Upstream.SendChat(r.Context(), provider, body)
+		response, sendErr := spec.send(g.Upstream, r.Context(), provider, body)
 		if sendErr != nil {
 			g.adjustInflight(provider.ID, -1)
 			g.reportFailure(provider.ID, sendErr)
@@ -618,7 +634,7 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			if retryableStatus[response.HTTP.StatusCode] && index < maxAttempts-1 {
 				continue
 			}
-			g.recordKeyUsage(keyID, false, balancer.Usage{})
+			g.recordKeyUsage(keyID, false, Usage{})
 			status := response.HTTP.StatusCode
 			if status == http.StatusUnauthorized || status == http.StatusForbidden {
 				status = http.StatusBadGateway
@@ -634,12 +650,14 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		w.Header().Set("X-Lb-Provider-Id", provider.ID)
 		w.Header().Set("X-Lb-Attempt", fmt.Sprint(index+1))
 		w.Header().Set("X-Lb-Upstream-Model", provider.UpstreamModel(model))
+		w.Header().Set("X-Lb-Endpoint", spec.endpoint)
 
 		if stream {
-			usage, streamErr := g.pipeStream(w, response, provider, model)
+			result, streamErr := g.pipeStream(w, response, provider, model, spec)
 			response.HTTP.Body.Close()
 			response.Cancel()
 			g.adjustInflight(provider.ID, -1)
+			usage := localUsage(promptTokens, result.completionTokens, result.upstream.TotalTokens)
 
 			// 流式响应里余额不足只能从 SSE 的 error 事件读到（HTTP 状态早已是 200）。
 			var balanceErr *balanceStreamError
@@ -655,7 +673,7 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 				// 已经下发过内容：立刻截断并正常收尾，不让调用方干等或读到半截 SSE。
 				g.recordKeyUsage(keyID, false, usage)
 				if balanceErr.streamed {
-					finishTruncatedStream(w, model)
+					spec.truncate(w, model)
 					return
 				}
 				httpx.Error(w, http.StatusServiceUnavailable, noAccountMessage(model), map[string]any{"attempts": attempts})
@@ -664,7 +682,7 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 			if streamErr != nil {
 				g.reportFailure(provider.ID, streamErr)
-				g.recordKeyUsage(keyID, false, balancer.Usage{})
+				g.recordKeyUsage(keyID, false, usage)
 				return
 			}
 			g.reportSuccess(provider.ID, time.Since(response.StartedAt), usage)
@@ -672,7 +690,7 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 
-		payload, usage, decodeErr := g.decodeResponse(response, provider, model)
+		payload, upstreamUsage, decodeErr := g.decodeResponse(response, provider, model, spec)
 		response.HTTP.Body.Close()
 		response.Cancel()
 		g.adjustInflight(provider.ID, -1)
@@ -685,7 +703,7 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 					index = -1
 					continue
 				}
-				g.recordKeyUsage(keyID, false, balancer.Usage{})
+				g.recordKeyUsage(keyID, false, Usage{})
 				httpx.Error(w, http.StatusServiceUnavailable, noAccountMessage(model), map[string]any{"attempts": attempts})
 				return
 			}
@@ -696,10 +714,15 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			if index < maxAttempts-1 {
 				continue
 			}
-			g.recordKeyUsage(keyID, false, balancer.Usage{})
+			g.recordKeyUsage(keyID, false, Usage{})
 			httpx.Error(w, http.StatusBadGateway, "上游响应解析失败: "+decodeErr.Error(), map[string]any{"attempts": attempts})
 			return
 		}
+
+		// 输出 token 由响应正文自行统计，然后覆盖上游给出的 usage：
+		// 下游看到的用量与本站计费口径一致，不会因上游谎报而对不上账。
+		usage := localUsage(promptTokens, tokenizer.CountCompletionPayload(payload), upstreamUsage.TotalTokens)
+		payload["usage"] = usageBody(usage)
 
 		g.reportSuccess(provider.ID, time.Since(response.StartedAt), usage)
 		g.recordKeyUsage(keyID, true, usage)
@@ -707,7 +730,7 @@ func (g *Gateway) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	g.recordKeyUsage(keyID, false, balancer.Usage{})
+	g.recordKeyUsage(keyID, false, Usage{})
 	httpx.Error(w, http.StatusBadGateway, "所有上游提供商均失败", map[string]any{"attempts": attempts})
 }
 
@@ -731,6 +754,9 @@ func (g *Gateway) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "model 字段不能为空", nil)
 		return
 	}
+
+	// 向量化只有输入 token，本地按 input 字段自算，同样不采信上游自报用量。
+	inputTokens := tokenizer.CountContent(body["input"])
 
 	session, authErr := g.AuthenticateForModel(r.Context(), secret, model)
 	if authErr != nil {
@@ -782,11 +808,12 @@ func (g *Gateway) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if response.StatusCode >= 200 && response.StatusCode < 300 {
-		g.reportSuccess(provider.ID, 0, balancer.Usage{})
-		g.recordKeyUsage(keyID, true, balancer.Usage{})
+		usage := localUsage(inputTokens, 0, 0)
+		g.reportSuccess(provider.ID, 0, usage)
+		g.recordKeyUsage(keyID, true, usage)
 	} else {
 		g.reportFailure(provider.ID, fmt.Errorf("HTTP %d", response.StatusCode))
-		g.recordKeyUsage(keyID, false, balancer.Usage{})
+		g.recordKeyUsage(keyID, false, Usage{})
 		// 向量化没有多上游重试，但账号既然连这一次都付不起，也应立即退出分配池。
 		if snippet := string(raw); IsBalanceExhausted(response.StatusCode, snippet) {
 			g.suspendExhaustedAccount(session.AccountID, snippet)
@@ -839,18 +866,22 @@ func preferDeclaredModel(providers []*store.Provider, model string) []*store.Pro
 	return append(declared, fallback...)
 }
 
-func (g *Gateway) decodeResponse(response *Response, provider *store.Provider, model string) (map[string]any, balancer.Usage, error) {
+// decodeResponse 读取非流式响应，返回响应体与上游自报用量。
+//
+// 第二个返回值只是上游自己声称的用量，仅用于对照；真正计费的 token
+// 由调用方用 tokenizer 依据请求与响应正文自行统计。
+func (g *Gateway) decodeResponse(response *Response, provider *store.Provider, model string, spec inferenceSpec) (map[string]any, Usage, error) {
 	raw, err := io.ReadAll(io.LimitReader(response.HTTP.Body, 64<<20))
 	if err != nil {
-		return nil, balancer.Usage{}, err
+		return nil, Usage{}, err
 	}
 	decoded := map[string]any{}
 	if err := json.Unmarshal(raw, &decoded); err != nil {
-		return nil, balancer.Usage{}, fmt.Errorf("非法 JSON 响应: %w", err)
+		return nil, Usage{}, fmt.Errorf("非法 JSON 响应: %w", err)
 	}
 
 	payload := decoded
-	if provider.Type == store.TypeAnthropic {
+	if spec.anthropic && provider.Type == store.TypeAnthropic {
 		payload = FromAnthropicResponse(decoded, model)
 	} else {
 		payload["model"] = model
@@ -903,15 +934,29 @@ func finishTruncatedStream(w http.ResponseWriter, model string) {
 	}
 }
 
-// pipeStream 把上游 SSE 原样转发给调用方。
+// streamResult 是一次流式转发的用量结果。
+//
+// completionTokens 是本站自己按下发正文累计出的输出 token；
+// upstream 是上游自报的 usage，仅作对照，不参与计费。
+type streamResult struct {
+	completionTokens int64
+	upstream         Usage
+}
+
+// pipeStream 把上游 SSE 转发给调用方，同时在本地累计输出 token。
 //
 // 响应头刻意延迟到第一次真正下发内容时才写：在那之前发现余额不足，
 // 还可以完全透明地换一个账号重试，调用方看不到任何异常。
-func (g *Gateway) pipeStream(w http.ResponseWriter, response *Response, provider *store.Provider, model string) (balancer.Usage, error) {
+//
+// 输出 token 按「真正下发给调用方的正文」累计，因此与上游是否返回 usage 无关，
+// 中途截断也只会计到截断处，不会替上游多算钱。
+func (g *Gateway) pipeStream(w http.ResponseWriter, response *Response, provider *store.Provider, model string, spec inferenceSpec) (streamResult, error) {
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(response.HTTP.Body)
-	usage := balancer.Usage{}
+	result := streamResult{}
+	var counter tokenizer.Counter
 	converter := newAnthropicStreamConverter(model)
+	useAnthropic := spec.anthropic && provider.Type == store.TypeAnthropic
 	started := false
 
 	begin := func() {
@@ -931,7 +976,14 @@ func (g *Gateway) pipeStream(w http.ResponseWriter, response *Response, provider
 		if _, err := io.WriteString(w, chunk); err != nil {
 			return err
 		}
+		if delta := spec.streamDelta(chunk); delta != "" {
+			counter.Add(delta)
+		}
 		return nil
+	}
+	finish := func(err error) (streamResult, error) {
+		result.completionTokens = counter.Total()
+		return result, err
 	}
 
 	for {
@@ -939,23 +991,23 @@ func (g *Gateway) pipeStream(w http.ResponseWriter, response *Response, provider
 		if line != "" {
 			// 余额不足要在转发之前拦下：已经写出去的内容无法撤回。
 			if detail, exhausted := sseBalanceError(line); exhausted {
-				return usage, &balanceStreamError{detail: detail, streamed: started}
+				return finish(&balanceStreamError{detail: detail, streamed: started})
 			}
-			if provider.Type == store.TypeAnthropic {
+			if useAnthropic {
 				for _, chunk := range converter.Convert(line) {
 					if writeErr := emit(chunk); writeErr != nil {
-						return usage, writeErr
+						return finish(writeErr)
 					}
 				}
 				if converter.usage.TotalTokens > 0 {
-					usage = converter.usage
+					result.upstream = converter.usage
 				}
 			} else {
 				if parsed, ok := usageFromSSELine(line); ok {
-					usage = parsed
+					result.upstream = parsed
 				}
 				if writeErr := emit(line); writeErr != nil {
-					return usage, writeErr
+					return finish(writeErr)
 				}
 			}
 			if started && flusher != nil {
@@ -966,22 +1018,22 @@ func (g *Gateway) pipeStream(w http.ResponseWriter, response *Response, provider
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return usage, err
+			return finish(err)
 		}
 	}
 
-	if provider.Type == store.TypeAnthropic {
+	if useAnthropic {
 		if err := emit("data: [DONE]\n\n"); err != nil {
-			return usage, err
+			return finish(err)
 		}
-		usage = converter.usage
+		result.upstream = converter.usage
 	}
 	// 上游一个字节都没给（空流）时也要落地响应头，否则调用方收不到结束。
 	begin()
 	if flusher != nil {
 		flusher.Flush()
 	}
-	return usage, nil
+	return finish(nil)
 }
 
 // adjustInflight 只改内存计数，不触发落盘。
@@ -998,7 +1050,7 @@ func (g *Gateway) adjustInflight(providerID string, delta int64) {
 
 // reportSuccess 与 reportFailure 走缓冲写：统计信息由后台合并落盘，
 // 避免每个请求都重写整个数据文件。
-func (g *Gateway) reportSuccess(providerID string, latency time.Duration, usage balancer.Usage) {
+func (g *Gateway) reportSuccess(providerID string, latency time.Duration, usage Usage) {
 	g.Store.Mutate(func(data *store.Data) {
 		if provider := data.FindProvider(providerID); provider != nil {
 			g.Balancer.ReportSuccess(provider, latency, usage)
@@ -1014,7 +1066,15 @@ func (g *Gateway) reportFailure(providerID string, err error) {
 	})
 }
 
-func (g *Gateway) recordKeyUsage(keyID string, ok bool, usage balancer.Usage) {
+// recordKeyUsage 记账一次调用：写入本地统计，并按账号计价方式扣费。
+//
+// token 数全部来自本站自己的估算，因此上游谎报用量不会影响计费与配额；
+// 上游自报值另存 UpstreamTokens 供排查对照。
+//
+// 计费只对成功请求执行：失败的请求没有产出，向调用方收钱不合理，
+// 但 requests/failure 仍然计数，方便看板判断账号健康度。
+func (g *Gateway) recordKeyUsage(keyID string, ok bool, usage Usage) {
+	exhausted := ""
 	g.Store.Mutate(func(data *store.Data) {
 		key := data.FindKeyByID(keyID)
 		if key == nil {
@@ -1027,28 +1087,66 @@ func (g *Gateway) recordKeyUsage(keyID string, ok bool, usage balancer.Usage) {
 		} else {
 			key.Stats.Failure++
 		}
+		key.Stats.PromptTokens += usage.PromptTokens
+		key.Stats.CompletionTokens += usage.CompletionTokens
 		key.Stats.TotalTokens += usage.TotalTokens
+		key.Stats.UpstreamTokens += usage.UpstreamTokens
 		key.Stats.LastUsedAt = &now
 
-		if account := data.FindAccount(key.AccountID); account != nil {
-			account.Stats.Requests++
-			if ok {
-				account.Stats.Success++
-			} else {
-				account.Stats.Failure++
-			}
-			account.Stats.TotalTokens += usage.TotalTokens
-			account.Stats.LastUsedAt = &now
+		account := data.FindAccount(key.AccountID)
+		if account == nil {
+			return
+		}
+		account.Stats.Requests++
+		if ok {
+			account.Stats.Success++
+		} else {
+			account.Stats.Failure++
+		}
+		account.Stats.PromptTokens += usage.PromptTokens
+		account.Stats.CompletionTokens += usage.CompletionTokens
+		account.Stats.TotalTokens += usage.TotalTokens
+		account.Stats.UpstreamTokens += usage.UpstreamTokens
+		account.Stats.LastUsedAt = &now
+
+		if !ok {
+			return
+		}
+		calls := int64(1)
+		if cost := account.Charge(usage.TotalTokens, calls); cost > 0 {
+			key.Stats.Cost = round6(key.Stats.Cost + cost)
+		}
+		// 手动余额扣到下限时立刻退出分配池：下一次请求会自动换号。
+		if account.AutoSuspend && account.Exhausted() && !account.Suspended {
+			exhausted = account.ID
 		}
 	})
+
+	if exhausted != "" && g.Suspender != nil {
+		g.Suspender.SuspendAccount(exhausted, "本地计费余额触及下限自动暂停")
+	}
 }
 
-func usageFromMap(value any) balancer.Usage {
+// round6 把金额收敛到 6 位小数，避免浮点累加出现长尾误差。
+func round6(value float64) float64 {
+	scaled := value * 1e6
+	if scaled >= 0 {
+		scaled += 0.5
+	} else {
+		scaled -= 0.5
+	}
+	return float64(int64(scaled)) / 1e6
+}
+
+// usageFromMap 解析上游自报的 usage 字段。
+//
+// 结果只用于对照与日志：本站计费一律走 tokenizer 自算的数字。
+func usageFromMap(value any) Usage {
 	source, ok := value.(map[string]any)
 	if !ok {
-		return balancer.Usage{}
+		return Usage{}
 	}
-	usage := balancer.Usage{}
+	usage := Usage{}
 	if prompt, ok := asInt(source["prompt_tokens"]); ok {
 		usage.PromptTokens = prompt
 	} else if prompt, ok := asInt(source["input_tokens"]); ok {
@@ -1067,25 +1165,25 @@ func usageFromMap(value any) balancer.Usage {
 	return usage
 }
 
-func usageFromSSELine(line string) (balancer.Usage, bool) {
+func usageFromSSELine(line string) (Usage, bool) {
 	trimmed := strings.TrimSpace(line)
 	if !strings.HasPrefix(trimmed, "data:") {
-		return balancer.Usage{}, false
+		return Usage{}, false
 	}
 	payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
 	if payload == "" || payload == "[DONE]" {
-		return balancer.Usage{}, false
+		return Usage{}, false
 	}
 	decoded := map[string]any{}
 	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
-		return balancer.Usage{}, false
+		return Usage{}, false
 	}
 	if decoded["usage"] == nil {
-		return balancer.Usage{}, false
+		return Usage{}, false
 	}
 	usage := usageFromMap(decoded["usage"])
 	if usage.TotalTokens == 0 && usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
-		return balancer.Usage{}, false
+		return Usage{}, false
 	}
 	return usage, true
 }

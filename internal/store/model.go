@@ -21,23 +21,32 @@ const (
 // ProviderTypes 列出全部合法协议类型。
 var ProviderTypes = []ProviderType{TypeOpenAI, TypeAnthropic, TypeGemini}
 
-// Paths 描述上游各端点的相对路径。
+// Paths 描述上游各端点的路径。
+//
+// 三个字段都允许填写完整的 http(s) 地址：JoinURL 遇到完整 URL 会直接使用它，
+// 因此账号可以为不遵循 base + 固定后缀约定的上游指定精确端点。
 type Paths struct {
-	Chat   string `json:"chat"`
-	Models string `json:"models"`
+	Chat      string `json:"chat"`
+	Models    string `json:"models"`
+	Responses string `json:"responses"`
 }
 
 // ProviderStats 记录上游 API 的累计调用指标。
 type ProviderStats struct {
-	Requests         int64      `json:"requests"`
-	Success          int64      `json:"success"`
-	Failure          int64      `json:"failure"`
-	PromptTokens     int64      `json:"promptTokens"`
-	CompletionTokens int64      `json:"completionTokens"`
-	TotalTokens      int64      `json:"totalTokens"`
-	AvgLatencyMS     int64      `json:"avgLatencyMs"`
-	LastError        *LastError `json:"lastError"`
-	LastUsedAt       *time.Time `json:"lastUsedAt"`
+	Requests         int64 `json:"requests"`
+	Success          int64 `json:"success"`
+	Failure          int64 `json:"failure"`
+	PromptTokens     int64 `json:"promptTokens"`
+	CompletionTokens int64 `json:"completionTokens"`
+	TotalTokens      int64 `json:"totalTokens"`
+	// UpstreamTokens 是上游自报的累计 token，仅作对照。
+	//
+	// 计费与配额一律用本站自己算出的 TotalTokens：部分站点会谎报用量，
+	// 但保留它们的数字才能在出现偏差时定位是哪一侧的问题。
+	UpstreamTokens int64      `json:"upstreamTokens"`
+	AvgLatencyMS   int64      `json:"avgLatencyMs"`
+	LastError      *LastError `json:"lastError"`
+	LastUsedAt     *time.Time `json:"lastUsedAt"`
 }
 
 // LastError 保存最近一次失败信息。
@@ -79,12 +88,19 @@ type Provider struct {
 }
 
 // KeyStats 记录网关密钥的用量。
+//
+// token 字段全部来自本站自己的估算，Cost 是按账号计价方式折算的金额；
+// UpstreamTokens 保留上游自报值，仅用于与本地口径对照。
 type KeyStats struct {
-	Requests    int64      `json:"requests"`
-	Success     int64      `json:"success"`
-	Failure     int64      `json:"failure"`
-	TotalTokens int64      `json:"totalTokens"`
-	LastUsedAt  *time.Time `json:"lastUsedAt"`
+	Requests         int64      `json:"requests"`
+	Success          int64      `json:"success"`
+	Failure          int64      `json:"failure"`
+	PromptTokens     int64      `json:"promptTokens"`
+	CompletionTokens int64      `json:"completionTokens"`
+	TotalTokens      int64      `json:"totalTokens"`
+	UpstreamTokens   int64      `json:"upstreamTokens"`
+	Cost             float64    `json:"cost"`
+	LastUsedAt       *time.Time `json:"lastUsedAt"`
 }
 
 // APIKey 是下游调用本网关使用的密钥。
@@ -232,10 +248,30 @@ type GroupInput struct {
 func DefaultPaths(t ProviderType) Paths {
 	switch t {
 	case TypeAnthropic:
-		return Paths{Chat: "/messages", Models: "/models"}
+		return Paths{Chat: "/messages", Models: "/models", Responses: "/responses"}
 	default:
-		return Paths{Chat: "/chat/completions", Models: "/models"}
+		return Paths{Chat: "/chat/completions", Models: "/models", Responses: "/responses"}
 	}
+}
+
+// FullEndpoint 校验用户自填的完整端点地址。
+//
+// 只接受 http(s) 且带主机名的绝对地址：相对路径会被 JoinURL 拼到 base url 后面，
+// 与「自定义完整地址」的语义相悖，容易产出 https://a.com/v1/https://b.com 这类结果。
+func FullEndpoint(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", true
+	}
+	lower := strings.ToLower(trimmed)
+	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+		return "", false
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Host == "" {
+		return "", false
+	}
+	return strings.TrimRight(trimmed, "/"), true
 }
 
 // NormalizeBaseURL 补全协议头并去掉尾部斜杠。
