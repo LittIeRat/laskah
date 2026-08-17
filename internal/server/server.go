@@ -34,6 +34,11 @@ type Options struct {
 	FailureThreshold int
 	AllowOrigin      string
 	TrustProxy       bool
+
+	// PublicModels 控制不带密钥访问 /v1/models 时是否返回全站模型目录。
+	//
+	// 用指针区分「没设置」与「显式设为 false」：默认开启，只有显式关掉才收敛成空列表。
+	PublicModels *bool
 }
 
 // App 聚合服务运行所需的组件。
@@ -77,6 +82,9 @@ func New(options Options) (*App, error) {
 	gw.SetRefresher(manager)
 	// 上游明确报余额不足时立刻暂停该账号并换账号重试。
 	gw.SetSuspender(manager)
+	if options.PublicModels != nil {
+		gw.SetPublicModels(*options.PublicModels)
+	}
 	adminHandler := admin.New(dataStore, lb, upstream, manager, options.TrustProxy)
 
 	mux := http.NewServeMux()

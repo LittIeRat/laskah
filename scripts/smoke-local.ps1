@@ -434,17 +434,48 @@ Step 'GET /admin/dashboard 汇总余额与用量' {
   'groups=' + $names + ' apiCount=' + $d.accounts.apiCount + ' unlimited=' + $d.accounts.unlimited
 }
 
-Step 'GET /v1/models 匿名返回 200 空列表（便于客户端探活）' {
+Step 'GET /v1/models 匿名返回公开模型目录' {
   $r = Api GET '/v1/models' -Expect 200
   if ($r.Data.object -ne 'list') { throw 'object 不是 list' }
-  if (@($r.Data.data).Count -ne 0) { throw '匿名访问不应列出任何模型' }
+  $ids = @($r.Data.data | ForEach-Object { $_.id })
+  if ($ids -notcontains 'gpt-4o-mini') { throw '匿名目录缺少 gpt-4o-mini' }
   if (-not $r.Data.hint) { throw '匿名响应缺少 hint 提示' }
-  'HTTP 200 空列表 + hint'
+  # 外层再包一次 @()：Sort-Object -Unique 只剩一个值时会退化成标量字符串，直接索引会拿到首字符。
+  $owners = @(@($r.Data.data | ForEach-Object { $_.owned_by }) | Sort-Object -Unique)
+  if ($owners.Count -ne 1 -or $owners[0] -ne 'laskah') { throw ('匿名目录泄露了上游身份: ' + ($owners -join ',')) }
+  'HTTP 200 models=' + ($ids -join ',') + ' owned_by=laskah'
+}
+
+Step 'GET /v1/models/{id} 匿名可查单个模型' {
+  $r = Api GET '/v1/models/gpt-4o-mini' -Expect 200
+  if ($r.Data.id -ne 'gpt-4o-mini') { throw ('id=' + $r.Data.id) }
+  if ($r.Data.object -ne 'model') { throw ('object=' + $r.Data.object) }
+  'id=gpt-4o-mini object=model'
+}
+
+Step 'GET /v1/models/{id} 匿名查询未知模型返回 404' {
+  $r = Api GET '/v1/models/not-a-real-model' -Expect 404
+  'HTTP 404'
 }
 
 Step 'GET /v1/models 携带无效密钥仍然 401' {
   $r = Api GET '/v1/models' -Bearer 'sk-not-a-real-key' -Expect 401
   'HTTP 401'
+}
+
+Step 'POST /v1/responses 无密钥返回 401' {
+  $r = Api POST '/v1/responses' @{ model = 'gpt-4o-mini'; input = 'hi' } -Expect 401
+  'HTTP 401'
+}
+
+Step 'POST /v1/responses 缺少 input 返回 400（路由已就位）' {
+  $r = Api POST '/v1/responses' @{ model = 'gpt-4o-mini' } -Bearer $gatewayKey -Expect 400
+  'HTTP 400'
+}
+
+Step 'POST /responses 与 /v1/responses 等价' {
+  $r = Api POST '/responses' @{ model = 'gpt-4o-mini' } -Bearer $gatewayKey -Expect 400
+  'HTTP 400（同一处理器）'
 }
 
 Step 'GET /v1/models 返回准确模型列表' {

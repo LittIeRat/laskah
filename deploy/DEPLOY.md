@@ -122,8 +122,12 @@ sudo nano /etc/laskah/laskah.env
 | `TRUST_PROXY` | 反向代理后必须为 `true`，否则登录限速会把所有访客算作同一个 IP |
 
 其余可调项（`HOST` / `PORT` / `DATA_FILE` / `STRATEGY` / `MAX_RETRIES` /
-`COOLDOWN_MS` / `FAILURE_THRESHOLD` / `BALANCE_INTERVAL_MS`）见
+`COOLDOWN_MS` / `FAILURE_THRESHOLD` / `BALANCE_INTERVAL_MS` / `PUBLIC_MODELS`）见
 `deploy/laskah.env.example` 内注释。
+
+`PUBLIC_MODELS` 默认 `true`：不带密钥访问 `/v1/models` 会列出全部可用账号提供的
+模型并集（只有模型名，`owned_by` 统一署名 `laskah`）。需要对外隐藏供货范围时设为
+`false`，匿名请求退回空列表，匿名单模型查询一律 404。
 
 **超级管理员账号不在配置文件里。** 服务首次启动处于「待初始化」状态，
 只有 `/setup` 可用，账号密码由你在浏览器里亲手创建（见第 7 节）。
@@ -325,8 +329,8 @@ curl https://your-domain.com/v1/chat/completions \
 | `POST /v1/responses` | OpenAI Responses 兼容，支持 `stream:true` |
 | `POST /v1/completions` | 旧版补全，内部转成 messages |
 | `POST /v1/embeddings` | 向量化 |
-| `GET /v1/models` | 严格 OpenAI 规范：`{"object":"list","data":[{"id","object","created","owned_by"}]}`；不带密钥时返回 200 空列表 |
-| `GET /v1/models/{id}` | 单模型查询 |
+| `GET /v1/models` | 严格 OpenAI 规范：`{"object":"list","data":[{"id","object","created","owned_by"}]}`；不带密钥时返回公开模型目录（可用 `PUBLIC_MODELS=false` 关闭） |
+| `GET /v1/models/{id}` | 单模型查询，匿名同样可用 |
 
 `/v1/responses` 与 `/v1/chat/completions` 共用同一套账号分配、余额判定、频率限制、
 截断换号与本地计量逻辑，只是请求 / 响应结构不同：

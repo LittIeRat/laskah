@@ -142,15 +142,21 @@ curl http://127.0.0.1:8787/v1/responses \
 
 ## /v1/models 输出格式
 
-严格遵循 OpenAI 规范。**完全不带 `Authorization` 头**时返回 200 与空列表，附一个 `hint` 字段说明要带密钥——
-很多客户端会先探一次 `/v1/models` 判断服务是否存活，直接 401 会被当成服务不可用。
-带了密钥但密钥无效 / 被禁用时仍返回 401 / 403，不会泄露上游供货范围。
+严格遵循 OpenAI 规范。**完全不带 `Authorization` 头**时返回 200 与**公开模型目录**：
+全部可用账号提供的模型并集，附一个 `hint` 说明实际可调范围由密钥决定。
+模型名本身不是机密，而「必须先建密钥才能看这个站有什么模型」会明显拖慢接入，
+所以浏览器直接打开 `/v1/models` 就能看到完整清单，`/v1/models/{model}` 也可匿名查询。
+条目仍只有 `id` / `object` / `created` / `owned_by` 四个字段且 `owned_by` 统一为 `laskah`，
+不泄露上游站点、账号数量与余额。带了密钥但密钥无效 / 被禁用时照实返回 401 / 403。
+
+需要严格保密供货范围时设 `PUBLIC_MODELS=false`，匿名请求退回空列表加提示，
+且匿名单模型查询一律 404，不给存在性探测留通道：
 
 ```json
-{ "object": "list", "data": [], "hint": "未提供 API Key，请在 Authorization: Bearer <key> 中提供" }
+{ "object": "list", "data": [], "hint": "未提供 API Key，返回空列表。请在请求头带上 Authorization: Bearer <本站 API Key> ..." }
 ```
 
-携带有效密钥时的列表：
+携带有效密钥时列表按该密钥的白名单与分组收窄：
 
 ```json
 {
@@ -481,7 +487,7 @@ go vet ./...
 go test ./... -count=1
 ```
 
-接口级冒烟，52 项断言（Windows；会重置本地数据并留下一套演示数据）：
+接口级冒烟，57 项断言（Windows；会重置本地数据并留下一套演示数据）：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-local.ps1

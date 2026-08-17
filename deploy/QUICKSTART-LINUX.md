@@ -208,8 +208,9 @@ curl https://你的域名/v1/responses \
 Base URL 填 `https://你的域名/v1`，兼容 `/chat/completions`、`/responses`、`/completions`、
 `/embeddings`、`/models`。`stream:true` 走 SSE。
 
-**不带密钥直接打开 `/v1/models`** 会返回 `200` 与空列表加一句提示，方便客户端探活；
-带了错误密钥仍是 401 / 403。
+**不带密钥直接打开 `/v1/models`** 会列出全站可用账号提供的模型并集（公开目录），
+浏览器里就能直接确认这个站支持什么模型，`/v1/models/{模型名}` 也可匿名查询；
+带了错误密钥仍是 401 / 403。想对外隐藏支持范围就在 env 里设 `PUBLIC_MODELS=false`。
 
 `/dashboard` 上的「查询总余额」会先刷新全部账号再给一份报告，把总额拆成
 「上游查询得到」与「手动余额本地扣减」，并说明有几个账号查询失败（失败账号沿用旧余额）。

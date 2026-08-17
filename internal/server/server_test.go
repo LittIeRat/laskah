@@ -35,16 +35,26 @@ type harness struct {
 }
 
 func newHarness(t *testing.T) *harness {
+	return newHarnessWith(t, nil)
+}
+
+// newHarnessWith 允许调整服务选项，用于验证 PUBLIC_MODELS 一类的开关。
+func newHarnessWith(t *testing.T, tweak func(*Options)) *harness {
 	t.Helper()
 	t.Setenv("ADMIN_TOKEN", "test-admin-token")
 	t.Setenv("MASTER_KEY", "unit-test-master-key")
 
-	app, err := New(Options{
+	options := Options{
 		DataFile:        filepath.Join(t.TempDir(), "db.json"),
 		Strategy:        "round-robin",
 		MaxRetries:      3,
 		BalanceInterval: time.Hour,
-	})
+	}
+	if tweak != nil {
+		tweak(&options)
+	}
+
+	app, err := New(options)
 	if err != nil {
 		t.Fatalf("初始化服务失败: %v", err)
 	}
@@ -249,6 +259,11 @@ func fakeUpstream(t *testing.T, hits *[]string) *httptest.Server {
 			*hits = append(*hits, key)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprint(w, `{"id":"cmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`)
+		case "/v1/responses", "/responses":
+			*hits = append(*hits, key)
+			w.Header().Set("Content-Type", "application/json")
+			// 上游故意自报一个夸张的 usage，用来验证网关只采信本地口径。
+			_, _ = fmt.Fprint(w, `{"id":"resp_1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}],"usage":{"input_tokens":9999,"output_tokens":8888,"total_tokens":18887}}`)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -907,17 +922,34 @@ func TestModelsEndpointFollowsOpenAISchema(t *testing.T) {
 		t.Fatalf("非法密钥应返回 401, got %d", response.StatusCode)
 	}
 
-	// 完全不带密钥（浏览器直接打开）返回可解析的空列表 + 说明，避免看到裸 401。
-	// 这里刻意不暴露任何模型名：匿名访问者不该看到本站的上游供货范围。
+	// 完全不带密钥（浏览器直接打开）返回公开模型目录：模型名不是机密，
+	// 而「必须先建密钥才能看有什么模型」会明显拖慢接入。仍不泄露上游站点与账号数量。
 	response, anonymous := h.do(http.MethodGet, "/v1/models", nil, "")
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("匿名访问应返回 200, got %d", response.StatusCode)
 	}
-	if len(anonymous["data"].([]any)) != 0 {
-		t.Fatalf("匿名访问不应泄露模型列表: %#v", anonymous["data"])
+	anonymousEntries := anonymous["data"].([]any)
+	if len(anonymousEntries) != 2 {
+		t.Fatalf("匿名访问应列出全站模型目录: %#v", anonymousEntries)
+	}
+	for _, item := range anonymousEntries {
+		entry := item.(map[string]any)
+		if len(entry) != 4 || entry["object"] != "model" || entry["owned_by"] != "laskah" {
+			t.Fatalf("匿名条目应保持 OpenAI 规范且不暴露上游: %#v", entry)
+		}
 	}
 	if !strings.Contains(anonymous["hint"].(string), "Authorization") {
 		t.Fatalf("匿名响应应提示如何携带密钥: %#v", anonymous["hint"])
+	}
+
+	// 匿名单模型查询同样可用，未知模型仍是 404。
+	if response, singleAnon := h.do(http.MethodGet, "/v1/models/gpt-4o-mini", nil, ""); response.StatusCode != http.StatusOK {
+		t.Fatalf("匿名单模型查询应成功: %d %#v", response.StatusCode, singleAnon)
+	} else if singleAnon["id"] != "gpt-4o-mini" || len(singleAnon) != 4 {
+		t.Fatalf("匿名单模型响应格式错误: %#v", singleAnon)
+	}
+	if response, _ := h.do(http.MethodGet, "/v1/models/not-exists", nil, ""); response.StatusCode != http.StatusNotFound {
+		t.Fatalf("匿名查询未知模型应 404, got %d", response.StatusCode)
 	}
 
 	// 密钥白名单应收窄模型列表。
@@ -927,6 +959,218 @@ func TestModelsEndpointFollowsOpenAISchema(t *testing.T) {
 	scopedEntries := scoped["data"].([]any)
 	if len(scopedEntries) != 1 || scopedEntries[0].(map[string]any)["id"] != "gpt-4o" {
 		t.Fatalf("密钥白名单未生效: %#v", scopedEntries)
+	}
+}
+
+// TestPublicModelsCanBeDisabled 验证 PUBLIC_MODELS=false 时匿名目录退回空列表。
+//
+// 默认开放模型目录是为了方便接入，但需要严格保密供货范围的部署必须能关掉，
+// 且关掉后连单模型查询也不能变成「存在性探测」通道。
+
+// TestResponsesEndpointCompatibility 验证 /v1/responses 与 chat 走同一套账号分配与本地计量。
+//
+// 重点是三件事：路由带不带 /v1 前缀都通、上游自报的夸张 usage 被本地口径覆盖、
+// 用量确实记到了账号与密钥的统计里。
+func TestResponsesEndpointCompatibility(t *testing.T) {
+	h := newHarness(t)
+	quota, used := 5000000.0, 0.0
+	site := fakeSite(t, &quota, &used)
+	hits := []string{}
+	upstream := fakeUpstream(t, &hits)
+
+	groupID := h.createGroup("团队 A")
+	if response, body := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":           "acct",
+		"groupId":        groupID,
+		"baseUrl":        upstream.URL + "/v1",
+		"siteUrl":        site.URL,
+		"userId":         "1",
+		"accessToken":    "tok",
+		"keys":           "sk-r1",
+		"selectedModels": []string{"gpt-4o-mini"},
+	}); response.StatusCode != http.StatusCreated {
+		t.Fatalf("创建账号失败: %d %#v", response.StatusCode, body)
+	}
+
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client"})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+	keyID := keyBody["data"].(map[string]any)["id"].(string)
+
+	requestBody := map[string]any{"model": "gpt-4o-mini", "input": "hi"}
+	response, body := h.do(http.MethodPost, "/v1/responses", requestBody, secret)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("responses 请求失败: %d %#v", response.StatusCode, body)
+	}
+	if body["object"] != "response" {
+		t.Fatalf("响应应保持 Responses 结构: %#v", body)
+	}
+	if len(hits) != 1 || hits[0] != "sk-r1" {
+		t.Fatalf("应命中账号名下的上游 Key: %#v", hits)
+	}
+
+	// 上游自报 9999/8888，本站必须改写成自算口径。
+	usage := body["usage"].(map[string]any)
+	expectedPrompt := float64(tokenizer.CountPrompt(requestBody))
+	expectedOutput := float64(tokenizer.CountText("hi"))
+	if usage["prompt_tokens"].(float64) != expectedPrompt || usage["input_tokens"].(float64) != expectedPrompt {
+		t.Fatalf("输入 token 应为本地估算 %v: %#v", expectedPrompt, usage)
+	}
+	if usage["completion_tokens"].(float64) != expectedOutput || usage["output_tokens"].(float64) != expectedOutput {
+		t.Fatalf("输出 token 应为本地估算 %v: %#v", expectedOutput, usage)
+	}
+	if usage["total_tokens"].(float64) != expectedPrompt+expectedOutput {
+		t.Fatalf("总 token 应为本地口径之和: %#v", usage)
+	}
+
+	// 不带 /v1 前缀的同名路径同样可用，方便只认 /responses 的客户端。
+	if response, bare := h.do(http.MethodPost, "/responses", requestBody, secret); response.StatusCode != http.StatusOK {
+		t.Fatalf("/responses 应与 /v1/responses 等价: %d %#v", response.StatusCode, bare)
+	}
+
+	// 缺少 input 时应是明确的 400，而不是把空请求转给上游。
+	if response, bad := h.do(http.MethodPost, "/v1/responses", map[string]any{"model": "gpt-4o-mini"}, secret); response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("缺少 input 应返回 400: %d %#v", response.StatusCode, bad)
+	}
+
+	// 用量要落到账号与密钥统计上，并且账号侧记的是本地口径。
+	_, keys := h.admin(http.MethodGet, "/admin/keys", nil)
+	for _, item := range keys["data"].([]any) {
+		entry := item.(map[string]any)
+		if entry["id"] != keyID {
+			continue
+		}
+		stats := entry["stats"].(map[string]any)
+		if stats["requests"].(float64) != 2 {
+			t.Fatalf("两次成功请求应都计入密钥统计: %#v", stats)
+		}
+		if stats["totalTokens"].(float64) != 2*(expectedPrompt+expectedOutput) {
+			t.Fatalf("密钥 token 统计应为本地口径: %#v", stats)
+		}
+	}
+
+	_, totals := h.admin(http.MethodGet, "/admin/accounts/totals", nil)
+	tokens := totals["data"].(map[string]any)["tokens"].(map[string]any)
+	if tokens["selfMetered"] != true {
+		t.Fatalf("汇总应标记为本站自算: %#v", tokens)
+	}
+	if tokens["upstream"].(float64) != 2*18887 {
+		t.Fatalf("上游自报值应原样留存供对照: %#v", tokens)
+	}
+	if tokens["accounts"].(float64) != 2*(expectedPrompt+expectedOutput) {
+		t.Fatalf("账号侧 token 应为本地口径: %#v", tokens)
+	}
+}
+
+// TestResponsesStreamingCountsLocalTokens 验证 Responses 流式转发与本地输出 token 累计。
+//
+// 流式场景没有可信的 usage 可读，输出 token 只能靠逐片累计 response.output_text.delta，
+// 这条路走不通的话手动计费会长期少算钱。
+func TestResponsesStreamingCountsLocalTokens(t *testing.T) {
+	h := newHarness(t)
+	quota, used := 5000000.0, 0.0
+	site := fakeSite(t, &quota, &used)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models", "/models":
+			_, _ = fmt.Fprint(w, `{"data":[{"id":"gpt-4o-mini"}]}`)
+			return
+		case "/v1/responses", "/responses":
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"世界\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":7777,\"output_tokens\":6666}}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+
+	groupID := h.createGroup("团队 A")
+	if response, body := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":           "acct",
+		"groupId":        groupID,
+		"baseUrl":        upstream.URL + "/v1",
+		"siteUrl":        site.URL,
+		"userId":         "1",
+		"accessToken":    "tok",
+		"keys":           "sk-s1",
+		"selectedModels": []string{"gpt-4o-mini"},
+	}); response.StatusCode != http.StatusCreated {
+		t.Fatalf("创建账号失败: %d %#v", response.StatusCode, body)
+	}
+
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client"})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+
+	payload := map[string]any{"model": "gpt-4o-mini", "input": "hi", "stream": true}
+	response, raw := h.doRaw(http.MethodPost, "/v1/responses", payload, secret)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("流式 responses 请求失败: %d %s", response.StatusCode, raw)
+	}
+	if contentType := response.Header.Get("Content-Type"); !strings.Contains(contentType, "text/event-stream") {
+		t.Fatalf("流式响应应为 SSE: %s", contentType)
+	}
+	if !strings.Contains(raw, "你好") || !strings.Contains(raw, "世界") || !strings.Contains(raw, "[DONE]") {
+		t.Fatalf("流式内容未完整转发: %s", raw)
+	}
+
+	// 输出 token 来自逐片累计的 delta，而不是上游自报的 6666。
+	_, totals := h.admin(http.MethodGet, "/admin/accounts/totals", nil)
+	tokens := totals["data"].(map[string]any)["tokens"].(map[string]any)
+	expectedOutput := float64(tokenizer.CountText("你好世界"))
+	if tokens["completion"].(float64) != expectedOutput {
+		t.Fatalf("流式输出 token 应为本地累计 %v: %#v", expectedOutput, tokens)
+	}
+	if tokens["prompt"].(float64) != float64(tokenizer.CountPrompt(map[string]any{"model": "gpt-4o-mini", "input": "hi", "stream": true})) {
+		t.Fatalf("流式输入 token 应为本地估算: %#v", tokens)
+	}
+}
+
+func TestPublicModelsCanBeDisabled(t *testing.T) {
+	disabled := false
+	h := newHarnessWith(t, func(options *Options) {
+		options.PublicModels = &disabled
+	})
+	quota, used := 5000000.0, 0.0
+	site := fakeSite(t, &quota, &used)
+	hits := []string{}
+	upstream := fakeUpstream(t, &hits)
+
+	groupID := h.createGroup("团队 A")
+	if response, body := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":           "acct",
+		"groupId":        groupID,
+		"baseUrl":        upstream.URL + "/v1",
+		"siteUrl":        site.URL,
+		"userId":         "1",
+		"accessToken":    "tok",
+		"keys":           "sk-a1",
+		"selectedModels": []string{"gpt-4o-mini"},
+	}); response.StatusCode != http.StatusCreated {
+		t.Fatalf("创建账号失败: %d %#v", response.StatusCode, body)
+	}
+
+	response, anonymous := h.do(http.MethodGet, "/v1/models", nil, "")
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("关闭公开目录后仍应返回 200: %d", response.StatusCode)
+	}
+	if len(anonymous["data"].([]any)) != 0 {
+		t.Fatalf("关闭公开目录后不应列出模型: %#v", anonymous["data"])
+	}
+	if response, _ := h.do(http.MethodGet, "/v1/models/gpt-4o-mini", nil, ""); response.StatusCode != http.StatusNotFound {
+		t.Fatalf("关闭公开目录后单模型查询应 404, got %d", response.StatusCode)
+	}
+
+	// 带上有效密钥仍然照常列出。
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client"})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+	_, scoped := h.do(http.MethodGet, "/v1/models", nil, secret)
+	if len(scoped["data"].([]any)) != 1 {
+		t.Fatalf("持有密钥时应正常列出模型: %#v", scoped["data"])
 	}
 }
 

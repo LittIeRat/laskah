@@ -231,11 +231,24 @@ type Gateway struct {
 
 	// Suspender 可为 nil，此时不做余额不足自动暂停。
 	Suspender AccountSuspender
+
+	// PublicModels 决定不带密钥访问 /v1/models 时是否列出全站模型目录。
+	//
+	// 打开（默认）时匿名请求得到全部可用账号提供的模型并集，只含模型名，
+	// 便于客户端探活与人工确认支持范围；关闭时退回空列表加提示。
+	PublicModels bool
 }
 
 // New 创建网关处理器。
+//
+// PublicModels 默认开启：模型名不是机密，而「先建密钥才能看有什么模型」会明显拖慢接入。
 func New(dataStore *store.Store, lb *balancer.Balancer, limiter *balancer.RateLimiter, upstream *Upstream) *Gateway {
-	return &Gateway{Store: dataStore, Balancer: lb, Limiter: limiter, Upstream: upstream}
+	return &Gateway{Store: dataStore, Balancer: lb, Limiter: limiter, Upstream: upstream, PublicModels: true}
+}
+
+// SetPublicModels 设置匿名模型目录开关。
+func (g *Gateway) SetPublicModels(enabled bool) {
+	g.PublicModels = enabled
 }
 
 // SetRefresher 注入请求时余额刷新实现。

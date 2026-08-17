@@ -208,7 +208,9 @@
       "响应严格遵循 OpenAI 规范：",
       '{"object":"list","data":[{"id":"gpt-4o-mini","object":"model","created":1700000000,"owned_by":"laskah"}]}',
       "",
-      "不带 Authorization 头时返回 200 与空列表（附 hint 字段），带无效密钥仍返回 401/403。"
+      "不带 Authorization 头时返回公开模型目录（全站可用账号的模型并集，附 hint 字段），",
+      "单模型查询 /v1/models/{model} 匿名同样可用；带无效密钥仍返回 401/403。",
+      "需要对外隐藏支持范围时在服务端设 PUBLIC_MODELS=false，匿名请求退回空列表。"
     ].join("\n");
     el("usage-curl").textContent = [
       "curl " + base + "/chat/completions \\",

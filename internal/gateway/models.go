@@ -46,8 +46,11 @@ type AnonymousModelList struct {
 	Hint   string       `json:"hint"`
 }
 
-// anonymousModelsHint 说明匿名访问看不到模型的原因与正确用法。
-const anonymousModelsHint = "未提供 API Key，返回空列表。请在请求头带上 Authorization: Bearer <本站 API Key> 以查看该密钥可调用的模型。"
+// anonymousModelsHint 说明匿名列表的含义：这是全站目录，实际可调范围仍由密钥决定。
+const anonymousModelsHint = "公开模型目录。实际可调用范围由所用 API Key 的分组与白名单决定，请求时在 Authorization: Bearer <本站 API Key> 中带上密钥。"
+
+// anonymousModelsClosedHint 是关闭公开目录时的说明。
+const anonymousModelsClosedHint = "未提供 API Key，返回空列表。请在请求头带上 Authorization: Bearer <本站 API Key> 以查看该密钥可调用的模型。"
 
 // HandleModels 处理 /v1/models 与 /v1/models/{id}。
 //
@@ -69,18 +72,10 @@ func (g *Gateway) HandleModels(w http.ResponseWriter, r *http.Request) {
 	requested := requestedModelID(r.URL.Path)
 	secret := httpx.BearerToken(r)
 
-	// 完全没带密钥（例如浏览器直接打开该地址）时给出可解析的空列表而不是 401。
+	// 完全没带密钥（例如浏览器直接打开该地址）时给出可解析的列表而不是 401。
 	// 带了密钥但无效仍然按 401 处理：那是明确的鉴权失败，不该被静默成空结果。
 	if strings.TrimSpace(secret) == "" {
-		if requested != "" {
-			httpx.Error(w, http.StatusNotFound, "模型不存在或当前密钥无权访问: "+requested, nil)
-			return
-		}
-		httpx.JSON(w, http.StatusOK, AnonymousModelList{
-			Object: "list",
-			Data:   []ModelEntry{},
-			Hint:   anonymousModelsHint,
-		})
+		g.handleAnonymousModels(w, requested)
 		return
 	}
 
@@ -104,6 +99,45 @@ func (g *Gateway) HandleModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	httpx.Error(w, http.StatusNotFound, "模型不存在或当前密钥无权访问: "+requested, nil)
+}
+
+// handleAnonymousModels 处理不带密钥的模型查询。
+//
+// PublicModels 打开时列出全站可用账号提供的模型并集（默认行为）：很多客户端与人工排查
+// 都需要先看一眼「这个站到底有什么模型」，逼着先建密钥才能看反而更麻烦。
+// 这里只暴露模型名，owned_by 仍统一署名本站，不泄露上游站点、账号数量与余额。
+// 需要严格保密供货范围时把 PUBLIC_MODELS 设为 false，退回空列表加提示。
+func (g *Gateway) handleAnonymousModels(w http.ResponseWriter, requested string) {
+	if !g.PublicModels {
+		if requested != "" {
+			httpx.Error(w, http.StatusNotFound, "模型不存在或当前密钥无权访问: "+requested, nil)
+			return
+		}
+		httpx.JSON(w, http.StatusOK, AnonymousModelList{
+			Object: "list",
+			Data:   []ModelEntry{},
+			Hint:   anonymousModelsClosedHint,
+		})
+		return
+	}
+
+	// keyID 传空串即「不受任何密钥白名单约束」，取全部分组内可用账号的模型并集。
+	entries := g.availableModels("")
+	if requested != "" {
+		for _, entry := range entries {
+			if entry.ID == requested {
+				httpx.JSON(w, http.StatusOK, entry)
+				return
+			}
+		}
+		httpx.Error(w, http.StatusNotFound, "模型不存在: "+requested, nil)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, AnonymousModelList{
+		Object: "list",
+		Data:   entries,
+		Hint:   anonymousModelsHint,
+	})
 }
 
 // requestedModelID 从 /v1/models/{id} 提取模型名，列表请求返回空串。

@@ -35,6 +35,7 @@ func main() {
 		BalanceInterval:  time.Duration(envInt("BALANCE_INTERVAL_MS", 60000)) * time.Millisecond,
 		AllowOrigin:      envString("ALLOW_ORIGIN", ""),
 		TrustProxy:       envBool("TRUST_PROXY", false),
+		PublicModels:     envBoolPtr("PUBLIC_MODELS"),
 	}
 
 	app, err := server.New(options)
@@ -214,6 +215,18 @@ func envInt(name string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+// envBoolPtr 读取三态布尔环境变量：未设置返回 nil，交由下游用默认值。
+//
+// 用于 PUBLIC_MODELS 这类「默认开启、只有显式关掉才生效」的开关。
+func envBoolPtr(name string) *bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	if raw == "" {
+		return nil
+	}
+	value := raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+	return &value
 }
 
 func envBool(name string, fallback bool) bool {
