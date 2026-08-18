@@ -1,6 +1,8 @@
 package store
 
 import (
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -1084,4 +1086,187 @@ func TestAssignAccountForModelBorrowsWithoutRebinding(t *testing.T) {
 	if account := data.AssignAccountForModel(key, ""); account == nil || account.ID != catchAll.ID {
 		t.Fatalf("未指定模型时应保持粘性: %#v", account)
 	}
+}
+
+// TestBuildAccountQueryScript 覆盖脚本查询的三条边界：脚本非法要拦、
+// 额度查询地址必须是完整地址、只配脚本也算「能查额度」（不再按无限余额处理）。
+func TestBuildAccountQueryScript(t *testing.T) {
+	const balanceScript = `({
+	  request: {
+	    url: "{{baseUrl}}/api/user/self",
+	    method: "GET",
+	    headers: { "Authorization": "Bearer {{accessToken}}", "New-Api-User": "{{userId}}" }
+	  },
+	  extractor: function (response) {
+	    return { remaining: response.data.quota / 500000, unit: "USD" };
+	  }
+	})`
+
+	if _, verr := BuildAccount(AccountInput{Name: "x", BaseURL: "https://a.com/v1", QueryScript: "({ request: { url: 1 } })"}); verr == nil {
+		t.Fatalf("非法脚本应报错")
+	}
+	if _, verr := BuildAccount(AccountInput{Name: "x", BaseURL: "https://a.com/v1", QueryScript: "fetch('http://evil')"}); verr == nil {
+		t.Fatalf("脚本里的危险调用应被拒绝")
+	}
+	if _, verr := BuildAccount(AccountInput{Name: "x", BaseURL: "https://a.com/v1", QueryURL: "console.example.com/api"}); verr == nil {
+		t.Fatalf("额度查询地址不是完整地址应报错")
+	}
+
+	// 额度查询地址留空必须放行：不少自建上游根本没有额度接口。
+	plain, verr := BuildAccount(AccountInput{Name: "x", BaseURL: "https://a.com/v1"})
+	if verr != nil {
+		t.Fatalf("留空额度查询地址不应报错: %v", verr)
+	}
+	if plain.QueryURL != "" || plain.HasQueryScript() || plain.HasBalanceQuery() || !plain.Unlimited() {
+		t.Fatalf("未配置任何查询手段应视为无限余额: %#v", plain)
+	}
+
+	scripted, verr := BuildAccount(AccountInput{
+		Name:        "scripted",
+		BaseURL:     "https://a.com/v1",
+		QueryURL:    "https://console.example.com/api",
+		QueryScript: balanceScript,
+	})
+	if verr != nil {
+		t.Fatalf("合法脚本不应报错: %v", verr)
+	}
+	if scripted.QueryURL != "https://console.example.com/api" {
+		t.Fatalf("额度查询地址未保存: %q", scripted.QueryURL)
+	}
+	if !scripted.HasQueryScript() || scripted.QueryProgram() == nil {
+		t.Fatalf("脚本应已编译: %#v", scripted)
+	}
+	// 只有脚本、没有访问令牌时依然要能参与额度查询与耗尽判定。
+	if scripted.HasBuiltinQuery() || !scripted.HasBalanceQuery() || scripted.Unlimited() {
+		t.Fatalf("仅脚本也应算配置了额度查询: %#v", scripted)
+	}
+	if scripted.QueryProgram().Method() != "GET" {
+		t.Fatalf("脚本方法解析错误: %q", scripted.QueryProgram().Method())
+	}
+
+	// 清除脚本后回到无限额度，避免删掉脚本却仍按 0 余额把账号踢出池子。
+	if err := scripted.SetQueryScript(""); err != nil {
+		t.Fatalf("清除脚本不应报错: %v", err)
+	}
+	if scripted.HasQueryScript() || scripted.HasBalanceQuery() {
+		t.Fatalf("清除脚本后应恢复无限额度: %#v", scripted)
+	}
+	if err := scripted.SetQueryScript("({ request: {} })"); err == nil {
+		t.Fatalf("非法脚本写入应报错")
+	}
+}
+
+// TestPublicAccountHidesQueryScript 确认脚本源码不会经视图回显：
+// 脚本里常被写进硬编码令牌，回显等于把凭据交出去。
+func TestPublicAccountHidesQueryScript(t *testing.T) {
+	const balanceScript = `({
+	  request: {
+	    url: "{{baseUrl}}/api/user/self",
+	    method: "GET",
+	    headers: { "Authorization": "Bearer {{accessToken}}", "New-Api-User": "{{userId}}" }
+	  },
+	  extractor: function (response) {
+	    return { remaining: response.data.quota / 500000, unit: "USD" };
+	  }
+	})`
+
+	account, verr := BuildAccount(AccountInput{
+		Name:        "scripted",
+		BaseURL:     "https://api.newapi.com/v1",
+		QueryURL:    "https://console.example.com/api",
+		QueryScript: balanceScript,
+	})
+	if verr != nil {
+		t.Fatalf("构建失败: %v", verr)
+	}
+	view := PublicAccount(account, 1, 0)
+
+	for _, field := range []string{"queryScript", "queryUrl", "balanceScript"} {
+		if _, leaked := view[field]; leaked {
+			t.Fatalf("视图不应包含 %s", field)
+		}
+	}
+	if view["hasQueryScript"] != true || view["hasQueryUrl"] != true {
+		t.Fatalf("应标记脚本与查询地址已配置: %#v", view)
+	}
+	for key, value := range view {
+		if text, ok := value.(string); ok && strings.Contains(text, "extractor") {
+			t.Fatalf("字段 %s 泄露了脚本源码", key)
+		}
+	}
+}
+
+// TestQueryScriptPersistence 确认脚本以密文落盘、重新加载后能解密并自动编译。
+func TestQueryScriptPersistence(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "tok")
+	t.Setenv("MASTER_KEY", "unit-test-master-key")
+	file := t.TempDir() + "/db.json"
+
+	const balanceScript = `({
+	  request: {
+	    url: "{{baseUrl}}/api/user/self",
+	    method: "GET",
+	    headers: { "Authorization": "Bearer {{accessToken}}", "New-Api-User": "{{userId}}" }
+	  },
+	  extractor: function (response) {
+	    return { remaining: response.data.quota / 500000, unit: "USD" };
+	  }
+	})`
+
+	first := New(file)
+	if err := first.Load(); err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	account, verr := BuildAccount(AccountInput{
+		Name:        "scripted",
+		BaseURL:     "https://api.newapi.com/v1",
+		QueryURL:    "https://console.example.com/api",
+		QueryScript: balanceScript,
+	})
+	if verr != nil {
+		t.Fatalf("构建失败: %v", verr)
+	}
+	if err := first.Update(func(data *Data) error {
+		data.Accounts = append(data.Accounts, account)
+		return nil
+	}); err != nil {
+		t.Fatalf("Update 失败: %v", err)
+	}
+
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("读取落盘文件失败: %v", err)
+	}
+	if strings.Contains(string(raw), "extractor") {
+		t.Fatalf("脚本明文落盘了")
+	}
+	if !strings.Contains(string(raw), "\"queryScript\":\"enc.") {
+		t.Fatalf("脚本应以密文形式落盘: %s", string(raw))
+	}
+
+	second := New(file)
+	if err := second.Load(); err != nil {
+		t.Fatalf("重新 Load 失败: %v", err)
+	}
+	second.View(func(data *Data) {
+		if data.Version != 7 {
+			t.Fatalf("数据版本应升到 7, got %d", data.Version)
+		}
+		reloaded := data.FindAccount(account.ID)
+		if reloaded == nil {
+			t.Fatalf("账号未持久化")
+		}
+		if reloaded.QueryURL != "https://console.example.com/api" {
+			t.Fatalf("额度查询地址未持久化: %q", reloaded.QueryURL)
+		}
+		if reloaded.ScriptError != "" {
+			t.Fatalf("脚本重新编译失败: %s", reloaded.ScriptError)
+		}
+		if !reloaded.HasQueryScript() || reloaded.QueryProgram() == nil {
+			t.Fatalf("脚本应在加载后自动编译: %#v", reloaded)
+		}
+		if reloaded.QueryScript != strings.TrimSpace(balanceScript) {
+			t.Fatalf("脚本源码解密后不一致: %q", reloaded.QueryScript)
+		}
+	})
 }

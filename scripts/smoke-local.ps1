@@ -367,6 +367,143 @@ Step '自定义 chat / responses / models 完整地址被接受但不回显' {
   'hasCustomChatUrl/RespUrl/ModelsUrl=true 且不回显'
 }
 
+Step 'POST /admin/scripts/validate 合法脚本回显请求且遮蔽凭据' {
+  $script1 = @'
+({
+  request: {
+    url: "{{baseUrl}}/api/user/self",
+    method: "GET",
+    headers: {
+      "Authorization": "Bearer {{accessToken}}",
+      "New-Api-User": "{{userId}}"
+    }
+  },
+  extractor: function (response) {
+    if (response.success && response.data) {
+      return {
+        planName: response.data.group || "默认套餐",
+        remaining: response.data.quota / 500000,
+        used: response.data.used_quota / 500000,
+        unit: "USD"
+      };
+    }
+    return { isValid: false, invalidMessage: response.message || "查询失败" };
+  }
+})
+'@
+  $payload = @{
+    script      = $script1
+    queryUrl    = 'https://console.example.com'
+    accessToken = 'tok-abcdef0123456789'
+    userId      = '114514'
+  }
+  $r = Api POST '/admin/scripts/validate' $payload -Session $superSession -Csrf $superCsrf -Expect 200
+  $d = $r.Data.data
+  if (-not $d.ok) { throw ('合法脚本校验失败: ' + $d.error) }
+  if ($d.method -ne 'GET') { throw ('method=' + $d.method) }
+  if ($d.url -ne 'https://console.example.com/api/user/self') { throw ('url=' + $d.url) }
+  if ($d.hasBody) { throw 'GET 脚本不应带请求体' }
+  if ($r.Text -match 'abcdef0123456789') { throw '访问令牌被原文回显' }
+  'ok=true ' + $d.method + ' ' + $d.url + ' 凭据已遮蔽'
+}
+
+Step 'POST /admin/scripts/validate 危险与残缺脚本被拒绝' {
+  $bad = Api POST '/admin/scripts/validate' @{ script = '({ request: { url: "{{baseUrl}}/x", method: "GET" } })' } -Session $superSession -Csrf $superCsrf -Expect 200
+  if ($bad.Data.data.ok) { throw '缺少 extractor 的脚本被判为合法' }
+  if ($bad.Data.data.error -notmatch 'extractor') { throw ('错误信息未说明 extractor: ' + $bad.Data.data.error) }
+  $danger = Api POST '/admin/scripts/validate' @{ script = '({ request: { url: require("http") } })' } -Session $superSession -Csrf $superCsrf -Expect 200
+  if ($danger.Data.data.ok) { throw '含 require 的脚本被判为合法' }
+  $unknown = Api POST '/admin/scripts/validate' @{ script = '({ request: { url: "{{secretKey}}/x", method: "GET" }, extractor: function (r) { return { remaining: 1 }; } })' } -Session $superSession -Csrf $superCsrf -Expect 200
+  if ($unknown.Data.data.ok) { throw '未知模板变量被放过' }
+  '缺 extractor / require / 未知变量 均被拒绝'
+}
+
+$scriptAccount = ''
+
+Step 'POST /admin/accounts 创建脚本查询账号（自定义完整额度地址）' {
+  $script2 = @'
+({
+  request: {
+    url: "{{baseUrl}}/console/quota",
+    method: "GET",
+    headers: { "X-Token": "{{accessToken}}" }
+  },
+  extractor: function (response) {
+    if (!response.ok) { return { isValid: false, invalidMessage: response.reason }; }
+    return { planName: response.plan, remaining: response.left, used: response.spent, unit: "USD" };
+  }
+})
+'@
+  $payload = @{
+    groupId     = $groupB
+    name        = '脚本查询账号'
+    baseUrl     = 'https://upstream.example.com/v1'
+    keys        = 'sk-scripted-0123456789abcdef'
+    queryUrl    = 'https://console.example.com'
+    accessToken = 'tok-console-0123456789'
+    queryScript = $script2
+  }
+  $r = Api POST '/admin/accounts' $payload -Session $superSession -Csrf $superCsrf -Expect 201
+  $script:scriptAccount = $r.Data.data.id
+  $acct = $r.Data.data
+  if (-not $acct.hasQueryScript) { throw '未记录查询脚本' }
+  if (-not $acct.hasQueryUrl) { throw '未记录额度查询完整地址' }
+  if (-not $acct.hasBalanceQuery) { throw '配了脚本却未标记可查额度' }
+  if ($acct.unlimited) { throw '配了脚本的账号不应视为无限余额' }
+  if ($r.Text -match 'extractor') { throw '脚本源码被回显' }
+  if ($r.Text -match 'tok-console') { throw '访问令牌被回显' }
+  # 查询失败原因里允许出现请求地址（排查用），但它不能变成一个可读回的配置字段。
+  foreach ($prop in $acct.PSObject.Properties) {
+    if ($prop.Name -in @('checkError', 'scriptError')) { continue }
+    if (([string]$prop.Value) -match 'console\.example\.com') { throw ('额度查询地址被字段 ' + $prop.Name + ' 回显') }
+  }
+  'id=' + $script:scriptAccount + ' hasQueryScript=true unlimited=false 且不回显脚本'
+}
+
+Step '脚本查询账号计入看板脚本口径统计' {
+  $r = Api GET '/admin/dashboard' -Session $superSession -Expect 200
+  $a = $r.Data.data.accounts
+  if ($null -eq $a.scripted) { throw '缺少 scripted 计数' }
+  if ($a.scripted -lt 1) { throw ('scripted=' + $a.scripted + '，期望至少 1') }
+  if ($null -eq $a.scriptBroken) { throw '缺少 scriptBroken 计数' }
+  if ($a.scriptBroken -ne 0) { throw ('scriptBroken=' + $a.scriptBroken + '，期望 0') }
+  'scripted=' + $a.scripted + ' scriptBroken=0'
+}
+
+Step '非法脚本创建账号被拒绝' {
+  $payload = @{
+    groupId     = $groupB
+    name        = '坏脚本账号'
+    baseUrl     = 'https://upstream.example.com/v1'
+    keys        = 'sk-badscript-0123456789abcdef'
+    queryScript = '({ request: { url: 1 } })'
+  }
+  $r = Api POST '/admin/accounts' $payload -Session $superSession -Csrf $superCsrf -Expect 400
+  'HTTP 400'
+}
+
+Step '额度查询完整地址必须是绝对地址（留空放行）' {
+  $bad = @{
+    groupId  = $groupB
+    name     = '相对额度地址'
+    baseUrl  = 'https://upstream.example.com/v1'
+    keys     = 'sk-badquery-0123456789abcdef'
+    queryUrl = 'console.example.com/api'
+  }
+  $r = Api POST '/admin/accounts' $bad -Session $superSession -Csrf $superCsrf -Expect 400
+  $ok = @{
+    groupId  = $groupB
+    name     = '无额度接口账号'
+    baseUrl  = 'https://upstream.example.com/v1'
+    keys     = 'sk-noquery-0123456789abcdef'
+    queryUrl = ''
+  }
+  $r2 = Api POST '/admin/accounts' $ok -Session $superSession -Csrf $superCsrf -Expect 201
+  if (-not $r2.Data.data.unlimited) { throw '没有额度接口的账号应按无限余额处理' }
+  if ($r2.Data.data.hasQueryUrl) { throw '留空却记录了额度查询地址' }
+  '相对地址 400 / 留空 201 且 unlimited=true'
+}
+
 Step 'POST /admin/accounts/balance-query 查询总余额并拆分来源' {
   $r = Api POST '/admin/accounts/balance-query' -Session $superSession -Csrf $superCsrf -Expect 200
   $d = $r.Data.data
@@ -532,6 +669,11 @@ Step '管理员访问 /admin/keys 被 403' {
 
 Step '管理员访问 /admin/users 被 403' {
   $r = Api GET '/admin/users' -Session $adminSession -Expect 403
+  'HTTP 403'
+}
+
+Step '管理员访问 /admin/scripts/validate 被 403' {
+  $r = Api POST '/admin/scripts/validate' @{ script = '({ request: { url: "https://x.com", method: "GET" }, extractor: function (r) { return { remaining: 1 }; } })' } -Session $adminSession -Csrf $adminCsrf -Expect 403
   'HTTP 403'
 }
 

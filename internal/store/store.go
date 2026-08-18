@@ -48,7 +48,7 @@ func defaultKeyFile(dataFile string) string {
 
 func newData() *Data {
 	data := &Data{
-		Version:         6,
+		Version:         7,
 		Config:          Config{Strategy: "weighted-random", MaxRetries: 3, CreatedAt: time.Now().UTC()},
 		Groups:          []*Group{},
 		Accounts:        []*Account{},
@@ -132,8 +132,9 @@ func (s *Store) normalizeLocked() {
 	// v6 引入本地 token 计量、手动余额与自定义端点：旧账号一律按「不计价」迁移，
 	// 余额来源与行为保持原样，避免升级后突然开始扣本地余额。
 	legacyBilling := data.Version < 6
-	if data.Version < 6 {
-		data.Version = 6
+	// v7 引入查询脚本与自定义额度查询地址：旧账号两者都为空，行为完全不变。
+	if data.Version < 7 {
+		data.Version = 7
 	}
 	if data.Config.Users == nil {
 		data.Config.Users = []*AdminUser{}
@@ -278,6 +279,13 @@ func (s *Store) unsealLocked() error {
 			return fmt.Errorf("解密账号访问令牌失败 (%s): %w", account.Name, err)
 		}
 		account.AccessToken = plaintext
+		scriptSource, err := s.cipher.Open(account.SealedQueryScript)
+		if err != nil {
+			return fmt.Errorf("解密账号额度查询脚本失败 (%s): %w", account.Name, err)
+		}
+		account.QueryScript = scriptSource
+		// 编译失败不阻断启动：错误写进 ScriptError 供界面提示，该账号退回无脚本状态。
+		_ = account.CompileQueryScript()
 	}
 	for _, key := range s.data.Keys {
 		plaintext, err := s.cipher.Open(key.SealedKey)
@@ -674,15 +682,23 @@ func (s *Store) sealLocked() error {
 		provider.sealedFrom = provider.APIKey
 	}
 	for _, account := range s.data.Accounts {
-		if account.sealedFrom == account.AccessToken && security.IsSealed(account.SealedAccessToken) {
-			continue
+		if account.sealedFrom != account.AccessToken || !security.IsSealed(account.SealedAccessToken) {
+			sealed, err := s.cipher.Seal(account.AccessToken)
+			if err != nil {
+				return err
+			}
+			account.SealedAccessToken = sealed
+			account.sealedFrom = account.AccessToken
 		}
-		sealed, err := s.cipher.Seal(account.AccessToken)
-		if err != nil {
-			return err
+		// 查询脚本与访问令牌同等对待：脚本里常被写进硬编码令牌，明文落盘等于白加密。
+		if account.sealedScriptFrom != account.QueryScript || !security.IsSealed(account.SealedQueryScript) {
+			sealed, err := s.cipher.Seal(account.QueryScript)
+			if err != nil {
+				return err
+			}
+			account.SealedQueryScript = sealed
+			account.sealedScriptFrom = account.QueryScript
 		}
-		account.SealedAccessToken = sealed
-		account.sealedFrom = account.AccessToken
 	}
 	for _, key := range s.data.Keys {
 		if key.sealedFrom == key.Key && security.IsSealed(key.SealedKey) {

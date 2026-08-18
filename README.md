@@ -197,6 +197,8 @@ curl http://127.0.0.1:8787/v1/responses \
 | 手动配置余额 | 开启后本账号不依赖上游额度接口，由初始余额减本站自算消耗得出当前余额 |
 | 初始余额 | 手动余额模式下的起始额度（USD） |
 | 请求地址 | 额度查询站点，留空复用 Base URL（默认 `https://api.newapi.com`） |
+| 额度查询完整地址 | 选填，额度接口不在 Base URL 同源时填这里；填了会替代脚本里的 `{{baseUrl}}`，内置查询也改用它。没有额度接口就留空 |
+| 查询脚本 | 选填，一段 `({ request, extractor })` 配置，用来对接任意非 New API 站点；填了它就不再走内置查询路径 |
 | 访问令牌 | New API「个人设置 → 安全设置」生成的 access_token |
 | 用户 ID | New API 里的数字用户 ID，例如 `114514` |
 | 超时时间 | 额度查询超时秒数，1–120，默认 10 |
@@ -215,7 +217,7 @@ curl http://127.0.0.1:8787/v1/responses \
 与 `pointerup` 都落在遮罩上且没有选区），已填的内容不会因为选文本而丢失。
 输入法组字时按 Esc 只取消候选词，不关弹窗。
 
-**既没配额度查询、也没开手动余额的账号显示「∞ 无限余额」**：既不参与金额汇总（避免 0 余额把总额拉低），
+**既没配额度查询（内置凭据或查询脚本）、也没开手动余额的账号显示「∞ 无限余额」**：既不参与金额汇总（避免 0 余额把总额拉低），
 也不会被余额清理逻辑删掉，刷新时直接返回无限结果、不打上游。
 开了手动余额的账号即使没有上游查询接口也**不算无限**：点刷新返回本地余额视图，扣到下限同样自动暂停。
 
@@ -273,11 +275,13 @@ curl http://127.0.0.1:8787/v1/responses \
 
 ## 余额查询与刷新
 
-查询按顺序尝试（对应 New API 的两种脚本）：
+账号填了**查询脚本**时一律走脚本（见下一节）。没填脚本时走内置的 New API 路径，按顺序尝试：
 
 1. `GET {请求地址}/api/status` 读 `quota_per_unit`（实测 `500000`，即 500000 quota = 1 USD）。
 2. `GET {请求地址}/api/user/self`，带 `Authorization: Bearer {accessToken}`、`New-Api-User: {userId}`，用 `quota / quota_per_unit` 得余额，`used_quota / quota_per_unit` 得已消耗，`group` 作为套餐名。
 3. 访问令牌不可用时回落 `POST {请求地址}/api/usage`（带 `Authorization: Bearer {上游 API Key}`），用 `balance` 作为余额。
+
+填了「额度查询完整地址」时，上面第 2、3 步也改用这个地址，不再按请求地址拼后缀。
 
 三种刷新时机：
 
@@ -290,6 +294,72 @@ curl http://127.0.0.1:8787/v1/responses \
 **请求时刷新**是防止「单账号余额用完还不切号」的关键：`Authenticate` 挑到账号后若数据过期就先刷新，
 刷新后判定不可用（余额耗尽或已被自动暂停）就重新挑号，最多试 3 个账号，全不可用返回 503。
 查询失败视为「仍可用」——网络抖动不该把正常账号踢出池子。
+
+### 自定义查询脚本
+
+不是所有站点都长成 New API 的样子，所以账号可以自带一段查询脚本，形态与 cc-switch 一致：
+
+```js
+({
+  request: {
+    url: "{{baseUrl}}/api/user/self",
+    method: "GET",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer {{accessToken}}",
+      "New-Api-User": "{{userId}}"
+    },
+  },
+  extractor: function (response) {
+    if (response.success && response.data) {
+      return {
+        planName: response.data.group || "默认套餐",
+        remaining: response.data.quota / 500000,
+        used: response.data.used_quota / 500000,
+        total: (response.data.quota + response.data.used_quota) / 500000,
+        unit: "USD",
+      };
+    }
+    return { isValid: false, invalidMessage: response.message || "查询失败" };
+  },
+})
+```
+
+可用变量 `{{baseUrl}}`、`{{apiKey}}`、`{{accessToken}}`、`{{userId}}`；
+填了「额度查询完整地址」时 `{{baseUrl}}` 取该地址，否则取「请求地址」（再回落 Base URL）。
+`request.body` 写成对象会被序列化成 JSON 并自动补 `Content-Type`。
+
+`extractor` 的返回字段全部可选：
+
+| 字段 | 含义 |
+| --- | --- |
+| `isValid` | 套餐是否有效；为 `false` 时整次查询按失败处理 |
+| `invalidMessage` | 失效原因，会显示在账号行与弹窗里 |
+| `remaining` | 剩余额度，参与耗尽判定与总余额汇总 |
+| `total` / `used` | 总额与已用；只给这两项时剩余额度按 `total - used` 推算 |
+| `unit` | 币种，默认 `USD` |
+| `planName` | 套餐名 |
+| `extra` | 自由文本，原样显示 |
+
+一个字段都不给数值时按**查询失败**处理，而不是把余额写成 0——
+否则脚本写得不全会让账号被误判欠费并暂停。
+
+**沙箱边界**（`internal/script`，纯 Go 实现的 JS 子集解释器，无第三方依赖）：
+
+- 白名单全局只有 `Math` / `JSON` / `Object` / `Array` / `Number` / `String` / `Boolean` / `parseInt` / `parseFloat` / `isNaN`。
+  **没有**网络、文件、时间、随机数，也没有 `require` / `import` / `eval` / `Function` / `fetch` / `process` / `globalThis` / `new` / `class` / `async`。
+- 语法支持到 ES2020 常用子集：箭头函数、模板字符串、`?.`、`??`、`for...of`、`map/filter/reduce/sort` 等。
+- 硬上限：源码 16 KB、语法节点 4000、执行步数 200000、单字符串 1 MB、数组长度 100000。超限即报错，不会拖住刷新。
+- 实际的 HTTP 请求由宿主发出，脚本只声明「请求怎么发、响应怎么读」，因此拿不到 `request` 之外的任何地址。
+- 每次查询都在全新作用域里重新求值顶层表达式，多个账号并发查询不共享任何可变状态。
+- 脚本与访问令牌同级加密落盘（`queryScript` 字段是 `enc.v1.` 密文），保存后**不回显**：里面常被写进硬编码令牌。
+
+创建账号弹窗里的「校验脚本」按钮走 `POST /admin/scripts/validate`：只做解析与模板替换，
+回显最终的方法、地址与请求头（凭据遮蔽成 `tok****89`），**不会真的发请求**。
+账号保存后配置不可回显，所以脚本必须在提交前就验证——写错一个字段否则只能靠删号重建来发现。
+
+看板与「查询总余额」报告里，脚本查询到的余额计入「上游查询得到」这一档；
+`accounts.scripted` 是脚本账号数，`accounts.scriptBroken` 是脚本编译失败的账号数（这些账号按无限额度处理，不会被误判欠费）。
 
 ### 上游被 WAF 拦下时
 
@@ -370,7 +440,7 @@ Go 默认的 `Go-http-client/1.1` 会被 Cloudflare 一类的 WAF 直接判成�
 | GET / POST | `/admin/accounts` | 列表（含移除记录与汇总）/ 创建 |
 | GET | `/admin/accounts/totals` | 全站汇总 |
 | POST | `/admin/accounts/refresh-all` | 刷新全部账号余额 |
-| POST | `/admin/accounts/balance-query` | 查询总余额：先刷新全部账号，再返回按来源拆分的汇总与失败计数 |
+| POST | `/admin/accounts/balance-query` | 查询总余额：先刷新全部账号，再返回按来源拆分的汇总与失败计数（含脚本查询口径） |
 | DELETE | `/admin/accounts/batch` | 批量删除（体 `{"ids":[...]}`） |
 | GET | `/admin/accounts/{id}` 或 `/balance` | 只读余额视图 |
 | POST | `/admin/accounts/{id}/refresh` | 手动刷新单个账号 |
@@ -390,7 +460,8 @@ Go 默认的 `Go-http-client/1.1` 会被 Cloudflare 一类的 WAF 直接判成�
 
 `POST /admin/setup`（免鉴权，仅未初始化时可用）、`POST /admin/login`、`POST /admin/logout`、
 `GET /admin/session`、`POST /admin/password`、`GET /admin/dashboard`、
-`GET|PATCH /admin/settings`、`POST /admin/models/probe`（拉上游模型列表）
+`GET|PATCH /admin/settings`、`POST /admin/models/probe`（拉上游模型列表）、
+`POST /admin/scripts/validate`（校验额度查询脚本，只解析不发请求）
 
 除 `/admin/setup` / `login` / `logout` / `session` 外全部要求登录；
 `/admin/password` 与 `/admin/dashboard` 对两种角色开放，其余全部要求超管。
@@ -487,7 +558,7 @@ go vet ./...
 go test ./... -count=1
 ```
 
-接口级冒烟，57 项断言（Windows；会重置本地数据并留下一套演示数据）：
+接口级冒烟，64 项断言（Windows；会重置本地数据并留下一套演示数据）：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-local.ps1

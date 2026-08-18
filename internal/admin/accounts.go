@@ -48,6 +48,8 @@ type accountPayload struct {
 	KeyList   any    `json:"keyList"`
 	Selected  any    `json:"selectedModels"`
 	TimeoutMS any    `json:"timeoutMs"`
+	// Script 是 balanceScript 的别名，容忍界面早期字段名。
+	Script string `json:"balanceScript"`
 }
 
 func (h *Handler) createAccount(w http.ResponseWriter, r *http.Request) {
@@ -60,6 +62,9 @@ func (h *Handler) createAccount(w http.ResponseWriter, r *http.Request) {
 	input := payload.AccountInput
 	if input.Models == nil {
 		input.Models = payload.Selected
+	}
+	if strings.TrimSpace(input.QueryScript) == "" {
+		input.QueryScript = payload.Script
 	}
 	account, verr := store.BuildAccount(input)
 	if verr != nil {

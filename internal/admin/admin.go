@@ -63,6 +63,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/accounts", h.super(h.handleAccountCollection))
 	mux.HandleFunc("/admin/accounts/", h.super(h.handleAccountItem))
 	mux.HandleFunc("/admin/models/probe", h.super(h.handleModelProbe))
+	mux.HandleFunc("/admin/scripts/validate", h.super(h.handleScriptValidate))
 	mux.HandleFunc("/admin/keys", h.super(h.handleKeyCollection))
 	mux.HandleFunc("/admin/keys/", h.super(h.handleKeyItem))
 }

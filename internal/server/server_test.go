@@ -2551,3 +2551,171 @@ func TestSetupPasswordWithWhitespaceLogsIn(t *testing.T) {
 		t.Fatalf("初始化后应可登录: %d %#v", response.StatusCode, body)
 	}
 }
+
+// TestScriptValidateEndpoint 覆盖脚本校验端点：保存后账号配置不可回显，
+// 因此脚本必须在提交前就能验证，而校验不能真的发请求、也不能回显凭据原文。
+func TestScriptValidateEndpoint(t *testing.T) {
+	h := newHarness(t)
+	balanceScript := `({
+  request: {
+    url: "{{baseUrl}}/console/quota",
+    method: "GET",
+    headers: { "X-Token": "{{accessToken}}" }
+  },
+  extractor: function (response) {
+    if (!response.ok) {
+      return { isValid: false, invalidMessage: response.reason };
+    }
+    return {
+      planName: response.plan,
+      remaining: response.left,
+      used: response.spent,
+      unit: "USD",
+      extra: "节点 " + response.node
+    };
+  }
+})`
+
+	response, body := h.admin(http.MethodPost, "/admin/scripts/validate", map[string]any{
+		"script":      balanceScript,
+		"queryUrl":    "https://console.example.com",
+		"accessToken": "tok-abcdef123456",
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("校验请求失败: %d %#v", response.StatusCode, body)
+	}
+	data := body["data"].(map[string]any)
+	if data["ok"] != true {
+		t.Fatalf("合法脚本应校验通过: %#v", data)
+	}
+	if data["url"] != "https://console.example.com/console/quota" || data["method"] != "GET" {
+		t.Fatalf("回显的请求信息错误: %#v", data)
+	}
+	if data["hasBody"] != false {
+		t.Fatalf("GET 脚本不应有请求体: %#v", data)
+	}
+	headers := data["headers"].(map[string]any)
+	if token, _ := headers["X-Token"].(string); !strings.Contains(token, "****") || strings.Contains(token, "abcdef") {
+		t.Fatalf("凭据应遮蔽后回显: %#v", headers)
+	}
+
+	_, bad := h.admin(http.MethodPost, "/admin/scripts/validate", map[string]any{
+		"script": "({ request: { url: \"{{baseUrl}}/x\", method: \"GET\" } })",
+	})
+	badData := bad["data"].(map[string]any)
+	if badData["ok"] != false {
+		t.Fatalf("缺少 extractor 应校验失败: %#v", badData)
+	}
+	if message, _ := badData["error"].(string); !strings.Contains(message, "extractor") {
+		t.Fatalf("应说明缺少 extractor: %#v", badData)
+	}
+
+	// 危险脚本必须在校验阶段就被拒绝，而不是等到真正查询时。
+	_, danger := h.admin(http.MethodPost, "/admin/scripts/validate", map[string]any{
+		"script": "({ request: { url: require('http') } })",
+	})
+	if danger["data"].(map[string]any)["ok"] != false {
+		t.Fatalf("危险脚本应被拒绝: %#v", danger)
+	}
+}
+
+// TestScriptedAccountQueriesBalance 覆盖「用脚本查站点总余额」的完整链路：
+// 创建时立刻查一次、余额进入看板汇总、脚本源码不回显。
+func TestScriptedAccountQueriesBalance(t *testing.T) {
+	h := newHarness(t)
+	hits := []string{}
+	upstream := fakeUpstream(t, &hits)
+
+	var gotPath, gotToken string
+	left := 6.5
+	console := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotToken = r.Header.Get("X-Token")
+		_, _ = fmt.Fprintf(w, `{"ok":true,"plan":"pro","left":%f,"spent":3.5,"node":"hk-1"}`, left)
+	}))
+	t.Cleanup(console.Close)
+
+	balanceScript := `({
+  request: {
+    url: "{{baseUrl}}/console/quota",
+    method: "GET",
+    headers: { "X-Token": "{{accessToken}}" }
+  },
+  extractor: function (response) {
+    if (!response.ok) {
+      return { isValid: false, invalidMessage: response.reason };
+    }
+    return {
+      planName: response.plan,
+      remaining: response.left,
+      used: response.spent,
+      unit: "USD",
+      extra: "节点 " + response.node
+    };
+  }
+})`
+
+	groupID := h.createGroup("脚本组")
+	response, body := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":        "scripted",
+		"groupId":     groupID,
+		"baseUrl":     upstream.URL + "/v1",
+		"queryUrl":    console.URL,
+		"accessToken": "tok-console",
+		"queryScript": balanceScript,
+		"keys":        "sk-s1\nsk-s2",
+	})
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("创建脚本账号失败: %d %#v", response.StatusCode, body)
+	}
+	account := body["data"].(map[string]any)
+	if gotPath != "/console/quota" || gotToken != "tok-console" {
+		t.Fatalf("脚本请求未按配置发出: %q %q", gotPath, gotToken)
+	}
+	if account["balance"].(float64) != 6.5 || account["usedAmount"].(float64) != 3.5 {
+		t.Fatalf("脚本余额未写入账号: %#v", account)
+	}
+	if account["planName"] != "pro" || account["balanceExtra"] != "节点 hk-1" {
+		t.Fatalf("脚本附加信息未写入: %#v", account)
+	}
+	if account["hasQueryScript"] != true || account["hasQueryUrl"] != true {
+		t.Fatalf("应标记脚本与查询地址已配置: %#v", account)
+	}
+	if account["unlimited"] != false || account["hasBalanceQuery"] != true {
+		t.Fatalf("配了脚本就不该按无限额度处理: %#v", account)
+	}
+	if account["checkError"] != "" {
+		t.Fatalf("脚本查询不应报错: %#v", account["checkError"])
+	}
+	for field, value := range account {
+		if text, ok := value.(string); ok && strings.Contains(text, "extractor") {
+			t.Fatalf("字段 %s 泄露了脚本源码", field)
+		}
+	}
+
+	// 站点总余额查询：脚本账号要计入「上游查询得到」这一口径。
+	_, total := h.admin(http.MethodPost, "/admin/accounts/balance-query", nil)
+	totals := total["data"].(map[string]any)["totals"].(map[string]any)
+	accounts := totals["accounts"].(map[string]any)
+	if int(accounts["scripted"].(float64)) != 1 || int(accounts["queried"].(float64)) != 1 {
+		t.Fatalf("看板应统计脚本查询账号: %#v", accounts)
+	}
+	if int(accounts["scriptBroken"].(float64)) != 0 || int(accounts["unlimited"].(float64)) != 0 {
+		t.Fatalf("脚本正常时不应计入异常或无限额度: %#v", accounts)
+	}
+	balance := totals["balance"].(map[string]any)
+	if balance["queriedBalance"].(float64) != 6.5 || balance["total"].(float64) != 6.5 {
+		t.Fatalf("脚本余额应计入站点总余额: %#v", balance)
+	}
+
+	// 余额掉到下限以下时照常自动暂停，脚本口径与内置口径行为一致。
+	left = 0.2
+	if response, _ := h.admin(http.MethodPost, "/admin/accounts/refresh-all", nil); response.StatusCode != http.StatusOK {
+		t.Fatalf("刷新失败: %d", response.StatusCode)
+	}
+	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
+	suspended := findAccount(list["data"].([]any), account["id"].(string))
+	if suspended == nil || suspended["suspended"] != true {
+		t.Fatalf("余额触及下限应自动暂停: %#v", suspended)
+	}
+}

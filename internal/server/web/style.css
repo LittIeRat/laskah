@@ -383,6 +383,40 @@ label .req {
   user-select: text;
 }
 
+/* 校验成功态：复用 .inline-error 的排版，只换配色。 */
+.inline-error.inline-ok {
+  background: rgba(48, 209, 88, 0.12);
+  border-color: rgba(48, 209, 88, 0.32);
+  color: var(--badge-good);
+}
+
+/* 脚本工具条：按钮与示例下拉并排，下拉不再独占一行。 */
+.script-toolbar {
+  margin-top: 10px;
+  margin-bottom: 10px;
+  gap: 8px;
+}
+
+.script-toolbar select {
+  width: auto;
+  min-width: 200px;
+  flex: 0 1 260px;
+  padding: 7px 11px;
+  font-size: 13px;
+}
+
+/* 脚本编辑框：等宽、保留缩进、可横向滚动。 */
+.code-area {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre;
+  tab-size: 2;
+  overflow: auto;
+  min-height: 180px;
+  resize: vertical;
+}
+
 input,
 select,
 textarea {

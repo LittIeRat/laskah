@@ -51,7 +51,9 @@
       "账号总余额",
       balanceText,
       (account.enabled || 0) + " 个可用账号" + (unlimited ? " · " + unlimited + " 个无限额度" : "") +
-      ((account.suspended || 0) ? " · " + account.suspended + " 个已暂停" : ""),
+      ((account.suspended || 0) ? " · " + account.suspended + " 个已暂停" : "") +
+      ((account.scripted || 0) ? " · " + account.scripted + " 个脚本查询" : "") +
+      ((account.scriptBroken || 0) ? " · " + account.scriptBroken + " 个脚本异常" : ""),
       "accent"
     ));
     grid.appendChild(LB.stat("累计消耗金额", LB.fmtMoney(balance.lifetime, balance.currency), "含已删除账号 " + LB.fmtMoney(balance.removedUsed, balance.currency)));
@@ -481,13 +483,15 @@
         "总余额（可计金额账号合计）  " + LB.fmtMoney(balance.total, balance.currency),
         "  ├ 上游查询得到          " + LB.fmtMoney(balance.queriedBalance, balance.currency) + "   " + (account.queried || 0) + " 个账号",
         "  └ 手动余额本地扣减      " + LB.fmtMoney(balance.manualAmount, balance.currency) + "   " + (account.manualBalance || 0) + " 个账号",
-        "无限额度账号              " + (account.unlimited || 0) + " 个（不计入总额）",
+        "无限额度账号              " + (account.unlimited || 0) + " 个（未配额度查询，按无限计）",
+        "脚本查询账号              " + (account.scripted || 0) + " 个" + ((account.scriptBroken || 0) ? " · 脚本编译失败 " + account.scriptBroken + " 个（按无限额度处理）" : ""),
         "累计消耗金额              " + LB.fmtMoney(balance.lifetime, balance.currency) + "（含已删除账号 " + LB.fmtMoney(balance.removedUsed, balance.currency) + "）",
         "本站自算消耗金额          " + LB.fmtMoney(balance.localCost, balance.currency),
         "消耗 tokens（本站自算）   " + LB.fmtNumber(token.lifetime) + "（上游自报 " + LB.fmtNumber(token.upstream) + "）",
         "",
         "本次查询 " + (data.queried || 0) + " 个账号 · 失败 " + (data.failed || 0) + " 个 · 暂停 " + (data.suspended || 0) + " 个 · 删除 " + (data.deleted || 0) + " 个",
         (data.failed ? "失败账号沿用上次余额，总额可能偏高，请在「分组与账号」里单独复查。" : "全部账号查询成功，总额为最新值。"),
+        "「上游查询得到」已包含内置 New API 查询与自定义脚本查询两种口径。",
         "统计时间 " + LB.fmtTime(new Date().toISOString())
       ];
       box.hidden = false;

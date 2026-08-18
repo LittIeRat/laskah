@@ -336,6 +336,7 @@ func (d *Data) GroupSummary(groupID string) map[string]any {
 	unlimitedNum := 0
 	suspendedNum := 0
 	manualNum := 0
+	scriptedNum := 0
 	queriedBalance := 0.0
 	manualAmount := 0.0
 	for _, account := range d.Accounts {
@@ -345,6 +346,9 @@ func (d *Data) GroupSummary(groupID string) map[string]any {
 		accountNum++
 		if account.Suspended {
 			suspendedNum++
+		}
+		if account.HasQueryScript() {
+			scriptedNum++
 		}
 		if account.HasManualBalance() {
 			manualNum++
@@ -408,6 +412,7 @@ func (d *Data) GroupSummary(groupID string) map[string]any {
 		"suspended":        suspendedNum,
 		"unlimited":        unlimitedNum,
 		"manualBalance":    manualNum,
+		"scripted":         scriptedNum,
 		"apiCount":         apiCount,
 		"keys":             keyCount,
 		"currency":         "USD",
@@ -437,6 +442,8 @@ func (d *Data) AccountTotals() map[string]any {
 	queriedBalance := 0.0
 	manualAmount := 0.0
 	queriedNum := 0
+	scriptedNum := 0
+	scriptBroken := 0
 	var checkedAt *time.Time
 	staleNum := 0
 	for _, account := range d.Accounts {
@@ -447,6 +454,12 @@ func (d *Data) AccountTotals() map[string]any {
 			balance += account.Balance
 			usedAmount += account.UsedAmount
 			totalAmount += account.TotalAmount
+		}
+		if account.HasQueryScript() {
+			scriptedNum++
+		}
+		if account.ScriptError != "" {
+			scriptBroken++
 		}
 		if account.HasManualBalance() {
 			manualBalance++
@@ -520,6 +533,8 @@ func (d *Data) AccountTotals() map[string]any {
 			"unlimited":     unlimited,
 			"manualBalance": manualBalance,
 			"queried":       queriedNum,
+			"scripted":      scriptedNum,
+			"scriptBroken":  scriptBroken,
 			"neverChecked":  staleNum,
 			"removed":       len(d.RemovedAccounts),
 			"apiCount":      apiCount,

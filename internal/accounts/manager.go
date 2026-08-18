@@ -46,11 +46,11 @@ func New(dataStore *store.Store, client *wallet.Client) *Manager {
 //
 // 未配置额度查询的账号按无限余额处理，直接返回而不产生任何上游请求。
 func (m *Manager) Refresh(ctx context.Context, id string) map[string]any {
-	creds, name, found := m.credentials(id)
+	creds, name, found, queryable := m.credentials(id)
 	if !found {
 		return nil
 	}
-	if creds.AccessToken == "" || creds.UserID == "" {
+	if !queryable {
 		// 手动余额账号的数字完全由本地计费维护，不存在可查询的上游额度接口，
 		// 因此直接回报当前本地状态，而不是谎称“无限余额”。
 		if local := m.localResult(id, name); local != nil {
@@ -111,11 +111,16 @@ func unlimitedResult(id, name string) map[string]any {
 	}
 }
 
-func (m *Manager) credentials(id string) (wallet.Credentials, string, bool) {
+// credentials 取出账号的查询配置。
+//
+// queryable 表示这个账号到底能不能查额度：脚本或内置凭据任一具备即为真。
+// 判定放在这里而不是让调用方看字段，避免「有脚本但没令牌」被误当成无限额度。
+func (m *Manager) credentials(id string) (wallet.Credentials, string, bool, bool) {
 	var (
-		creds wallet.Credentials
-		name  string
-		found bool
+		creds     wallet.Credentials
+		name      string
+		found     bool
+		queryable bool
 	)
 	m.Store.View(func(data *store.Data) {
 		account := data.FindAccount(id)
@@ -124,15 +129,14 @@ func (m *Manager) credentials(id string) (wallet.Credentials, string, bool) {
 		}
 		found = true
 		name = account.Name
+		queryable = account.HasBalanceQuery()
 
-		base := account.SiteURL
-		if base == "" {
-			base = account.BaseURL
-		}
 		creds = wallet.Credentials{
-			BaseURL:     base,
+			BaseURL:     account.QueryBase(),
 			UserID:      account.UserID,
 			AccessToken: account.AccessToken,
+			QueryURL:    account.QueryURL,
+			Script:      account.QueryProgram(),
 			Timeout:     account.QueryTimeout(),
 		}
 		for _, provider := range data.AccountProviders(account.ID) {
@@ -142,7 +146,7 @@ func (m *Manager) credentials(id string) (wallet.Credentials, string, bool) {
 			}
 		}
 	})
-	return creds, name, found
+	return creds, name, found, queryable
 }
 
 func (m *Manager) apply(id, name string, snapshot wallet.Snapshot) map[string]any {
@@ -183,12 +187,21 @@ func (m *Manager) apply(id, name string, snapshot wallet.Snapshot) map[string]an
 		}
 
 		account.CheckError = ""
-		account.Balance = snapshot.Balance
-		account.UsedAmount = snapshot.UsedAmount
-		account.TotalAmount = snapshot.TotalAmount
+		// 脚本可能只返回一部分字段：没返回的一律保留旧值，
+		// 否则一个只回报 remaining 的脚本会把已用金额抹成 0。
+		if snapshot.HasBalance || snapshot.Source != "script" {
+			account.Balance = snapshot.Balance
+		}
+		if snapshot.HasUsed || snapshot.Source != "script" {
+			account.UsedAmount = snapshot.UsedAmount
+		}
+		if snapshot.HasTotal || snapshot.Source != "script" {
+			account.TotalAmount = snapshot.TotalAmount
+		}
 		if snapshot.PlanName != "" {
 			account.PlanName = snapshot.PlanName
 		}
+		account.BalanceExtra = snapshot.Extra
 		account.BalanceFrom = snapshot.Source
 		account.UpdatedAt = time.Now().UTC()
 		balance = account.Balance
@@ -328,12 +341,12 @@ func (m *Manager) refreshMany(ctx context.Context, ids []string) []any {
 			gate <- struct{}{}
 			defer func() { <-gate }()
 
-			creds, name, found := m.credentials(accountID)
+			creds, name, found, queryable := m.credentials(accountID)
 			if !found {
 				return
 			}
 			// 无上游额度接口的账号不发网络请求：手动余额走本地视图，其余按无限额度跳过。
-			if creds.AccessToken == "" || creds.UserID == "" {
+			if !queryable {
 				outcomes[slot] = outcome{id: accountID, name: name, found: true, unlimited: true}
 				return
 			}

@@ -3,6 +3,8 @@ package store
 import (
 	"strings"
 	"time"
+
+	"laskah/internal/script"
 )
 
 // MaxKeysPerAccount 限制单个账号最多绑定的上游 API 数量。
@@ -104,6 +106,22 @@ type Account struct {
 	SiteURL string `json:"siteUrl"`
 	BaseURL string `json:"baseUrl"`
 
+	// QueryURL 是额度查询的完整请求地址，留空表示按站点地址推导默认端点。
+	//
+	// 有些上游把额度接口挂在与推理地址完全无关的路径甚至域名上，
+	// 「base url + 固定后缀」的约定在那里不成立，因此允许直接填完整地址。
+	QueryURL string `json:"queryUrl"`
+
+	// QueryScript 是管理员自填的额度查询脚本（cc-switch 形态），空串表示不使用脚本。
+	//
+	// 只存在于内存，落盘时写入 SealedQueryScript 密文：脚本里可能被写进硬编码令牌，
+	// 与访问令牌同等对待才不会出现「凭据加密了但脚本明文躺在数据文件里」。
+	QueryScript       string `json:"-"`
+	SealedQueryScript string `json:"queryScript"`
+
+	// ScriptError 记录脚本编译失败的原因，仅供界面提示。
+	ScriptError string `json:"scriptError"`
+
 	// 额度查询凭据。
 	UserID            string `json:"userId"`
 	AccessToken       string `json:"-"`
@@ -162,6 +180,9 @@ type Account struct {
 	CheckedAt    *time.Time `json:"checkedAt"`
 	CheckError   string     `json:"checkError"`
 
+	// BalanceExtra 是脚本 extractor 返回的 extra 文本，用于展示自定义信息。
+	BalanceExtra string `json:"balanceExtra"`
+
 	Models    []string     `json:"models"`
 	Note      string       `json:"note"`
 	CreatedAt time.Time    `json:"createdAt"`
@@ -169,6 +190,64 @@ type Account struct {
 	Stats     AccountStats `json:"stats"`
 
 	sealedFrom string
+	// sealedScriptFrom 与 sealedFrom 同理，用于跳过未变更脚本的重复加密。
+	sealedScriptFrom string
+	// program 是编译后的查询脚本，随 QueryScript 一起更新。
+	program *script.Program
+}
+
+// SetQueryScript 编译并写入查询脚本，空串表示清除脚本。
+//
+// 编译在这里完成而不是查询时：语法错误必须在保存阶段就被拒绝，
+// 否则要等到下一次额度查询才发现脚本根本跑不起来。
+func (a *Account) SetQueryScript(source string) error {
+	trimmed := strings.TrimSpace(source)
+	if trimmed == "" {
+		a.QueryScript = ""
+		a.ScriptError = ""
+		a.program = nil
+		return nil
+	}
+	program, err := script.Parse(trimmed)
+	if err != nil {
+		return err
+	}
+	a.QueryScript = trimmed
+	a.ScriptError = ""
+	a.program = program
+	return nil
+}
+
+// CompileQueryScript 重新编译已持久化的脚本，供加载数据后调用。
+//
+// 编译失败时保留源码但记录原因：直接丢弃脚本会让管理员在界面上
+// 看到「没配置查询」而不是「脚本坏了」，反而更难排查。
+func (a *Account) CompileQueryScript() error {
+	trimmed := strings.TrimSpace(a.QueryScript)
+	if trimmed == "" {
+		a.program = nil
+		a.ScriptError = ""
+		return nil
+	}
+	program, err := script.Parse(trimmed)
+	if err != nil {
+		a.program = nil
+		a.ScriptError = err.Error()
+		return err
+	}
+	a.program = program
+	a.ScriptError = ""
+	return nil
+}
+
+// QueryProgram 返回已编译的查询脚本，未配置或编译失败时为 nil。
+func (a *Account) QueryProgram() *script.Program {
+	return a.program
+}
+
+// HasQueryScript 判断账号是否配置了可用的查询脚本。
+func (a *Account) HasQueryScript() bool {
+	return a.program != nil
 }
 
 // RemovedAccount 记录被自动清理的账号，便于界面回溯。
@@ -194,6 +273,8 @@ type AccountInput struct {
 	BaseURL           string `json:"baseUrl"`
 	UserID            any    `json:"userId"`
 	AccessToken       string `json:"accessToken"`
+	QueryURL          string `json:"queryUrl"`
+	QueryScript       string `json:"queryScript"`
 	TimeoutSeconds    any    `json:"timeoutSeconds"`
 	QueryIntervalMin  any    `json:"queryIntervalMin"`
 	RefreshOnRequest  *bool  `json:"refreshOnRequest"`
@@ -278,6 +359,13 @@ func BuildAccount(input AccountInput) (*Account, *ValidationError) {
 		verr.Errorf("用户名称不能为空")
 	}
 
+	// 额度查询地址同样要求完整地址，但允许留空：
+	// 不少自建上游根本没有额度接口，强制填写只会逼人瞎填。
+	queryURL, ok := FullEndpoint(input.QueryURL)
+	if !ok {
+		verr.Errorf("额度查询地址需要填写完整地址（以 http:// 或 https:// 开头），不查额度可留空")
+	}
+
 	// 自定义端点必须是完整地址：填了却不是绝对 URL 就直接报错，
 	// 否则会被拼到 base url 后面，产出一个谁都没预期的地址。
 	endpoints := Paths{}
@@ -341,6 +429,18 @@ func BuildAccount(input AccountInput) (*Account, *ValidationError) {
 		verr.Errorf("启用手动余额时必须选择按量或按次计价，否则余额永远不会扣减")
 	}
 
+	// 查询脚本先编译一遍：语法或结构错误必须在创建阶段就退回，
+	// 否则账号会带着一段永远跑不起来的脚本进入分配池。
+	var queryProgram *script.Program
+	if trimmedScript := strings.TrimSpace(input.QueryScript); trimmedScript != "" {
+		program, scriptErr := script.Parse(trimmedScript)
+		if scriptErr != nil {
+			verr.Errorf("额度查询脚本无效: %s", scriptErr.Error())
+		} else {
+			queryProgram = program
+		}
+	}
+
 	if verr.HasErrors() {
 		return nil, verr
 	}
@@ -376,6 +476,9 @@ func BuildAccount(input AccountInput) (*Account, *ValidationError) {
 		QueryIntervalMin:  int(intervalMin),
 		RefreshOnRequest:  refreshOnRequest,
 		RequestRefreshSec: int(requestRefreshSec),
+		QueryURL:          queryURL,
+		QueryScript:       scriptSource(queryProgram),
+		program:           queryProgram,
 		Endpoints:         endpoints,
 		BillingMode:       billingMode,
 		PricePerMToken:    pricePerMToken,
@@ -394,6 +497,14 @@ func BuildAccount(input AccountInput) (*Account, *ValidationError) {
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}, nil
+}
+
+// scriptSource 返回脚本源码，未配置脚本时为空串。
+func scriptSource(program *script.Program) string {
+	if program == nil {
+		return ""
+	}
+	return program.Source()
 }
 
 // BuildGroup 校验并生成用户分组。
@@ -632,12 +743,29 @@ func (d *Data) RemoveAccounts(ids []string, reason string) []RemovedAccount {
 	return removed
 }
 
-// HasBalanceQuery 判断账号是否配置了余额查询凭据。
+// HasBalanceQuery 判断账号是否配置了余额查询方式。
 //
-// 未配置时余额无从上游得知；若也没有启用手动余额，就按“无限额度”处理，
+// 两条路径任一成立即算已配置：内置的 New API 凭据（访问令牌 + 用户 ID），
+// 或者管理员自填的查询脚本。都没有且未启用手动余额时按“无限额度”处理，
 // 既不判定耗尽，也不做请求时刷新，避免把没有额度概念的自建上游误停。
 func (a *Account) HasBalanceQuery() bool {
+	return a.HasQueryScript() || a.HasBuiltinQuery()
+}
+
+// HasBuiltinQuery 判断是否配置了内置 New API 查询凭据。
+func (a *Account) HasBuiltinQuery() bool {
 	return strings.TrimSpace(a.AccessToken) != "" && strings.TrimSpace(a.UserID) != ""
+}
+
+// QueryBase 返回额度查询使用的站点地址。
+//
+// 优先用账号自填的站点地址，留空时回落到推理 base url：
+// 多数 New API 站点两者同源，只有少数把控制台与推理接口分开部署。
+func (a *Account) QueryBase() string {
+	if base := strings.TrimSpace(a.SiteURL); base != "" {
+		return base
+	}
+	return strings.TrimSpace(a.BaseURL)
 }
 
 // HasManualBalance 判断账号是否使用管理员手填余额。
@@ -898,6 +1026,10 @@ func PublicAccount(a *Account, apiCount, boundKeys int) map[string]any {
 		"hasBaseUrl":         a.BaseURL != "",
 		"hasAccessToken":     a.AccessToken != "",
 		"hasUserId":          a.UserID != "",
+		"hasQueryUrl":        a.QueryURL != "",
+		"hasQueryScript":     strings.TrimSpace(a.QueryScript) != "",
+		"scriptError":        a.ScriptError,
+		"balanceExtra":       a.BalanceExtra,
 		"timeoutSeconds":     a.TimeoutSeconds,
 		"queryIntervalMin":   a.QueryIntervalMin,
 		"refreshOnRequest":   a.RefreshOnRequest,

@@ -522,6 +522,126 @@
       }
     });
 
+    // 额度查询脚本：留空则用上面的内置 New API 凭据查询。
+    var scriptInput = h("textarea", {
+      rows: 12,
+      spellcheck: false,
+      class: "code-area",
+      placeholder: "留空则使用上方凭据走内置 New API 查询；填写脚本可对接任意站点"
+    });
+    var queryUrlInput = h("input", { type: "text", placeholder: "https://console.example.com", spellcheck: false });
+    var scriptStatus = h("div", { class: "inline-error" });
+    scriptStatus.style.display = "none";
+
+    function showScriptStatus(text, ok) {
+      scriptStatus.textContent = text || "";
+      scriptStatus.style.display = text ? "" : "none";
+      scriptStatus.className = "inline-error" + (ok ? " inline-ok" : "");
+    }
+
+    var scriptSamples = {
+      "New API /api/user/self": [
+        "({",
+        "  request: {",
+        "    url: \"{{baseUrl}}/api/user/self\",",
+        "    method: \"GET\",",
+        "    headers: {",
+        "      \"Content-Type\": \"application/json\",",
+        "      \"Authorization\": \"Bearer {{accessToken}}\",",
+        "      \"New-Api-User\": \"{{userId}}\"",
+        "    },",
+        "  },",
+        "  extractor: function (response) {",
+        "    if (response.success && response.data) {",
+        "      return {",
+        "        planName: response.data.group || \"默认套餐\",",
+        "        remaining: response.data.quota / 500000,",
+        "        used: response.data.used_quota / 500000,",
+        "        total: (response.data.quota + response.data.used_quota) / 500000,",
+        "        unit: \"USD\",",
+        "      };",
+        "    }",
+        "    return {",
+        "      isValid: false,",
+        "      invalidMessage: response.message || \"查询失败\"",
+        "    };",
+        "  },",
+        "})"
+      ].join("\n"),
+      "OpenAI 风格 /api/usage": [
+        "({",
+        "  request: {",
+        "    url: \"{{baseUrl}}/api/usage\",",
+        "    method: \"POST\",",
+        "    headers: {",
+        "      \"Authorization\": \"Bearer {{apiKey}}\"",
+        "    }",
+        "  },",
+        "  extractor: function (response) {",
+        "    return {",
+        "      isValid: !response.error,",
+        "      remaining: response.balance,",
+        "      unit: \"USD\"",
+        "    };",
+        "  }",
+        "})"
+      ].join("\n")
+    };
+
+    var sampleSelect = h("select", {});
+    sampleSelect.appendChild(h("option", { value: "", text: "插入示例脚本…" }));
+    Object.keys(scriptSamples).forEach(function (name) {
+      sampleSelect.appendChild(h("option", { value: name, text: name }));
+    });
+    sampleSelect.addEventListener("change", function () {
+      var sample = scriptSamples[sampleSelect.value];
+      if (sample) {
+        scriptInput.value = sample;
+        showScriptStatus("");
+      }
+      sampleSelect.value = "";
+    });
+
+    var validateButton = h("button", { class: "btn btn-sm", type: "button", text: "校验脚本" });
+    validateButton.addEventListener("click", async function () {
+      if (!scriptInput.value.trim()) {
+        showScriptStatus("脚本为空，将使用上方凭据走内置 New API 查询。", true);
+        return;
+      }
+      validateButton.disabled = true;
+      validateButton.textContent = "校验中…";
+      try {
+        var response = await LB.request("POST", "/admin/scripts/validate", {
+          script: scriptInput.value,
+          baseUrl: siteInput.value.trim() || baseInput.value.trim(),
+          queryUrl: queryUrlInput.value.trim(),
+          userId: userIdInput.value.trim(),
+          accessToken: tokenInput.value,
+          apiKey: parseKeys(keysInput.value)[0] || ""
+        });
+        var data = response.data || {};
+        if (!data.ok) {
+          showScriptStatus("脚本无效：" + (data.error || "未知错误"), false);
+          LB.toast("脚本校验未通过", "error");
+          return;
+        }
+        var headerNames = Object.keys(data.headers || {});
+        showScriptStatus(
+          "校验通过 · " + data.method + " " + data.url +
+          (headerNames.length ? " · 请求头 " + headerNames.join("、") : "") +
+          (data.hasBody ? " · 带请求体" : ""),
+          true
+        );
+        LB.toast("脚本校验通过", "ok");
+      } catch (err) {
+        showScriptStatus(err.message, false);
+        LB.toast("脚本校验失败", "error");
+      } finally {
+        validateButton.disabled = false;
+        validateButton.textContent = "校验脚本";
+      }
+    });
+
     function switchBlock(labelText, input, note) {
       return h("div", { class: "field full" }, [
         h("div", { class: "switch-row" }, [
@@ -562,6 +682,20 @@
         field("请求时刷新间隔（秒）", reqRefreshInput, "调用到达时若余额数据超过该时长未更新，先查一次再分配流量"),
         switchBlock("余额耗尽时自动暂停账号", autoSuspend, "暂停不删除数据，充值后在列表里重新启用即可恢复；查询失败不会触发暂停"),
         switchBlock("请求时刷新余额", refreshOnRequest, "调用到达时先确认余额，防止余额用完仍继续使用该账号")
+      ]),
+      h("div", { class: "section-head" }, [
+        h("h2", { text: "脚本查询（可选）" }),
+        h("span", { class: "hint", text: "填了脚本就用脚本查额度；留空则用上面的凭据走内置 New API 查询" })
+      ]),
+      h("div", { class: "form-grid" }, [
+        field("额度查询完整地址", queryUrlInput, "额度接口不在 Base URL 同源时填这里；填了会替代脚本里的 {{baseUrl}}。没有额度接口可留空"),
+        h("div", { class: "field full" }, [
+          h("label", { text: "查询脚本" }),
+          h("div", { class: "btn-row script-toolbar" }, [validateButton, sampleSelect]),
+          scriptInput,
+          h("div", { class: "hint-text", text: "形如 ({ request: {...}, extractor: function (response) {...} })；可用变量 {{baseUrl}} {{apiKey}} {{accessToken}} {{userId}}；extractor 可返回 isValid / invalidMessage / remaining / used / total / unit / planName / extra" }),
+          scriptStatus
+        ])
       ]),
       h("div", { class: "section-head" }, [
         h("h2", { text: "自定义端点（可选）" }),
@@ -633,7 +767,7 @@
           return false;
         }
         // 自定义端点必须是完整地址，否则会被拼到 Base URL 后面变成无效地址。
-        var badEndpoint = [chatUrlInput, modelsUrlInput, responsesUrlInput].some(function (input) {
+        var badEndpoint = [chatUrlInput, modelsUrlInput, responsesUrlInput, queryUrlInput].some(function (input) {
           var value = input.value.trim();
           return value && !/^https?:\/\//i.test(value);
         });
@@ -656,6 +790,8 @@
           rateLimitPerMin: rateLimited.checked ? rateLimitInput.value : "",
           autoSuspend: autoSuspend.checked,
           refreshOnRequest: refreshOnRequest.checked,
+          queryUrl: queryUrlInput.value.trim(),
+          queryScript: scriptInput.value,
           chatUrl: chatUrlInput.value.trim(),
           modelsUrl: modelsUrlInput.value.trim(),
           responsesUrl: responsesUrlInput.value.trim(),
