@@ -394,3 +394,130 @@ func TestFetchByScriptRejectsHTML(t *testing.T) {
 		t.Fatalf("应识别人机验证页: %v", snapshot.Err)
 	}
 }
+
+// TestFetchSlowStatusProbeDoesNotBlockBalance 覆盖本轮修复的核心问题：
+// /api/status 只为拿换算单位，卡住时不能吃掉整份超时预算，
+// 否则真正的余额查询必然报 context deadline exceeded。
+func TestFetchSlowStatusProbeDoesNotBlockBalance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/status":
+			// 探测挂到超过账号超时：以前三次请求共享一个 deadline，这里会连带拖死余额查询。
+			<-r.Context().Done()
+		case "/api/user/self":
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{"quota":5000000,"used_quota":0}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	snapshot := NewClient().Fetch(context.Background(), Credentials{
+		BaseURL:     server.URL,
+		AccessToken: "tok",
+		UserID:      "114514",
+		Timeout:     3 * time.Second,
+	})
+	if snapshot.Err != nil {
+		t.Fatalf("探测慢不应影响余额查询: %v", snapshot.Err)
+	}
+	if snapshot.Balance != 10 {
+		t.Fatalf("应按默认换算单位得到余额: %#v", snapshot)
+	}
+	if snapshot.QuotaPerUnit != DefaultQuotaPerUnit {
+		t.Fatalf("探测失败应回落默认换算单位: %#v", snapshot)
+	}
+}
+
+// TestFetchTimeoutIsPerAttempt 确认配置的超时是「单个请求最多等多久」，
+// 而不是所有尝试共享的总预算：/api/user/self 用满整份时间后，
+// /api/usage 仍要拿到完整的一份，否则回落路径形同虚设。
+func TestFetchTimeoutIsPerAttempt(t *testing.T) {
+	var usageHit bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/status":
+			_, _ = fmt.Fprint(w, `{"data":{"quota_per_unit":500000}}`)
+		case "/api/user/self":
+			<-r.Context().Done()
+		case "/api/usage":
+			usageHit = true
+			_, _ = fmt.Fprint(w, `{"balance":4.5}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	snapshot := NewClient().Fetch(context.Background(), Credentials{
+		BaseURL:     server.URL,
+		AccessToken: "tok",
+		UserID:      "114514",
+		APIKey:      "sk-upstream",
+		Timeout:     time.Second,
+	})
+	if !usageHit {
+		t.Fatal("第一条路径超时后应继续尝试 /api/usage")
+	}
+	if snapshot.Err != nil || snapshot.Balance != 4.5 {
+		t.Fatalf("回落查询应成功: %#v", snapshot)
+	}
+}
+
+// TestFetchTimeoutMessageIsActionable 确认超时错误不再是一句裸的
+// context deadline exceeded：管理员需要知道是哪个地址、等了多久、下一步怎么办。
+func TestFetchTimeoutMessageIsActionable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	program := scriptProgram(t, `({
+  request: { url: "{{baseUrl}}/quota", method: "GET" },
+  extractor: function (response) { return { remaining: response.balance }; }
+})`)
+
+	snapshot := NewClient().Fetch(context.Background(), Credentials{
+		BaseURL: server.URL,
+		Script:  program,
+		Timeout: 500 * time.Millisecond,
+	})
+	if snapshot.Err == nil {
+		t.Fatal("应报超时")
+	}
+	message := snapshot.Err.Error()
+	for _, want := range []string{"超时", "/quota", "超时时间"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("错误信息缺少 %q: %s", want, message)
+		}
+	}
+	if strings.Contains(message, "context deadline exceeded") {
+		t.Fatalf("不应把裸错误抛给管理员: %s", message)
+	}
+}
+
+// TestNormalizeTimeout 覆盖超时归一化：0 与越界回落默认值，上限被夹住。
+func TestNormalizeTimeout(t *testing.T) {
+	if NormalizeTimeout(0) != DefaultTimeout {
+		t.Fatalf("0 应回落默认值")
+	}
+	if NormalizeTimeout(-5*time.Second) != DefaultTimeout {
+		t.Fatalf("负值应回落默认值")
+	}
+	if NormalizeTimeout(45*time.Second) != 45*time.Second {
+		t.Fatalf("区间内的值应原样使用")
+	}
+	if NormalizeTimeout(time.Hour) != MaxTimeout {
+		t.Fatalf("超过上限应夹到 %s", MaxTimeout)
+	}
+	if DefaultTimeout != 30*time.Second {
+		t.Fatalf("默认超时应为 30 秒, got %s", DefaultTimeout)
+	}
+	// 探测预算不能超过账号自己的超时，也不能超过硬上限。
+	if probeTimeout(2*time.Second) != 2*time.Second {
+		t.Fatalf("探测不应比配置的超时还长")
+	}
+	if probeTimeout(time.Minute) != maxStatusProbeTimeout {
+		t.Fatalf("探测应被夹到 %s", maxStatusProbeTimeout)
+	}
+}

@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"time"
@@ -50,7 +51,9 @@ func (h *Handler) handleGroupRefresh(w http.ResponseWriter, r *http.Request, gro
 		return
 	}
 
-	results := h.Accounts.RefreshIDs(r.Context(), ids)
+	ctx, cancel := context.WithTimeout(r.Context(), manualRefreshBudget)
+	defer cancel()
+	results := h.Accounts.RefreshIDs(ctx, ids)
 	summary := map[string]any{}
 	h.Store.View(func(data *store.Data) {
 		summary = store.PublicGroup(orEmptyGroup(data.FindGroup(groupID)), data.GroupSummary(groupID))

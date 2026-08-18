@@ -465,7 +465,7 @@
     var siteInput = h("input", { type: "text", placeholder: "https://api.newapi.com", spellcheck: false });
     var tokenInput = h("input", { type: "password", placeholder: "在『安全设置』里生成", autocomplete: "off", spellcheck: false });
     var userIdInput = h("input", { type: "text", placeholder: "例如：114514", spellcheck: false });
-    var timeoutInput = h("input", { type: "number", min: 1, max: 120, value: "10" });
+    var timeoutInput = h("input", { type: "number", min: 1, max: 300, value: "30" });
     var intervalInput = h("input", { type: "number", min: 0, max: 1440, value: "0" });
     var minBalanceInput = h("input", { type: "number", min: 0, step: "0.0001", value: "0" });
     var reqRefreshInput = h("input", { type: "number", min: 1, max: 3600, value: "60" });
@@ -676,7 +676,7 @@
         field("请求地址", siteInput, "New API 站点地址，留空则用 Base URL 去掉 /v1"),
         field("访问令牌（在个人安全设置里获取）", tokenInput, "站点个人设置 → 安全设置 → 生成访问令牌"),
         field("用户 ID", userIdInput, "New API 个人设置页可见"),
-        field("超时时间（秒）", timeoutInput),
+        field("超时时间（秒）", timeoutInput, "单次额度查询最多等多久，1-300，默认 30；站点挂在 Cloudflare 后面时别填太小"),
         field("自动查询间隔（分钟，0 表示不自动查询）", intervalInput),
         field("最低余额（低于则视为耗尽）", minBalanceInput, "内置安全线 $0.50：填 0 也会按 $0.50 执行，只有填更大的值才会生效"),
         field("请求时刷新间隔（秒）", reqRefreshInput, "调用到达时若余额数据超过该时长未更新，先查一次再分配流量"),

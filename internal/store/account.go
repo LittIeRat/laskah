@@ -17,7 +17,16 @@ const DefaultBatchKeys = 5
 const DefaultSiteURL = "https://api.newapi.com"
 
 // DefaultQueryTimeoutSeconds 是额度查询的默认超时秒数。
-const DefaultQueryTimeoutSeconds = 10
+//
+// 取 30 秒：额度接口普遍挂在 Cloudflare 后面，冷连接握手加上站点查库经常超过 10 秒，
+// 超时太短的直接后果是满屏 context deadline exceeded，账号余额停在旧值。
+const DefaultQueryTimeoutSeconds = 30
+
+// MaxQueryTimeoutSeconds 是允许配置的额度查询超时上限。
+//
+// 放宽到 300 秒是为了兜住个别极慢的自建站点；这个超时只作用于额度查询，
+// 不影响网关转发，因此放宽不会拖住调用方。
+const MaxQueryTimeoutSeconds = 300
 
 // DefaultRequestRefreshSeconds 是“请求时刷新余额”的默认最小间隔。
 //
@@ -322,8 +331,8 @@ func BuildAccount(input AccountInput) (*Account, *ValidationError) {
 	}
 
 	timeoutSeconds, ok := toFloat(input.TimeoutSeconds, DefaultQueryTimeoutSeconds)
-	if !ok || timeoutSeconds < 1 || timeoutSeconds > 120 {
-		verr.Errorf("超时时间需要是 1-120 秒")
+	if !ok || timeoutSeconds < 1 || timeoutSeconds > MaxQueryTimeoutSeconds {
+		verr.Errorf("超时时间需要是 1-%d 秒", MaxQueryTimeoutSeconds)
 		timeoutSeconds = DefaultQueryTimeoutSeconds
 	}
 
@@ -969,10 +978,17 @@ func (d *Data) SuspendAccounts(ids []string, reason string) []string {
 }
 
 // QueryTimeout 返回额度查询超时时长。
+//
+// 历史数据里存的是旧默认值 10 秒，那个值在真实站点上经常不够；
+// 因此低于默认值的配置一律抬到默认值，只有管理员自己填了更大的值才照用。
+// 想要更短的超时没有实际收益：额度查询不在调用方的等待路径上。
 func (a *Account) QueryTimeout() time.Duration {
 	seconds := a.TimeoutSeconds
-	if seconds <= 0 {
+	if seconds < DefaultQueryTimeoutSeconds {
 		seconds = DefaultQueryTimeoutSeconds
+	}
+	if seconds > MaxQueryTimeoutSeconds {
+		seconds = MaxQueryTimeoutSeconds
 	}
 	return time.Duration(seconds) * time.Second
 }

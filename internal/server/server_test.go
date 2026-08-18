@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2717,5 +2718,70 @@ func TestScriptedAccountQueriesBalance(t *testing.T) {
 	suspended := findAccount(list["data"].([]any), account["id"].(string))
 	if suspended == nil || suspended["suspended"] != true {
 		t.Fatalf("余额触及下限应自动暂停: %#v", suspended)
+	}
+}
+
+// TestSlowBalanceQueryDoesNotBlockRequest 覆盖「余额查询慢不拖累调用方」这件事。
+//
+// 额度接口卡住时，请求路径最多等 RequestRefreshWait 就放行，查询继续在后台跑；
+// 否则每次请求都要陪着额度接口一起超时，表现就是聊天接口整体变慢。
+func TestSlowBalanceQueryDoesNotBlockRequest(t *testing.T) {
+	h := newHarnessWith(t, func(options *Options) {
+		options.RequestRefreshWait = 300 * time.Millisecond
+	})
+
+	hits := []string{}
+	upstream := fakeUpstream(t, &hits)
+
+	// 额度站点故意挂住，直到请求超时才返回。
+	var probes int32
+	slowSite := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/user/self" {
+			atomic.AddInt32(&probes, 1)
+			select {
+			case <-time.After(3 * time.Second):
+			case <-r.Context().Done():
+			}
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(slowSite.Close)
+
+	groupID := h.createGroup("团队 A")
+	_, body := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":              "slow-site",
+		"groupId":           groupID,
+		"baseUrl":           upstream.URL + "/v1",
+		"siteUrl":           slowSite.URL,
+		"userId":            "1",
+		"accessToken":       "tok",
+		"keys":              "sk-slow",
+		"requestRefreshSec": 1,
+	})
+	if body["data"] == nil {
+		t.Fatalf("创建账号失败: %#v", body)
+	}
+
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client"})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+
+	// 让余额数据过期，迫使请求路径触发一次刷新。
+	time.Sleep(1100 * time.Millisecond)
+
+	started := time.Now()
+	response, chat := h.do(http.MethodPost, "/v1/chat/completions", chatBody(), secret)
+	elapsed := time.Since(started)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("额度查询慢不应让调用失败: %d %#v", response.StatusCode, chat)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("请求被额度查询拖住了 %s，应在等待上限后放行", elapsed)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("应正常转发到上游: %#v", hits)
+	}
+	if atomic.LoadInt32(&probes) == 0 {
+		t.Fatal("应确实发起过额度查询")
 	}
 }

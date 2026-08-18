@@ -1,13 +1,21 @@
 package admin
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"laskah/internal/httpx"
 	"laskah/internal/store"
 )
+
+// manualRefreshBudget 是「手动刷新全部余额 / 查询总余额」的整体上限。
+//
+// 单账号超时最长 300 秒，账号一多就可能把管理端请求挂到浏览器超时；
+// 这里给整批操作一个封顶值，超出的账号沿用旧余额并在报告里计为失败。
+const manualRefreshBudget = 3 * time.Minute
 
 func (h *Handler) handleAccountCollection(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -137,7 +145,11 @@ func (h *Handler) createAccount(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 创建后立刻查一次额度，让界面马上能看到余额或凭据错误。
-	h.refreshAccountBalance(r, account.ID)
+	//
+	// 走请求路径的「短等待 + 后台继续」语义：额度站点挂在 Cloudflare 后面时，
+	// 单次查询可能要几十秒，不能让「创建账号」这个写操作一直挂着不返回。
+	// 等待窗口内查完就带上余额返回，没查完则先返回账号，结果由后台写回。
+	h.refreshAccountBalanceSoon(r, account.ID)
 
 	view := map[string]any{}
 	h.Store.View(func(data *store.Data) {
@@ -341,7 +353,9 @@ func (h *Handler) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusServiceUnavailable, "额度查询组件未就绪", nil)
 		return
 	}
-	results := h.Accounts.RefreshAll(r.Context())
+	ctx, cancel := context.WithTimeout(r.Context(), manualRefreshBudget)
+	defer cancel()
+	results := h.Accounts.RefreshAll(ctx)
 	totals := map[string]any{}
 	h.Store.View(func(data *store.Data) {
 		totals = data.AccountTotals()
@@ -359,7 +373,9 @@ func (h *Handler) handleBalanceQuery(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusServiceUnavailable, "额度查询组件未就绪", nil)
 		return
 	}
-	results := h.Accounts.RefreshAll(r.Context())
+	ctx, cancel := context.WithTimeout(r.Context(), manualRefreshBudget)
+	defer cancel()
+	results := h.Accounts.RefreshAll(ctx)
 
 	failed := 0
 	deleted := 0
@@ -437,11 +453,26 @@ func (h *Handler) handleAccountBatchDelete(w http.ResponseWriter, r *http.Reques
 }
 
 // refreshAccountBalance 触发一次额度查询，账号不存在时返回 nil。
+//
+// 单账号查询按账号自己的超时执行，这里只加一个封顶，避免管理端请求被无限挂住。
 func (h *Handler) refreshAccountBalance(r *http.Request, id string) map[string]any {
 	if h.Accounts == nil {
 		return nil
 	}
-	return h.Accounts.Refresh(r.Context(), id)
+	ctx, cancel := context.WithTimeout(r.Context(), manualRefreshBudget)
+	defer cancel()
+	return h.Accounts.Refresh(ctx, id)
+}
+
+// refreshAccountBalanceSoon 触发一次额度查询，但最多只等一小段时间。
+//
+// 与 refreshAccountBalance 的区别：这里复用 RefreshForRequest 的合并 + 后台执行语义，
+// 用于「创建账号」这类不该被慢额度接口拖住的写操作。
+func (h *Handler) refreshAccountBalanceSoon(r *http.Request, id string) {
+	if h.Accounts == nil {
+		return
+	}
+	h.Accounts.RefreshForRequest(r.Context(), id)
 }
 
 func parsePositiveInt(text string) (int, error) {

@@ -22,6 +22,21 @@ const DefaultQuotaPerUnit = 500000.0
 // maxBodyBytes 限制读取上游响应的体积。
 const maxBodyBytes = 1 << 20
 
+// DefaultTimeout 是单次额度查询请求的默认超时。
+//
+// 取 30 秒而不是 10 秒：额度接口普遍挂在 Cloudflare 后面，冷连接握手加上
+// 站点自身查库，10 秒经常不够，结果就是满屏 context deadline exceeded。
+const DefaultTimeout = 30 * time.Second
+
+// MaxTimeout 是允许配置的单次请求超时上限。
+const MaxTimeout = 300 * time.Second
+
+// maxStatusProbeTimeout 限制 /api/status 探测的等待时长。
+//
+// 这个探测只为拿换算单位，失败也能回落默认值，因此绝不能占用整份预算：
+// 以前三次请求共享一个 deadline，探测卡住就让真正的余额查询必然超时。
+const maxStatusProbeTimeout = 8 * time.Second
+
 // Snapshot 是一次额度查询的结果。
 type Snapshot struct {
 	Balance      float64
@@ -89,16 +104,11 @@ func NewClient() *Client {
 // 优先使用管理员自填的脚本：它能覆盖任意站点形态，是唯一的通用手段。
 // 没有脚本时退回内置的 New API 路径（/api/user/self，再退 /api/usage）。
 func (c *Client) Fetch(parent context.Context, creds Credentials) Snapshot {
-	timeout := creds.Timeout
-	if timeout <= 0 || timeout > 120*time.Second {
-		timeout = 10 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(parent, timeout)
-	defer cancel()
+	timeout := NormalizeTimeout(creds.Timeout)
 
 	base := strings.TrimRight(strings.TrimSpace(creds.BaseURL), "/")
 	if creds.Script != nil {
-		return c.fetchByScript(ctx, base, creds)
+		return c.fetchByScript(parent, timeout, base, creds)
 	}
 	if base == "" && strings.TrimSpace(creds.QueryURL) == "" {
 		return Snapshot{
@@ -108,11 +118,12 @@ func (c *Client) Fetch(parent context.Context, creds Credentials) Snapshot {
 			QuotaPerUnit: DefaultQuotaPerUnit,
 		}
 	}
-	quotaPerUnit := c.quotaPerUnit(ctx, base)
+	quotaPerUnit := c.quotaPerUnit(parent, base, probeTimeout(timeout))
 
+	// 每次尝试各自计时：配置的超时是「单个请求最多等多久」，不是三次请求的总预算。
 	attempts := []func() (Snapshot, bool){
-		func() (Snapshot, bool) { return c.fetchUserSelf(ctx, base, creds, quotaPerUnit) },
-		func() (Snapshot, bool) { return c.fetchUsage(ctx, base, creds) },
+		func() (Snapshot, bool) { return c.fetchUserSelf(parent, timeout, base, creds, quotaPerUnit) },
+		func() (Snapshot, bool) { return c.fetchUsage(parent, timeout, base, creds) },
 	}
 
 	var lastErr error
@@ -143,7 +154,10 @@ func (c *Client) Fetch(parent context.Context, creds Credentials) Snapshot {
 //
 // 脚本只负责「请求怎么发」与「响应怎么读」，实际发请求仍由宿主完成：
 // 沙箱里没有任何网络能力，因此脚本无法访问 request 之外的地址。
-func (c *Client) fetchByScript(ctx context.Context, base string, creds Credentials) Snapshot {
+func (c *Client) fetchByScript(parent context.Context, timeout time.Duration, base string, creds Credentials) Snapshot {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
 	now := func() time.Time { return time.Now().UTC() }
 	vars := map[string]string{
 		"baseUrl":     base,
@@ -183,7 +197,7 @@ func (c *Client) fetchByScript(ctx context.Context, base string, creds Credentia
 
 	response, err := c.http.Do(request)
 	if err != nil {
-		return Snapshot{Err: err, CheckedAt: now(), Currency: "USD"}
+		return Snapshot{Err: describeTransportFailure(requestSpec.URL, timeout, err), CheckedAt: now(), Currency: "USD"}
 	}
 	defer drain(response)
 
@@ -240,6 +254,48 @@ func (c *Client) fetchByScript(ctx context.Context, base string, creds Credentia
 	return snapshot
 }
 
+// NormalizeTimeout 把配置的超时收敛到允许区间。
+//
+// 0 或越界都回落默认值：额度查询失败会直接影响账号能否参与调度，
+// 不能因为一个脏数字让请求只等 1 毫秒。
+func NormalizeTimeout(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return DefaultTimeout
+	}
+	if timeout > MaxTimeout {
+		return MaxTimeout
+	}
+	return timeout
+}
+
+// probeTimeout 给 /api/status 探测一个较短的预算。
+//
+// 探测失败可以回落默认换算单位，因此它不该吃掉整份超时；
+// 但也不能比配置值还长，否则填了 3 秒的账号会等 8 秒。
+func probeTimeout(timeout time.Duration) time.Duration {
+	if timeout < maxStatusProbeTimeout {
+		return timeout
+	}
+	return maxStatusProbeTimeout
+}
+
+// describeTransportFailure 把传输层错误翻译成能直接指向原因的一句话。
+//
+// context deadline exceeded 本身不说明任何事：管理员看不出是超时太短、
+// 站点太慢还是地址写错。这里补上目标地址与实际等待时长，并给出下一步动作。
+func describeTransportFailure(target string, timeout time.Duration, cause error) error {
+	if cause == nil {
+		return nil
+	}
+	if errors.Is(cause, context.DeadlineExceeded) {
+		return fmt.Errorf("查询 %s 超时（已等待 %s）：站点响应过慢或被中间层拦截，可在账号配置里把「超时时间」调大后重建账号", target, timeout)
+	}
+	if errors.Is(cause, context.Canceled) {
+		return fmt.Errorf("查询 %s 被取消（调用方已断开或服务正在关闭）", target)
+	}
+	return fmt.Errorf("查询 %s 失败: %w", target, cause)
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if trimmed := strings.TrimSpace(value); trimmed != "" {
@@ -255,10 +311,13 @@ func describeFailure2(response *http.Response, target string, cause error) error
 }
 
 // quotaPerUnit 读取站点 /api/status 的 quota_per_unit，失败时回落默认值。
-func (c *Client) quotaPerUnit(ctx context.Context, base string) float64 {
+func (c *Client) quotaPerUnit(parent context.Context, base string, timeout time.Duration) float64 {
 	if strings.TrimSpace(base) == "" {
 		return DefaultQuotaPerUnit
 	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/status", nil)
 	if err != nil {
 		return DefaultQuotaPerUnit
@@ -283,11 +342,14 @@ func (c *Client) quotaPerUnit(ctx context.Context, base string) float64 {
 }
 
 // fetchUserSelf 用访问令牌 + 用户 ID 查询 New API 的 /api/user/self。
-func (c *Client) fetchUserSelf(ctx context.Context, base string, creds Credentials, quotaPerUnit float64) (Snapshot, bool) {
+func (c *Client) fetchUserSelf(parent context.Context, timeout time.Duration, base string, creds Credentials, quotaPerUnit float64) (Snapshot, bool) {
 	token := strings.TrimSpace(creds.AccessToken)
 	if token == "" {
 		return Snapshot{}, false
 	}
+
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
 
 	target := endpointFor(creds, base, "/api/user/self")
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
@@ -304,7 +366,7 @@ func (c *Client) fetchUserSelf(ctx context.Context, base string, creds Credentia
 
 	response, err := c.http.Do(request)
 	if err != nil {
-		return Snapshot{Err: err}, false
+		return Snapshot{Err: describeTransportFailure(target, timeout, err)}, false
 	}
 	defer drain(response)
 
@@ -361,11 +423,14 @@ func endpointFor(creds Credentials, base, defaultPath string) string {
 }
 
 // fetchUsage 用上游 API Key 查询 /api/usage，作为访问令牌不可用时的回落。
-func (c *Client) fetchUsage(ctx context.Context, base string, creds Credentials) (Snapshot, bool) {
+func (c *Client) fetchUsage(parent context.Context, timeout time.Duration, base string, creds Credentials) (Snapshot, bool) {
 	apiKey := strings.TrimSpace(creds.APIKey)
 	if apiKey == "" {
 		return Snapshot{}, false
 	}
+
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
 
 	target := endpointFor(creds, base, "/api/usage")
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader([]byte("{}")))
@@ -379,7 +444,7 @@ func (c *Client) fetchUsage(ctx context.Context, base string, creds Credentials)
 
 	response, err := c.http.Do(request)
 	if err != nil {
-		return Snapshot{Err: err}, false
+		return Snapshot{Err: describeTransportFailure(target, timeout, err)}, false
 	}
 	defer drain(response)
 

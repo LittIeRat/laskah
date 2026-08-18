@@ -58,7 +58,8 @@ function Api {
     $Session = $null,
     [string]$Csrf = '',
     [string]$Bearer = '',
-    [int]$Expect = 0
+    [int]$Expect = 0,
+    [int]$TimeoutSec = 20
   )
   $headers = @{}
   if ($Csrf) { $headers['X-CSRF-Token'] = $Csrf }
@@ -68,7 +69,7 @@ function Api {
     Uri             = $base + $Path
     Method          = $Method
     UseBasicParsing = $true
-    TimeoutSec      = 20
+    TimeoutSec      = $TimeoutSec
     Headers         = $headers
   }
   if ($null -ne $Body) {
@@ -504,8 +505,44 @@ Step '额度查询完整地址必须是绝对地址（留空放行）' {
   '相对地址 400 / 留空 201 且 unlimited=true'
 }
 
+Step '额度查询超时时间默认 30 秒、上限 300 秒' {
+  $payload = @{
+    groupId     = $groupB
+    name        = '默认超时账号'
+    baseUrl     = 'https://upstream.example.com/v1'
+    keys        = 'sk-timeout-default-0123456789'
+    queryUrl    = 'https://console.example.com'
+    accessToken = 'tok-timeout-0123456789'
+    userId      = '114514'
+  }
+  $r = Api POST '/admin/accounts' $payload -Session $superSession -Csrf $superCsrf -Expect 201 -TimeoutSec 60
+  if ($r.Data.data.timeoutSeconds -ne 30) { throw ('timeoutSeconds=' + $r.Data.data.timeoutSeconds + '，期望默认 30') }
+  $long = @{
+    groupId        = $groupB
+    name           = '长超时账号'
+    baseUrl        = 'https://upstream.example.com/v1'
+    keys           = 'sk-timeout-long-0123456789'
+    queryUrl       = 'https://console.example.com'
+    accessToken    = 'tok-timeout-long-0123456789'
+    userId         = '114514'
+    timeoutSeconds = 300
+  }
+  $r2 = Api POST '/admin/accounts' $long -Session $superSession -Csrf $superCsrf -Expect 201 -TimeoutSec 60
+  if ($r2.Data.data.timeoutSeconds -ne 300) { throw ('timeoutSeconds=' + $r2.Data.data.timeoutSeconds + '，期望 300') }
+  $bad = @{
+    groupId        = $groupB
+    name           = '超时越界账号'
+    baseUrl        = 'https://upstream.example.com/v1'
+    keys           = 'sk-timeout-bad-0123456789'
+    timeoutSeconds = 301
+  }
+  $r3 = Api POST '/admin/accounts' $bad -Session $superSession -Csrf $superCsrf -Expect 400
+  '默认 30 / 上限 300 / 301 被拒'
+}
+
 Step 'POST /admin/accounts/balance-query 查询总余额并拆分来源' {
-  $r = Api POST '/admin/accounts/balance-query' -Session $superSession -Csrf $superCsrf -Expect 200
+  # 冒烟用的额度地址是不存在的域名，串行等待 DNS 失败会比普通接口慢，超时给足。
+  $r = Api POST '/admin/accounts/balance-query' -Session $superSession -Csrf $superCsrf -Expect 200 -TimeoutSec 180
   $d = $r.Data.data
   if ($null -eq $d.queried) { throw '缺少 queried 计数' }
   if ($null -eq $d.failed) { throw '缺少 failed 计数' }
@@ -518,7 +555,7 @@ Step 'POST /admin/accounts/balance-query 查询总余额并拆分来源' {
 }
 
 Step 'POST 分组手动刷新余额' {
-  $r = Api POST ('/admin/groups/' + $groupA + '/refresh') -Session $superSession -Csrf $superCsrf -Expect 200
+  $r = Api POST ('/admin/groups/' + $groupA + '/refresh') -Session $superSession -Csrf $superCsrf -Expect 200 -TimeoutSec 180
   'HTTP 200'
 }
 

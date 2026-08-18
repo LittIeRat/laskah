@@ -14,10 +14,24 @@ import (
 // maxParallelRefresh 限制并发刷新数量，兼顾速度与资源占用。
 const maxParallelRefresh = 6
 
+// DefaultRequestRefreshWait 是请求路径上等待余额刷新的默认上限。
+//
+// 额度查询本身允许等到账号配置的超时（默认 30 秒），但调用方不该陪着等：
+// 超过这个时间就先放行，查询继续在后台跑完并写回结果。
+const DefaultRequestRefreshWait = 5 * time.Second
+
+// backgroundRefreshBudget 是后台单账号刷新的总预算。
+//
+// 需要略大于单次请求超时，因为内置查询会依次尝试 /api/user/self 与 /api/usage。
+const backgroundRefreshBudget = 3 * wallet.MaxTimeout
+
 // Manager 组合数据仓库与额度查询客户端。
 type Manager struct {
 	Store  *store.Store
 	Wallet *wallet.Client
+
+	// RequestWait 是请求路径上等待余额刷新的上限，0 表示用默认值。
+	RequestWait time.Duration
 
 	// pending 让同一账号的并发刷新合并成一次上游查询。
 	pendingMu sync.Mutex
@@ -246,24 +260,54 @@ func (m *Manager) apply(id, name string, snapshot wallet.Snapshot) map[string]an
 // 同一账号的并发请求会合并成一次上游查询（后到者等待前者结果），
 // 因此突发流量不会把额度接口放大成 N 倍请求。
 // 查询失败时返回 true：网络抖动不应让全站不可用，故障转移交给上游重试逻辑。
+//
+// 查询在后台跑，并且不继承调用方的 context：
+//   - 调用方最多只等 requestRefreshWait，额度接口再慢也不会把聊天请求拖成几十秒；
+//   - 客户端断开不会把查询一起取消，否则慢站点永远刷不出结果，
+//     账号余额一直停在旧值，反而更容易把流量打到已欠费的账号上。
 func (m *Manager) RefreshForRequest(ctx context.Context, accountID string) bool {
 	if accountID == "" {
 		return false
 	}
 
 	m.pendingMu.Lock()
-	if call, running := m.pending[accountID]; running {
-		m.pendingMu.Unlock()
-		select {
-		case <-call.done:
-			return call.usable
-		case <-ctx.Done():
-			return false
-		}
+	call, running := m.pending[accountID]
+	if !running {
+		call = &refreshCall{done: make(chan struct{})}
+		m.pending[accountID] = call
 	}
-	call := &refreshCall{done: make(chan struct{})}
-	m.pending[accountID] = call
 	m.pendingMu.Unlock()
+
+	if !running {
+		go m.runRefresh(accountID, call)
+	}
+
+	timer := time.NewTimer(m.requestWait())
+	defer timer.Stop()
+	select {
+	case <-call.done:
+		return call.usable
+	case <-timer.C:
+		// 等超了不代表账号不可用：查询仍在后台继续，结果会写回供下一次请求使用。
+		// 这里放行而不是拦下，理由与「查询失败视为仍可用」一致。
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// requestWait 返回请求路径上的等待上限。
+func (m *Manager) requestWait() time.Duration {
+	if m.RequestWait > 0 {
+		return m.RequestWait
+	}
+	return DefaultRequestRefreshWait
+}
+
+// runRefresh 在后台完成一次刷新并唤醒所有等待者。
+func (m *Manager) runRefresh(accountID string, call *refreshCall) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), backgroundRefreshBudget)
+	defer cancel()
 
 	result := m.Refresh(ctx, accountID)
 	switch {
@@ -281,7 +325,6 @@ func (m *Manager) RefreshForRequest(ctx context.Context, accountID string) bool 
 	delete(m.pending, accountID)
 	m.pendingMu.Unlock()
 	close(call.done)
-	return call.usable
 }
 
 // RefreshAll 并发刷新全部账号额度。

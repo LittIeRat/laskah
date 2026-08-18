@@ -36,6 +36,8 @@ func main() {
 		AllowOrigin:      envString("ALLOW_ORIGIN", ""),
 		TrustProxy:       envBool("TRUST_PROXY", false),
 		PublicModels:     envBoolPtr("PUBLIC_MODELS"),
+		// 请求路径上最多等这么久的余额刷新，超时后先放行、查询继续在后台跑完。
+		RequestRefreshWait: time.Duration(envInt("REQUEST_REFRESH_WAIT_MS", 5000)) * time.Millisecond,
 	}
 
 	app, err := server.New(options)

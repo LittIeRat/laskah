@@ -39,6 +39,11 @@ type Options struct {
 	//
 	// 用指针区分「没设置」与「显式设为 false」：默认开启，只有显式关掉才收敛成空列表。
 	PublicModels *bool
+
+	// RequestRefreshWait 是请求路径上等待余额刷新的上限，0 表示用默认值。
+	//
+	// 额度接口慢的时候，调用方不该陪着一起等；查询会在后台继续跑完。
+	RequestRefreshWait time.Duration
 }
 
 // App 聚合服务运行所需的组件。
@@ -78,6 +83,7 @@ func New(options Options) (*App, error) {
 	upstream := gateway.NewUpstream()
 	gw := gateway.New(dataStore, lb, limiter, upstream)
 	manager := accounts.New(dataStore, wallet.NewClient())
+	manager.RequestWait = options.RequestRefreshWait
 	// 请求路径上的余额刷新：账号余额数据过期时先查一次再分配流量。
 	gw.SetRefresher(manager)
 	// 上游明确报余额不足时立刻暂停该账号并换账号重试。
@@ -157,7 +163,9 @@ func (a *App) balanceLoop() {
 		case <-a.stopCh:
 			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			// 预算要能容下一整批慢站点：单账号超时最长 300 秒，2 分钟的总预算
+			// 会在账号稍多时把后面的账号全部判成超时。
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			a.Accounts.RefreshDue(ctx)
 			cancel()
 			if suspended := a.Accounts.SweepExhausted(); len(suspended) > 0 {

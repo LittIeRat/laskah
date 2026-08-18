@@ -1270,3 +1270,49 @@ func TestQueryScriptPersistence(t *testing.T) {
 		}
 	})
 }
+
+// TestQueryTimeoutFloor 覆盖额度查询超时的归一化。
+//
+// 旧默认值 10 秒在真实站点上经常不够（满屏 context deadline exceeded），
+// 因此历史数据里的小值一律抬到默认值，只有管理员填了更大的值才照用。
+func TestQueryTimeoutFloor(t *testing.T) {
+	if DefaultQueryTimeoutSeconds != 30 || MaxQueryTimeoutSeconds != 300 {
+		t.Fatalf("超时常量错误: %d %d", DefaultQueryTimeoutSeconds, MaxQueryTimeoutSeconds)
+	}
+
+	defaults, verr := BuildAccount(AccountInput{Name: "x", BaseURL: "https://a.com/v1"})
+	if verr != nil {
+		t.Fatalf("不应报错: %v", verr)
+	}
+	if defaults.TimeoutSeconds != DefaultQueryTimeoutSeconds {
+		t.Fatalf("默认超时应为 %d 秒, got %d", DefaultQueryTimeoutSeconds, defaults.TimeoutSeconds)
+	}
+	if defaults.QueryTimeout() != 30*time.Second {
+		t.Fatalf("默认超时换算错误: %v", defaults.QueryTimeout())
+	}
+
+	if _, verr := BuildAccount(AccountInput{Name: "x", BaseURL: "https://a.com/v1", TimeoutSeconds: 301}); verr == nil {
+		t.Fatalf("超过 %d 秒应报错", MaxQueryTimeoutSeconds)
+	}
+	long, verr := BuildAccount(AccountInput{Name: "x", BaseURL: "https://a.com/v1", TimeoutSeconds: 180})
+	if verr != nil {
+		t.Fatalf("180 秒应被接受: %v", verr)
+	}
+	if long.QueryTimeout() != 180*time.Second {
+		t.Fatalf("自填的长超时应原样生效: %v", long.QueryTimeout())
+	}
+
+	// 旧数据（v6 及之前）里普遍是 10 秒，加载后要被抬到默认值。
+	legacy := &Account{TimeoutSeconds: 10}
+	if legacy.QueryTimeout() != 30*time.Second {
+		t.Fatalf("历史小超时应抬到默认值: %v", legacy.QueryTimeout())
+	}
+	zero := &Account{}
+	if zero.QueryTimeout() != 30*time.Second {
+		t.Fatalf("未设置时应用默认值: %v", zero.QueryTimeout())
+	}
+	huge := &Account{TimeoutSeconds: 100000}
+	if huge.QueryTimeout() != 300*time.Second {
+		t.Fatalf("超大值应被夹到上限: %v", huge.QueryTimeout())
+	}
+}

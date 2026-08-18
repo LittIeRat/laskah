@@ -122,8 +122,13 @@ sudo nano /etc/laskah/laskah.env
 | `TRUST_PROXY` | 反向代理后必须为 `true`，否则登录限速会把所有访客算作同一个 IP |
 
 其余可调项（`HOST` / `PORT` / `DATA_FILE` / `STRATEGY` / `MAX_RETRIES` /
-`COOLDOWN_MS` / `FAILURE_THRESHOLD` / `BALANCE_INTERVAL_MS` / `PUBLIC_MODELS`）见
+`COOLDOWN_MS` / `FAILURE_THRESHOLD` / `BALANCE_INTERVAL_MS` /
+`REQUEST_REFRESH_WAIT_MS` / `PUBLIC_MODELS`）见
 `deploy/laskah.env.example` 内注释。
+
+`REQUEST_REFRESH_WAIT_MS` 默认 `5000`：请求命中账号且余额过期时，最多等这么久等余额查完，
+到点先放行，查询继续在后台跑完并写回。想让额度接口查得更久，改的是账号自己的
+「超时时间」（1–300 秒，默认 30），不是这个值。
 
 `PUBLIC_MODELS` 默认 `true`：不带密钥访问 `/v1/models` 会列出全部可用账号提供的
 模型并集（只有模型名，`owned_by` 统一署名 `laskah`）。需要对外隐藏供货范围时设为
@@ -457,6 +462,9 @@ sudo systemctl restart laskah
 | 脚本账号余额不更新 | 看板 `accounts.scriptBroken` 不为 0 表示脚本编译失败（多为数据迁移后语法不被支持），删号重建并用「校验脚本」确认 |
 | 账号不接流量了 | 看 `/manage` 账号行的「已暂停」徽章与暂停原因（含上游原文），充值后打开开关即恢复 |
 | 登录限速把所有人一起锁 | `TRUST_PROXY` 没开，全部请求被当成同一个来源 IP |
+| 余额查询报 `context deadline exceeded` | 老版本的 10 秒默认超时太短。新版默认 30 秒（历史数据自动抬到 30），仍超时就删号重建、把「超时时间」调到 60–300 秒；查询站点在 Cloudflare 后面时冷连接握手常年超过 10 秒 |
+| 手动刷新全部余额在浏览器里报网关超时 | 反向代理的 `/admin/` 读超时太短。Nginx 用 `deploy/nginx-laskah.conf` 里的 `proxy_read_timeout 240s`，Caddy 用 `transport http { read_timeout 240s }`。后台查询不受影响，刷新页面即可看到结果 |
+| 聊天请求偶尔比上游慢几秒 | 请求路径上的余额刷新在等额度接口。`REQUEST_REFRESH_WAIT_MS` 调小（默认 5000），或把账号的「请求时刷新间隔」调大 |
 
 ---
 
