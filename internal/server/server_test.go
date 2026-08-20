@@ -1596,8 +1596,9 @@ func TestGroupEnableDisableStopsTraffic(t *testing.T) {
 	}
 }
 
-// TestUpstreamInsufficientBalanceSuspendsAccount 验证上游报余额不足时立即暂停账号并换账号重试。
-func TestUpstreamInsufficientBalanceSuspendsAccount(t *testing.T) {
+// TestUpstreamInsufficientBalanceSwitchesAccountWithoutSuspending 验证上游报余额不足时只在当次请求换号，
+// 不会把账号持久化暂停；只有本地余额触及下限才暂停。
+func TestUpstreamInsufficientBalanceSwitchesAccountWithoutSuspending(t *testing.T) {
 	h := newHarness(t)
 
 	brokeHits := 0
@@ -1643,18 +1644,15 @@ func TestUpstreamInsufficientBalanceSuspendsAccount(t *testing.T) {
 		t.Fatalf("应切换到健康账号: %#v", healthyHits)
 	}
 
-	// 欠费账号已被暂停，原因保留上游文案。
+	// 上游误报只影响当次换号，不应把账号持久化暂停。
 	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
 	accounts := list["data"].([]any)
 	if len(accounts) != 2 {
-		t.Fatalf("暂停不应删除账号: %#v", accounts)
+		t.Fatalf("换号不应删除账号: %#v", accounts)
 	}
 	brokeView := findAccount(accounts, brokeID)
-	if brokeView == nil || brokeView["suspended"] != true {
-		t.Fatalf("欠费账号应被自动暂停: %#v", accounts)
-	}
-	if !strings.Contains(brokeView["suspendReason"].(string), "余额不足") {
-		t.Fatalf("应记录暂停原因: %#v", brokeView["suspendReason"])
+	if brokeView == nil || brokeView["suspended"] != false {
+		t.Fatalf("上游余额不足不应自动暂停账号: %#v", accounts)
 	}
 }
 
@@ -1710,11 +1708,11 @@ func TestPrechargeShortfallSuspendsAccount(t *testing.T) {
 	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
 	accounts := list["data"].([]any)
 	brokeView := findAccount(accounts, brokeID)
-	if brokeView == nil || brokeView["suspended"] != true {
-		t.Fatalf("预扣费失败的账号应被自动暂停: %#v", accounts)
+	if brokeView == nil || brokeView["suspended"] != false {
+		t.Fatalf("预扣费失败不应自动暂停账号: %#v", accounts)
 	}
-	if reason := brokeView["suspendReason"].(string); !strings.Contains(reason, "预扣费额度失败") {
-		t.Fatalf("暂停原因应保留上游文案: %q", reason)
+	if reason, _ := brokeView["suspendReason"].(string); reason != "" {
+		t.Fatalf("不应留下暂停原因: %q", reason)
 	}
 }
 
@@ -2061,13 +2059,13 @@ func TestStreamBalanceShortfallSwitchesAccountTransparently(t *testing.T) {
 		t.Fatalf("应重试到健康账号: %#v", goodHits)
 	}
 
-	// 欠费账号已被暂停。
+	// 上游报余额不足只在当次请求里换号，不应持久化暂停。
 	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
 	broke := findAccount(list["data"].([]any), brokeID)
-	if broke == nil || broke["suspended"] != true {
-		t.Fatalf("欠费账号应被自动暂停: %#v", list["data"])
+	if broke == nil || broke["suspended"] != false {
+		t.Fatalf("上游余额不足不应自动暂停: %#v", list["data"])
 	}
-	if !strings.Contains(broke["suspendReason"].(string), "余额不足") {
+	if reason, _ := broke["suspendReason"].(string); reason != "" {
 		t.Fatalf("应记录余额不足暂停原因: %#v", broke["suspendReason"])
 	}
 }
@@ -2134,18 +2132,14 @@ func TestStreamBalanceShortfallMidStreamTruncates(t *testing.T) {
 		t.Fatalf("截断后应以 [DONE] 收尾，避免客户端干等: %q", raw)
 	}
 
-	// 账号已被暂停，下一次请求直接落到健康账号。
+	// 上游中途报余额不足不应持久化暂停账号；下一次请求仍可按当次状态重新分配。
 	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
-	if broke := findAccount(list["data"].([]any), brokeID); broke == nil || broke["suspended"] != true {
-		t.Fatalf("欠费账号应被自动暂停: %#v", list["data"])
+	if broke := findAccount(list["data"].([]any), brokeID); broke == nil || broke["suspended"] != false {
+		t.Fatalf("上游余额不足不应自动暂停: %#v", list["data"])
 	}
 
-	if response, retry := h.doRaw(http.MethodPost, "/v1/chat/completions", payload, secret); response.StatusCode != http.StatusOK || !strings.Contains(retry, "完整") {
-		t.Fatalf("下一次请求应命中健康账号: %d %s", response.StatusCode, retry)
-	}
-	if len(goodHits) != 1 {
-		t.Fatalf("健康账号应只被第二次请求命中: %#v", goodHits)
-	}
+	// 账号不再被持久化暂停，因此下一次请求允许再次尝试它；
+	// 本用例只验证“本次流已正确截断且账号状态未被写死”，不强求下一次一定切到健康账号。
 }
 
 // TestNonStreamBalanceShortfallInBodySwitchesAccount 覆盖「HTTP 200 但响应体里带 error 报余额不足」：
@@ -2214,8 +2208,8 @@ func TestNonStreamBalanceShortfallInBodySwitchesAccount(t *testing.T) {
 	}
 
 	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
-	if broke := findAccount(list["data"].([]any), brokeID); broke == nil || broke["suspended"] != true {
-		t.Fatalf("欠费账号应被自动暂停: %#v", list["data"])
+	if broke := findAccount(list["data"].([]any), brokeID); broke == nil || broke["suspended"] != false {
+		t.Fatalf("上游余额不足不应自动暂停: %#v", list["data"])
 	}
 }
 
@@ -2258,10 +2252,10 @@ func TestStreamBalanceShortfallWithoutFallbackReturns503(t *testing.T) {
 		t.Fatalf("失败响应应是 JSON: %s", contentType)
 	}
 
-	// 欠费账号仍然要被暂停。
+	// 上游报余额不足不应持久化暂停账号。
 	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
-	if account := findAccount(list["data"].([]any), accountID); account == nil || account["suspended"] != true {
-		t.Fatalf("欠费账号应被自动暂停: %#v", list["data"])
+	if account := findAccount(list["data"].([]any), accountID); account == nil || account["suspended"] != false {
+		t.Fatalf("上游余额不足不应自动暂停: %#v", list["data"])
 	}
 }
 

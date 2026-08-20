@@ -86,8 +86,7 @@ func New(options Options) (*App, error) {
 	manager.RequestWait = options.RequestRefreshWait
 	// 请求路径上的余额刷新：账号余额数据过期时先查一次再分配流量。
 	gw.SetRefresher(manager)
-	// 上游明确报余额不足时立刻暂停该账号并换账号重试。
-	gw.SetSuspender(manager)
+	// 仅本地余额扣到下限时才暂停账号；上游误报只影响当次换号，不写入暂停状态。
 	if options.PublicModels != nil {
 		gw.SetPublicModels(*options.PublicModels)
 	}

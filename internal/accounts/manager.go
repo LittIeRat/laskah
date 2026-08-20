@@ -434,30 +434,6 @@ func (m *Manager) refreshMany(ctx context.Context, ids []string) []any {
 	return results
 }
 
-// SuspendAccount 立即暂停一个账号，用于上游明确报告余额不足的场景。
-//
-// 不看 AutoSuspend 开关：上游已经拒绝了这次请求，继续放流量只会持续失败。
-// 返回该账号此刻是否处于暂停状态（并发下可能已被其它请求暂停）。
-func (m *Manager) SuspendAccount(accountID, reason string) bool {
-	if accountID == "" {
-		return false
-	}
-	if reason == "" {
-		reason = "上游报余额不足自动暂停"
-	}
-	suspended := false
-	_ = m.Store.Update(func(data *store.Data) error {
-		account := data.FindAccount(accountID)
-		if account == nil {
-			return nil
-		}
-		account.Suspend(reason)
-		suspended = account.Suspended
-		return nil
-	})
-	return suspended
-}
-
 // exhaustedReason 生成暂停原因，带上余额与生效下限，便于事后核对。
 func exhaustedReason(account *store.Account) string {
 	return fmt.Sprintf("余额触及下限自动暂停（余额 %.6f / 下限 %.2f %s）",

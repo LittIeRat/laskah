@@ -33,15 +33,6 @@ type BalanceRefresher interface {
 	RefreshForRequest(ctx context.Context, accountID string) bool
 }
 
-// AccountSuspender 在上游明确报告余额不足时立即暂停账号。
-//
-// 与定时/请求前的额度查询互补：有些站点余额查询接口有缓存或延迟，
-// 真正的“这一次请求都付不起”只有上游报错才知道，此时必须立刻把账号踢出池子。
-// 暂停而不是删除：账号、上游 API 与统计全部保留，管理员充值后重新启用即可。
-type AccountSuspender interface {
-	SuspendAccount(accountID, reason string) bool
-}
-
 // balanceExhaustedMarkers 是上游“余额/额度不足”的判定文案。
 //
 // 只在上游返回业务错误时匹配，且刻意不含 "rate limit"/"too many requests" 这类
@@ -229,9 +220,6 @@ type Gateway struct {
 	// Refresher 可为 nil，此时跳过请求时余额刷新。
 	Refresher BalanceRefresher
 
-	// Suspender 可为 nil，此时不做余额不足自动暂停。
-	Suspender AccountSuspender
-
 	// PublicModels 决定不带密钥访问 /v1/models 时是否列出全站模型目录。
 	//
 	// 打开（默认）时匿名请求得到全部可用账号提供的模型并集，只含模型名，
@@ -256,17 +244,21 @@ func (g *Gateway) SetRefresher(refresher BalanceRefresher) {
 	g.Refresher = refresher
 }
 
-// SetSuspender 注入余额不足自动暂停实现。
-func (g *Gateway) SetSuspender(suspender AccountSuspender) {
-	g.Suspender = suspender
-}
-
-// suspendExhaustedAccount 在上游报余额不足时暂停该账号，返回是否已暂停。
-func (g *Gateway) suspendExhaustedAccount(accountID string, detail string) bool {
-	if g.Suspender == nil || accountID == "" {
-		return false
+// switchExhaustedAccount 仅在本次请求里换号，不写入暂停状态。
+//
+// 用户要求“只有本地余额不足才暂停”，因此上游误报或预扣费失败都只影响当前请求：
+// 立刻换下一个账号重试，但不改账号持久化状态。
+func (g *Gateway) switchExhaustedAccount(r *http.Request, secret, model string, session Session) (Session, []*store.Provider, bool) {
+	_ = session
+	retrySession, retryErr := g.AuthenticateForModel(r.Context(), secret, model)
+	if retryErr != nil {
+		return Session{}, nil, false
 	}
-	return g.Suspender.SuspendAccount(accountID, "上游报余额不足自动暂停: "+truncateReason(detail))
+	retryCandidates := g.orderedProviders(model, retrySession)
+	if len(retryCandidates) == 0 {
+		return Session{}, nil, false
+	}
+	return retrySession, retryCandidates, true
 }
 
 // accountGate 构造账号级频率限制的准入判定。
@@ -597,22 +589,16 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request, spec i
 	// 避免大批账号同时欠费时把一次请求拖成长串串行重试。
 	accountSwitches := 0
 
-	// switchAccount 在“账号连这一次请求都付不起”时立刻暂停该账号并换一个账号，
-	// 成功时已就地刷新 session / candidates / maxAttempts，调用方只需重置循环下标。
+	// switchAccount 在上游报“这一次请求付不起”时只做当次换号，不改账号状态。
+	// 只有本地余额扣到下限时才会持久化暂停账号。
 	switchAccount := func(detail string) bool {
+		_ = detail
 		if accountSwitches >= maxAccountAttempts {
 			return false
 		}
-		if !g.suspendExhaustedAccount(session.AccountID, detail) {
-			return false
-		}
 		accountSwitches++
-		retrySession, retryErr := g.AuthenticateForModel(r.Context(), secret, model)
-		if retryErr != nil {
-			return false
-		}
-		retryCandidates := g.orderedProviders(model, retrySession)
-		if len(retryCandidates) == 0 {
+		retrySession, retryCandidates, ok := g.switchExhaustedAccount(r, secret, model, session)
+		if !ok {
 			return false
 		}
 		session = retrySession
@@ -854,9 +840,6 @@ func (g *Gateway) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		g.reportFailure(provider.ID, fmt.Errorf("HTTP %d", response.StatusCode))
 		g.recordKeyUsage(keyID, false, Usage{})
 		// 向量化没有多上游重试，但账号既然连这一次都付不起，也应立即退出分配池。
-		if snippet := string(raw); IsBalanceExhausted(response.StatusCode, snippet) {
-			g.suspendExhaustedAccount(session.AccountID, snippet)
-		}
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -1230,8 +1213,15 @@ func (g *Gateway) recordKeyUsage(keyID string, ok bool, usage Usage) {
 		}
 	})
 
-	if exhausted != "" && g.Suspender != nil {
-		g.Suspender.SuspendAccount(exhausted, "本地计费余额触及下限自动暂停")
+	if exhausted != "" {
+		_ = g.Store.Update(func(data *store.Data) error {
+			account := data.FindAccount(exhausted)
+			if account == nil || account.Suspended || !account.AutoSuspend || !account.Exhausted() {
+				return nil
+			}
+			account.Suspend("本地计费余额触及下限自动暂停")
+			return nil
+		})
 	}
 }
 
