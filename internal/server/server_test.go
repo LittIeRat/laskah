@@ -3075,3 +3075,81 @@ func asBoolValue(value any) bool {
 	flag, ok := value.(bool)
 	return ok && flag
 }
+
+// TestVendorPrefixedModelMatchesConfiguredProvider 覆盖 vendor/model 归一匹配：
+// modeloc 等探针会请求 anthropic/claude-fable-5，而后台常只配置 claude-fable-5。
+func TestVendorPrefixedModelMatchesConfiguredProvider(t *testing.T) {
+	h := newHarness(t)
+	hits := []string{}
+	upstream := fakeUpstream(t, &hits)
+	groupID := h.createGroup("团队 A")
+
+	_, accBody := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":    "claude",
+		"groupId": groupID,
+		"baseUrl": upstream.URL + "/v1",
+		"keys":    "sk-claude",
+		"models":  []string{"claude-fable-5"},
+	})
+	accountID := accBody["data"].(map[string]any)["id"].(string)
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client", "accountId": accountID})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+
+	body := chatBody()
+	body["model"] = "anthropic/claude-fable-5"
+	response, payload := h.do(http.MethodPost, "/v1/chat/completions", body, secret)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("vendor/model 应命中已配置账号: %d %#v", response.StatusCode, payload)
+	}
+	if len(hits) != 1 || hits[0] != "sk-claude" {
+		t.Fatalf("应命中配置了裸模型名的账号: %#v", hits)
+	}
+	if got := response.Header.Get("X-Lb-Upstream-Model"); got != "claude-fable-5" {
+		t.Fatalf("上游模型名应归一成裸模型: %q", got)
+	}
+}
+
+// TestRefreshRestoresSuspendedAccountWhenBalanceRecovered 覆盖“刷新后高于下限即自动恢复”。
+func TestRefreshRestoresSuspendedAccountWhenBalanceRecovered(t *testing.T) {
+	h := newHarness(t)
+	quota, used := 5000000.0, 0.0
+	site := fakeSite(t, &quota, &used)
+	upstreamHits := []string{}
+	upstream := fakeUpstream(t, &upstreamHits)
+	groupID := h.createGroup("恢复分组")
+
+	_, body := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":        "recoverable",
+		"groupId":     groupID,
+		"baseUrl":     upstream.URL + "/v1",
+		"siteUrl":     site.URL,
+		"userId":      "1",
+		"accessToken": "tok",
+		"keys":        "sk-a1",
+	})
+	accountID := body["data"].(map[string]any)["id"].(string)
+
+	if _, patched := h.admin(http.MethodPost, "/admin/accounts/"+accountID+"/enable", map[string]any{"enabled": false}); patched != nil {
+		// 仅触发请求，不校验 body
+	}
+	// 直接写成“已暂停且原因存在”，模拟一次历史暂停。
+	if err := h.app.Store.Update(func(data *store.Data) error {
+		acc := data.FindAccount(accountID)
+		acc.Suspended = true
+		acc.SuspendReason = "余额触及下限自动暂停（余额 0.1 / 下限 0.5 USD）"
+		now := time.Now().UTC()
+		acc.SuspendedAt = &now
+		return nil
+	}); err != nil {
+		t.Fatalf("写入测试状态失败: %v", err)
+	}
+
+	if response, refreshed := h.admin(http.MethodPost, "/admin/accounts/"+accountID+"/refresh", nil); response.StatusCode != http.StatusOK {
+		t.Fatalf("刷新失败: %d %#v", response.StatusCode, refreshed)
+	}
+	_, list := h.admin(http.MethodGet, "/admin/accounts", nil)
+	acc := findAccount(list["data"].([]any), accountID)
+	if acc == nil || acc["suspended"] != false {
+		t.Fatalf("刷新后余额高于下限应自动恢复: %#v", list["data"])
+	}
+}

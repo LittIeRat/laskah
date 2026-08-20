@@ -306,6 +306,28 @@ func HostLabel(baseURL string) string {
 	return parsed.Host
 }
 
+// NormalizeModelID 把供应商前缀模型名归一成“同一模型的可比较形态”。
+//
+// 例如 modeloc / 某些 SDK 会发 anthropic/claude-fable-5，而后台常配置 claude-fable-5；
+// 若只做精确字符串匹配，就会出现“明明有模型却 503 无账号可承接”。
+func NormalizeModelID(model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return ""
+	}
+	if slash := strings.Index(model, "/"); slash > 0 && slash < len(model)-1 {
+		return strings.TrimSpace(model[slash+1:])
+	}
+	return model
+}
+
+// modelIDsMatch 判断两个模型标识是否等价，兼容 vendor/model 与裸模型名互认。
+func modelIDsMatch(left, right string) bool {
+	left = NormalizeModelID(left)
+	right = NormalizeModelID(right)
+	return left != "" && left == right
+}
+
 // SupportsModel 判断上游是否可以处理该模型，支持通配符与别名。
 //
 // 模型列表为空表示“不限”，即接受任何模型。这是宽松匹配，
@@ -333,11 +355,17 @@ func (p *Provider) ExplicitlySupportsModel(model string) bool {
 	if _, ok := p.ModelMap[model]; ok {
 		return true
 	}
-	for _, pattern := range p.Models {
-		if pattern == model || pattern == "*" {
+	normalized := NormalizeModelID(model)
+	if normalized != model {
+		if _, ok := p.ModelMap[normalized]; ok {
 			return true
 		}
-		if WildcardMatch(pattern, model) {
+	}
+	for _, pattern := range p.Models {
+		if pattern == "*" || modelIDsMatch(pattern, model) {
+			return true
+		}
+		if WildcardMatch(pattern, model) || (normalized != model && WildcardMatch(pattern, normalized)) {
 			return true
 		}
 	}
@@ -349,7 +377,13 @@ func (p *Provider) UpstreamModel(model string) string {
 	if mapped, ok := p.ModelMap[model]; ok && mapped != "" {
 		return mapped
 	}
-	return model
+	normalized := NormalizeModelID(model)
+	if normalized != model {
+		if mapped, ok := p.ModelMap[normalized]; ok && mapped != "" {
+			return mapped
+		}
+	}
+	return normalized
 }
 
 // WildcardMatch 支持 gpt-4* 这类通配符匹配。
@@ -372,7 +406,7 @@ func (k *APIKey) AllowsModel(model string) bool {
 		return true
 	}
 	for _, allowed := range k.AllowedModels {
-		if allowed == model || allowed == "*" {
+		if allowed == "*" || modelIDsMatch(allowed, model) {
 			return true
 		}
 	}

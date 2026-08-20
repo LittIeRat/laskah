@@ -138,6 +138,19 @@ func firstAmount(pattern *regexp.Regexp, text string) (float64, bool) {
 	return value, true
 }
 
+// refreshAfterUpstreamShortfall 在上游报余额不足时主动刷新一次真实余额。
+//
+// 返回值语义：
+//   - refreshed=false: 无法刷新（无 refresher / 无账号），调用方按旧逻辑继续换号；
+//   - refreshed=true && usable=true: 刷新后余额仍高于下限，账号应视为可继续使用/重新启用；
+//   - refreshed=true && usable=false: 刷新后确认真的低于下限，调用方可换号或保持失败。
+func (g *Gateway) refreshAfterUpstreamShortfall(ctx context.Context, accountID string) (usable bool, refreshed bool) {
+	if g.Refresher == nil || accountID == "" {
+		return false, false
+	}
+	return g.Refresher.RefreshForRequest(ctx, accountID), true
+}
+
 // IsBalanceExhausted 判断上游错误是否属于“账号余额不足以完成一次请求”。
 //
 // 状态码先做粗筛：只有付费/权限/参数类错误才可能是余额问题，
@@ -638,11 +651,15 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request, spec i
 			g.reportFailure(provider.ID, statusErr)
 			attempts = append(attempts, map[string]any{"provider": provider.Name, "status": response.HTTP.StatusCode, "error": snippet})
 
-			// 上游明确说“这一次请求的余额都不够”时立刻暂停该账号，
-			// 并换一个账号重试，让调用方感知不到这次切换。
-			if IsBalanceExhausted(response.HTTP.StatusCode, snippet) && switchAccount(snippet) {
-				index = -1
-				continue
+			// 上游报余额不足时先主动刷新真实余额：
+			// 刷新后若仍高于下限，说明是上游误报/缓存延迟，不暂停；
+			// 刷新后若不可用，则仅对本次请求换号重试。
+			if IsBalanceExhausted(response.HTTP.StatusCode, snippet) {
+				_, _ = g.refreshAfterUpstreamShortfall(r.Context(), session.AccountID)
+				if switchAccount(snippet) {
+					index = -1
+					continue
+				}
 			}
 
 			if retryableStatus[response.HTTP.StatusCode] && index < maxAttempts-1 {
@@ -681,6 +698,7 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request, spec i
 			if errors.As(streamErr, &balanceErr) {
 				g.reportFailure(provider.ID, streamErr)
 				attempts = append(attempts, map[string]any{"provider": provider.Name, "error": balanceErr.Error()})
+				_, _ = g.refreshAfterUpstreamShortfall(r.Context(), session.AccountID)
 				switched := switchAccount(balanceErr.detail)
 				if switched && !balanceErr.streamed {
 					// 还没给调用方写过任何字节，可以完全透明地换号重来。
@@ -716,6 +734,7 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request, spec i
 			if detail, exhausted := balanceExhaustedInPayload(payload); exhausted {
 				g.reportFailure(provider.ID, errors.New("上游账号余额不足"))
 				attempts = append(attempts, map[string]any{"provider": provider.Name, "error": detail})
+				_, _ = g.refreshAfterUpstreamShortfall(r.Context(), session.AccountID)
 				if switchAccount(detail) {
 					index = -1
 					continue
