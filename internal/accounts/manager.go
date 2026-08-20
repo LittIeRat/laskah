@@ -4,6 +4,7 @@ package accounts
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -75,6 +76,14 @@ func (m *Manager) Refresh(ctx context.Context, id string) map[string]any {
 
 	snapshot := m.Wallet.Fetch(ctx, creds)
 	return m.apply(id, name, snapshot)
+}
+
+func suspendedByUpstreamBalance(reason string) bool {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return false
+	}
+	return strings.HasPrefix(reason, "上游报余额不足自动暂停")
 }
 
 // localResult 返回手动余额账号的本地余额视图，非手动余额账号返回 nil。
@@ -228,6 +237,13 @@ func (m *Manager) apply(id, name string, snapshot wallet.Snapshot) map[string]an
 		// 管理员充值后在 /manage 点「启用」即恢复。
 		if exhausted && account.AutoSuspend {
 			suspended = account.Suspend(exhaustedReason(account))
+		}
+		// 请求路径上游曾明确报“余额不足”时会先暂停再换号；
+		// 但少数站点会偶发误报，这里以真实余额刷新结果为准：
+		// 若已成功查到余额且仍高于下限，就自动解除这类上游误暂停。
+		if !exhausted && account.Suspended && suspendedByUpstreamBalance(account.SuspendReason) {
+			account.Resume()
+			suspended = false
 		}
 		if account.Suspended {
 			suspended = true
