@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"laskah/internal/store"
+	"laskah/internal/tokenizer"
 )
 
 // FromAnthropicRequest 把 Anthropic Messages 请求标准化成本站内部的 OpenAI chat 形态。
@@ -197,16 +198,22 @@ func anthropicStopReason(finish string) string {
 // ToAnthropicMessage 把 OpenAI chat.completion 响应转成 Anthropic message 响应。
 func ToAnthropicMessage(payload map[string]any, model string) map[string]any {
 	text := ""
+	thinking := ""
 	stopReason := "end_turn"
-	blocks := []any{}
+	toolBlocks := []any{}
 	if choices, ok := payload["choices"].([]any); ok && len(choices) > 0 {
 		if entry, ok := choices[0].(map[string]any); ok {
 			if message, ok := entry["message"].(map[string]any); ok {
 				text = ContentText(message["content"])
+				// 推理模型可能只填 reasoning_content 而把正文留空。原样丢弃会让
+				// Anthropic 客户端收到一条空消息，因此转成 thinking 块保留内容。
+				if reasoning := tokenizer.ReasoningContent(message); reasoning != nil {
+					thinking = ContentText(reasoning)
+				}
 				if calls, ok := message["tool_calls"].([]any); ok {
 					for _, item := range calls {
 						if block := anthropicToolUse(item); block != nil {
-							blocks = append(blocks, block)
+							toolBlocks = append(toolBlocks, block)
 						}
 					}
 				}
@@ -216,9 +223,15 @@ func ToAnthropicMessage(payload map[string]any, model string) map[string]any {
 			}
 		}
 	}
-	if text != "" || len(blocks) == 0 {
-		blocks = append([]any{map[string]any{"type": "text", "text": text}}, blocks...)
+	// 块顺序对齐官方实现：thinking → text → tool_use。
+	blocks := []any{}
+	if thinking != "" {
+		blocks = append(blocks, map[string]any{"type": "thinking", "thinking": thinking})
 	}
+	if text != "" || len(toolBlocks) == 0 {
+		blocks = append(blocks, map[string]any{"type": "text", "text": text})
+	}
+	blocks = append(blocks, toolBlocks...)
 
 	usage := usageFromMap(payload["usage"])
 	id, _ := payload["id"].(string)
@@ -278,6 +291,11 @@ type anthropicOutputRewriter struct {
 	promptTokens int64
 	opened       bool
 	stopReason   string
+
+	// blockIndex 是当前正在下发的内容块下标，blockKind 是它的类型（thinking / text）。
+	// 思维链与正文必须放在不同的块里，否则 Anthropic 客户端会把思维链当正文渲染。
+	blockIndex int
+	blockKind  string
 }
 
 func newAnthropicOutputRewriter(model string, promptTokens int64) *anthropicOutputRewriter {
@@ -299,6 +317,7 @@ func (r *anthropicOutputRewriter) Rewrite(chunk string) []string {
 		return nil
 	}
 	text := ""
+	thinking := ""
 	if choices, ok := decoded["choices"].([]any); ok {
 		for _, item := range choices {
 			entry, ok := item.(map[string]any)
@@ -309,76 +328,92 @@ func (r *anthropicOutputRewriter) Rewrite(chunk string) []string {
 				if value, ok := delta["content"].(string); ok {
 					text += value
 				}
+				if reasoning := tokenizer.ReasoningContent(delta); reasoning != nil {
+					thinking += ContentText(reasoning)
+				}
 			}
 			if finish, ok := entry["finish_reason"].(string); ok && finish != "" {
 				r.stopReason = anthropicStopReason(finish)
 			}
 		}
 	}
-	if text == "" {
+	if text == "" && thinking == "" {
 		return nil
 	}
 
-	lines := []string{}
-	if !r.opened {
-		r.opened = true
-		lines = append(lines,
-			anthropicEvent("message_start", map[string]any{
-				"type": "message_start",
-				"message": map[string]any{
-					"id":            r.id,
-					"type":          "message",
-					"role":          "assistant",
-					"model":         r.model,
-					"content":       []any{},
-					"stop_reason":   nil,
-					"stop_sequence": nil,
-					"usage":         map[string]any{"input_tokens": r.promptTokens, "output_tokens": 0},
-				},
-			}),
-			anthropicEvent("content_block_start", map[string]any{
-				"type":          "content_block_start",
-				"index":         0,
-				"content_block": map[string]any{"type": "text", "text": ""},
-			}),
-		)
+	lines := r.open()
+	if thinking != "" {
+		lines = append(lines, r.switchBlock("thinking")...)
+		lines = append(lines, anthropicEvent("content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": r.blockIndex,
+			"delta": map[string]any{"type": "thinking_delta", "thinking": thinking},
+		}))
 	}
-	lines = append(lines, anthropicEvent("content_block_delta", map[string]any{
-		"type":  "content_block_delta",
-		"index": 0,
-		"delta": map[string]any{"type": "text_delta", "text": text},
-	}))
+	if text != "" {
+		lines = append(lines, r.switchBlock("text")...)
+		lines = append(lines, anthropicEvent("content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": r.blockIndex,
+			"delta": map[string]any{"type": "text_delta", "text": text},
+		}))
+	}
 	return lines
 }
 
-func (r *anthropicOutputRewriter) Finish(outputTokens int64) []string {
-	lines := []string{}
-	if !r.opened {
-		// 上游一个字节都没给：仍要给出完整的事件骨架，否则客户端会一直等下去。
-		r.opened = true
-		lines = append(lines,
-			anthropicEvent("message_start", map[string]any{
-				"type": "message_start",
-				"message": map[string]any{
-					"id":            r.id,
-					"type":          "message",
-					"role":          "assistant",
-					"model":         r.model,
-					"content":       []any{},
-					"stop_reason":   nil,
-					"stop_sequence": nil,
-					"usage":         map[string]any{"input_tokens": r.promptTokens, "output_tokens": 0},
-				},
-			}),
-			anthropicEvent("content_block_start", map[string]any{
-				"type":          "content_block_start",
-				"index":         0,
-				"content_block": map[string]any{"type": "text", "text": ""},
-			}),
-		)
+// open 在首次下发前补出 message_start，重复调用无副作用。
+func (r *anthropicOutputRewriter) open() []string {
+	if r.opened {
+		return []string{}
 	}
+	r.opened = true
+	return []string{anthropicEvent("message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id":            r.id,
+			"type":          "message",
+			"role":          "assistant",
+			"model":         r.model,
+			"content":       []any{},
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			"usage":         map[string]any{"input_tokens": r.promptTokens, "output_tokens": 0},
+		},
+	})}
+}
+
+// switchBlock 切换到指定类型的内容块，必要时关闭上一个块并递增下标。
+func (r *anthropicOutputRewriter) switchBlock(kind string) []string {
+	if r.blockKind == kind {
+		return nil
+	}
+	lines := []string{}
+	if r.blockKind != "" {
+		lines = append(lines, anthropicEvent("content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": r.blockIndex,
+		}))
+		r.blockIndex++
+	}
+	r.blockKind = kind
+	block := map[string]any{"type": "text", "text": ""}
+	if kind == "thinking" {
+		block = map[string]any{"type": "thinking", "thinking": "", "signature": ""}
+	}
+	return append(lines, anthropicEvent("content_block_start", map[string]any{
+		"type":          "content_block_start",
+		"index":         r.blockIndex,
+		"content_block": block,
+	}))
+}
+
+func (r *anthropicOutputRewriter) Finish(outputTokens int64) []string {
+	// 上游一个字节都没给（或只给了空串）时也要补出完整骨架，
+	// 否则客户端会一直等一个永远不会到来的 message_stop。
+	lines := r.open()
+	lines = append(lines, r.switchBlock("text")...)
 	lines = append(lines,
-		anthropicEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0}),
+		anthropicEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": r.blockIndex}),
 		anthropicEvent("message_delta", map[string]any{
 			"type":  "message_delta",
 			"delta": map[string]any{"stop_reason": r.stopReason, "stop_sequence": nil},

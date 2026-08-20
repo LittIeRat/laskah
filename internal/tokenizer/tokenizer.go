@@ -352,6 +352,9 @@ func CountCompletionPayload(payload map[string]any) int64 {
 			}
 			if message, ok := entry["message"].(map[string]any); ok {
 				countContentInto(&counter, message["content"])
+				// 推理模型把思维链放在 reasoning_content，上游一样按输出 token 收费，
+				// 不计入会让本站的用量口径明显偏低。
+				countContentInto(&counter, ReasoningContent(message))
 				if calls, ok := message["tool_calls"]; ok && calls != nil {
 					counter.Add(jsonText(calls))
 				}
@@ -366,6 +369,30 @@ func CountCompletionPayload(payload map[string]any) int64 {
 		countContentInto(&counter, content)
 	}
 	return counter.Total()
+}
+
+// reasoningFields 是各家 OpenAI 兼容实现放思维链的字段名。
+var reasoningFields = []string{"reasoning_content", "reasoning"}
+
+// ReasoningContent 取出一个 message 或 delta 里的思维链内容，没有则返回 nil。
+func ReasoningContent(entry map[string]any) any {
+	if entry == nil {
+		return nil
+	}
+	for _, field := range reasoningFields {
+		value := entry[field]
+		switch typed := value.(type) {
+		case nil:
+			continue
+		case string:
+			if typed != "" {
+				return typed
+			}
+		default:
+			return typed
+		}
+	}
+	return nil
 }
 
 func jsonText(value any) string {

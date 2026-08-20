@@ -364,6 +364,9 @@ curl https://your-domain.com/v1/messages \
 Base URL 填 `https://your-domain.com/v1`。不带 `/v1` 前缀的同名路径也受支持，
 方便某些只认 `/chat/completions` 的客户端。
 
+**思维链计量**：推理模型放在 `reasoning_content` / `reasoning` 的内容计入本地输出 token，
+转 Anthropic 时单独走 `thinking` 块，不与正文混在同一个内容块里。
+
 **输出上限兜底**：上游忽略 `max_tokens` 时本站按「声明值 × 1.25 + 8」自己收口，
 非流式裁正文并把 `finish_reason` 改成 `length`，流式在上限处正常收尾。计费只算真正下发的部分。
 

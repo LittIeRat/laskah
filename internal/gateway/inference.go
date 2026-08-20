@@ -185,6 +185,10 @@ func chatStreamDelta(line string) string {
 		if text, ok := delta["content"].(string); ok {
 			out.WriteString(text)
 		}
+		// 推理模型的思维链走 reasoning_content，上游同样按输出 token 计费。
+		if reasoning := tokenizer.ReasoningContent(delta); reasoning != nil {
+			out.WriteString(ContentText(reasoning))
+		}
 		// 工具调用的参数也是上游产出的输出 token，必须计入。
 		if calls, ok := delta["tool_calls"]; ok && calls != nil {
 			if encoded, err := json.Marshal(calls); err == nil {
@@ -319,6 +323,17 @@ func enforceOutputLimit(payload map[string]any, limit int64) bool {
 				if text, ok := message["content"].(string); ok && text != "" {
 					if trimmed, cut := trimToTokens(text, hardCap); cut {
 						message["content"] = trimmed
+						truncated = true
+					}
+				}
+				// 思维链也算输出，忽略它就会出现「正文很短却计了几百 token」的错觉。
+				for _, field := range []string{"reasoning_content", "reasoning"} {
+					text, ok := message[field].(string)
+					if !ok || text == "" {
+						continue
+					}
+					if trimmed, cut := trimToTokens(text, hardCap); cut {
+						message[field] = trimmed
 						truncated = true
 					}
 				}

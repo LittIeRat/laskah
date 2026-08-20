@@ -122,3 +122,40 @@ func TestCountCompletionPayload(t *testing.T) {
 		t.Fatal("空响应应为 0")
 	}
 }
+
+// TestReasoningContentCounted 校验思维链被计入输出用量。
+//
+// 推理模型把正文留空、只填 reasoning_content 时，上游照样按输出 token 收费，
+// 漏计会让看板金额明显偏低。
+func TestReasoningContentCounted(t *testing.T) {
+	payload := map[string]any{"choices": []any{
+		map[string]any{"message": map[string]any{
+			"role":              "assistant",
+			"content":           nil,
+			"reasoning_content": "hello world",
+		}},
+	}}
+	if got := CountCompletionPayload(payload); got != CountText("hello world") {
+		t.Fatalf("reasoning_content 期望 %d，得到 %d", CountText("hello world"), got)
+	}
+
+	both := map[string]any{"choices": []any{
+		map[string]any{"message": map[string]any{
+			"role":      "assistant",
+			"content":   "answer",
+			"reasoning": "think",
+		}},
+	}}
+	// 计数器按累计字符估算，逐段相加会因取整偏大，这里用同一个 Counter 得到期望值。
+	var counter Counter
+	counter.Add("answer")
+	counter.Add("think")
+	want := counter.Total()
+	if got := CountCompletionPayload(both); got != want {
+		t.Fatalf("正文+思维链期望 %d，得到 %d", want, got)
+	}
+
+	if ReasoningContent(map[string]any{"reasoning_content": ""}) != nil {
+		t.Fatal("空思维链应视为不存在")
+	}
+}

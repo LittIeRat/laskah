@@ -508,3 +508,76 @@ func TestPreferDeclaredModel(t *testing.T) {
 		t.Fatalf("单候选应原样返回")
 	}
 }
+
+// TestToAnthropicMessageBlockOrder 校验出站块顺序与思维链保留。
+func TestToAnthropicMessageBlockOrder(t *testing.T) {
+	converted := ToAnthropicMessage(map[string]any{
+		"id": "resp_1",
+		"choices": []any{map[string]any{
+			"finish_reason": "stop",
+			"message": map[string]any{
+				"role":              "assistant",
+				"content":           "answer",
+				"reasoning_content": "think",
+			},
+		}},
+		"usage": map[string]any{"prompt_tokens": float64(7), "completion_tokens": float64(3)},
+	}, "kimi")
+
+	blocks, ok := converted["content"].([]any)
+	if !ok || len(blocks) != 2 {
+		t.Fatalf("content 块数量错误: %#v", converted["content"])
+	}
+	first := blocks[0].(map[string]any)
+	if first["type"] != "thinking" || first["thinking"] != "think" {
+		t.Fatalf("首块应为 thinking: %#v", first)
+	}
+	second := blocks[1].(map[string]any)
+	if second["type"] != "text" || second["text"] != "answer" {
+		t.Fatalf("次块应为 text: %#v", second)
+	}
+	if converted["stop_reason"] != "end_turn" {
+		t.Fatalf("stop_reason 错误: %v", converted["stop_reason"])
+	}
+}
+
+// TestAnthropicRewriterSeparatesThinkingBlock 校验流式思维链与正文分块下发。
+//
+// 两者混在同一个 index 里会让 Anthropic 客户端把思维链渲染成正式回答。
+func TestAnthropicRewriterSeparatesThinkingBlock(t *testing.T) {
+	rewriter := newAnthropicOutputRewriter("kimi", 12)
+	out := []string{}
+	out = append(out, rewriter.Rewrite(`data: {"choices":[{"delta":{"reasoning_content":"think"}}]}`)...)
+	out = append(out, rewriter.Rewrite(`data: {"choices":[{"delta":{"content":"answer"}}]}`)...)
+	out = append(out, rewriter.Finish(5)...)
+	joined := strings.Join(out, "")
+
+	for _, want := range []string{
+		`"type":"thinking_delta"`,
+		`"thinking":"think"`,
+		`"type":"text_delta"`,
+		`"text":"answer"`,
+		`"index":1`,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("缺少 %s:\n%s", want, joined)
+		}
+	}
+	if strings.Count(joined, "event: content_block_start") != 2 {
+		t.Fatalf("应有两个 content_block_start:\n%s", joined)
+	}
+	if strings.Count(joined, "event: content_block_stop") != 2 {
+		t.Fatalf("应有两个 content_block_stop:\n%s", joined)
+	}
+	if strings.Count(joined, "event: message_start") != 1 {
+		t.Fatalf("message_start 应只出现一次:\n%s", joined)
+	}
+}
+
+// TestChatStreamDeltaCountsReasoning 校验流式思维链计入本地输出用量。
+func TestChatStreamDeltaCountsReasoning(t *testing.T) {
+	got := chatStreamDelta(`data: {"choices":[{"delta":{"content":"a","reasoning_content":"b"}}]}`)
+	if !strings.Contains(got, "a") || !strings.Contains(got, "b") {
+		t.Fatalf("正文与思维链都应计入: %q", got)
+	}
+}
