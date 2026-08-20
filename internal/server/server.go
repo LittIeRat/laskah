@@ -205,6 +205,10 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	// Responses 是 OpenAI 的新形态兼容接口，与 chat 走同一套账号分配与计费。
 	mux.HandleFunc("/responses", a.Gateway.HandleResponses)
 	mux.HandleFunc("/v1/responses", a.Gateway.HandleResponses)
+	// Messages 是 Anthropic 兼容接口：Claude Code 与 Anthropic SDK 只认这个路径，
+	// 缺了它这些客户端在连通性探测阶段就会拿到 404。
+	mux.HandleFunc("/messages", a.Gateway.HandleMessages)
+	mux.HandleFunc("/v1/messages", a.Gateway.HandleMessages)
 	// 列表与单模型查询共用一个处理器：/v1/models 与 /v1/models/{id}。
 	mux.HandleFunc("/models", a.Gateway.HandleModels)
 	mux.HandleFunc("/models/", a.Gateway.HandleModels)

@@ -121,6 +121,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 - `POST /v1/chat/completions`（`/chat/completions` 亦可）
 - `POST /v1/responses`（`/responses` 亦可，OpenAI Responses 兼容，支持 `stream: true`）
+- `POST /v1/messages`（`/messages` 亦可，Anthropic Messages 兼容，支持 `stream: true`）
 - `POST /v1/completions`（内部转成 chat 调用）
 - `POST /v1/embeddings`
 - `GET /v1/models`、`GET /v1/models/{model}`
@@ -135,10 +136,34 @@ curl http://127.0.0.1:8787/v1/responses \
   -d '{"model":"gpt-4o-mini","input":"hi"}'
 ```
 
-两个端点的账号分配、余额判定、频率限制、截断换号与本地计量逻辑完全一致，只是请求 / 响应结构不同。
+Anthropic 示例（Claude Code / Anthropic SDK 的默认形态）：
+
+```bash
+curl http://127.0.0.1:8787/v1/messages \
+  -H "x-api-key: sk-你的网关密钥" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","max_tokens":64,"system":"只回复 OK","messages":[{"role":"user","content":"hi"}]}'
+```
+
+三个端点的账号分配、余额判定、频率限制、截断换号与本地计量逻辑完全一致，只是请求 / 响应结构不同。
+入站请求先归一成内部 OpenAI 形态，出站再翻回调用方协议，因此上游是 OpenAI 兼容站还是 Anthropic 原生站都不影响调度与计费。
+`/v1/messages` 的流式返回是原生 Anthropic 事件序列（`message_start` → `content_block_delta` → `message_stop`），不混入 OpenAI 的 `chat.completion.chunk` 与 `[DONE]`。
+
 账号默认按 Base URL 拼 `/chat/completions`、`/responses`、`/models`；上游路径不标准时可在创建账号时逐个填**完整地址**覆盖。
 
 上游类型支持 OpenAI 兼容与 Anthropic（`type: anthropic` 时自动做请求 / 响应 / 流式格式转换）。
+转换只重写协议差异字段（system / messages / stop / tools），其余参数原样透传，避免 `thinking`、`metadata` 这类新参数被网关静默丢掉。
+
+### 输出上限兜底
+
+实测有中转站完全忽略 `max_tokens`（声明 8 却返回几百 token）。本站会按声明的
+`max_tokens` / `max_completion_tokens` / `max_output_tokens` 自己收口：
+
+- 硬上限 = 声明值 × 1.25 + 8。本地估算刻意偏保守，留这点余量才不会砍掉合规输出。
+- 非流式：裁掉超出部分，`finish_reason` 改成 `length`（Responses 改成 `status: incomplete`）。
+- 流式：越过硬上限立刻停止转发并按当前协议正常收尾，不会让客户端干等。
+- 计费只按真正下发给调用方的正文算，不替忽略上限的上游多收钱。
 
 ## /v1/models 输出格式
 
@@ -569,7 +594,7 @@ go vet ./...
 go test ./... -count=1
 ```
 
-接口级冒烟，65 项断言（Windows；会重置本地数据并留下一套演示数据）：
+接口级冒烟，69 项断言（Windows；会重置本地数据并留下一套演示数据）：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-local.ps1

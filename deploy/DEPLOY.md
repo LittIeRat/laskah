@@ -335,6 +335,7 @@ curl https://your-domain.com/v1/chat/completions \
 | --- | --- |
 | `POST /v1/chat/completions` | 主入口，支持 `stream:true` |
 | `POST /v1/responses` | OpenAI Responses 兼容，支持 `stream:true` |
+| `POST /v1/messages` | Anthropic Messages 兼容（Claude Code / Anthropic SDK），支持 `stream:true` 与 `x-api-key` |
 | `POST /v1/completions` | 旧版补全，内部转成 messages |
 | `POST /v1/embeddings` | 向量化 |
 | `GET /v1/models` | 严格 OpenAI 规范：`{"object":"list","data":[{"id","object","created","owned_by"}]}`；不带密钥时返回公开模型目录（可用 `PUBLIC_MODELS=false` 关闭） |
@@ -350,8 +351,21 @@ curl https://your-domain.com/v1/responses \
   -d '{"model":"gpt-4o-mini","input":"你好"}'
 ```
 
+Anthropic 客户端把 Base URL 填 `https://your-domain.com`，鉴权用 `x-api-key`：
+
+```bash
+curl https://your-domain.com/v1/messages \
+  -H "x-api-key: <网关密钥>" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}'
+```
+
 Base URL 填 `https://your-domain.com/v1`。不带 `/v1` 前缀的同名路径也受支持，
 方便某些只认 `/chat/completions` 的客户端。
+
+**输出上限兜底**：上游忽略 `max_tokens` 时本站按「声明值 × 1.25 + 8」自己收口，
+非流式裁正文并把 `finish_reason` 改成 `length`，流式在上限处正常收尾。计费只算真正下发的部分。
 
 `/v1/models` 只列出该密钥真正能调到的模型：账号可用、上游启用、密钥白名单允许，
 通配符（`gpt-4*`）只用于请求期匹配，不会作为可枚举 id 暴露。`owned_by` 统一为
@@ -481,7 +495,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-local.ps1
 powershell -NoProfile -File scripts\stop-local.ps1
 ```
 
-`scripts\smoke-local.ps1` 覆盖 64 项断言：初始化、登录限速、角色隔离、CSRF、
+`scripts\smoke-local.ps1` 覆盖 69 项断言：初始化、登录限速、角色隔离、CSRF、
 分组启停、5 个 API 上限、无限余额、批量密钥、看板汇总、`/v1/models` 规范、
 额度查询脚本校验与脚本账号创建、安全响应头、旧地址 `/keys → /dashboard` 重定向。
 

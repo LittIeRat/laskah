@@ -240,8 +240,22 @@ curl https://你的域名/v1/responses \
   -d '{"model":"gpt-4o-mini","input":"你好"}'
 ```
 
-Base URL 填 `https://你的域名/v1`，兼容 `/chat/completions`、`/responses`、`/completions`、
-`/embeddings`、`/models`。`stream:true` 走 SSE。
+Anthropic 客户端（Claude Code、Anthropic SDK）用 `/v1/messages` + `x-api-key`：
+
+```bash
+curl https://你的域名/v1/messages \
+  -H "x-api-key: 你的网关密钥" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}'
+```
+
+Base URL 填 `https://你的域名/v1`，兼容 `/chat/completions`、`/responses`、`/messages`、
+`/completions`、`/embeddings`、`/models`。`stream:true` 走 SSE，
+`/v1/messages` 的流式返回是原生 Anthropic 事件序列。
+
+上游忽略 `max_tokens` 时本站会自己收口（硬上限 = 声明值 × 1.25 + 8），
+非流式裁正文并把 `finish_reason` 改成 `length`，流式在上限处正常收尾，计费只算真正下发的部分。
 
 **不带密钥直接打开 `/v1/models`** 会列出全站可用账号提供的模型并集（公开目录），
 浏览器里就能直接确认这个站支持什么模型，`/v1/models/{模型名}` 也可匿名查询；

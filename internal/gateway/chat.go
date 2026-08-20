@@ -486,6 +486,14 @@ func (g *Gateway) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	g.handleInference(w, r, responsesSpec())
 }
 
+// HandleMessages 是 /v1/messages 的入口（Anthropic Messages 兼容）。
+//
+// 很多客户端（Claude Code、Anthropic SDK）只会用 x-api-key + /v1/messages 接入，
+// 只提供 OpenAI 形态会让它们在连通性探测阶段就拿到 404。
+func (g *Gateway) HandleMessages(w http.ResponseWriter, r *http.Request) {
+	g.handleInference(w, r, messagesSpec())
+}
+
 // handleInference 是两个推理端点共享的主流程。
 //
 // 顺序刻意是「先验密钥 → 再读 model → 最后分配账号」：
@@ -512,6 +520,11 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request, spec i
 		httpx.Error(w, http.StatusBadRequest, message, nil)
 		return
 	}
+	// 入站协议先归一到内部 OpenAI 形态：之后的账号分配、限流、计量与换号
+	// 只认这一种形态，新增入口协议不会让主流程分叉。
+	if spec.inbound != nil {
+		body = spec.inbound(body)
+	}
 	model := strings.TrimSpace(store.MustString(body["model"]))
 	if model == "" {
 		httpx.Error(w, http.StatusBadRequest, "model 字段不能为空", nil)
@@ -520,6 +533,8 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request, spec i
 
 	// 输入 token 在发出请求前就能算出来，与上游是否返回 usage 无关。
 	promptTokens := countPromptTokens(body)
+	// 调用方声明的输出上限：上游忽略它时由本站兜底截断。
+	outputLimit := outputTokenLimit(body)
 
 	var (
 		allowsModel bool
@@ -666,7 +681,10 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request, spec i
 		w.Header().Set("X-Lb-Endpoint", spec.endpoint)
 
 		if stream {
-			result, streamErr := g.pipeStream(w, response, provider, model, spec)
+			result, streamErr := g.pipeStream(w, response, provider, model, spec, streamOptions{
+				outputLimit:  outputLimit,
+				promptTokens: promptTokens,
+			})
 			response.HTTP.Body.Close()
 			response.Cancel()
 			g.adjustInflight(provider.ID, -1)
@@ -732,10 +750,18 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request, spec i
 			return
 		}
 
+		// 上游忽略 max_tokens 时本站兜底截断：否则调用方按上限做的预算与展示全部失真，
+		// 计费也会按上游多吐的部分收钱。截断后 finish_reason 改成 length，语义与 OpenAI 一致。
+		enforceOutputLimit(payload, outputLimit)
+
 		// 输出 token 由响应正文自行统计，然后覆盖上游给出的 usage：
 		// 下游看到的用量与本站计费口径一致，不会因上游谎报而对不上账。
 		usage := localUsage(promptTokens, tokenizer.CountCompletionPayload(payload), upstreamUsage.TotalTokens)
 		payload["usage"] = usageBody(usage)
+
+		if spec.outbound != nil {
+			payload = spec.outbound(payload, model)
+		}
 
 		g.reportSuccess(provider.ID, time.Since(response.StartedAt), usage)
 		g.recordKeyUsage(keyID, true, usage)
@@ -947,6 +973,15 @@ func finishTruncatedStream(w http.ResponseWriter, model string) {
 	}
 }
 
+// streamOptions 是一次流式转发的可选约束。
+type streamOptions struct {
+	// outputLimit 是调用方声明的输出上限，0 表示未声明。
+	outputLimit int64
+
+	// promptTokens 是本站算出的输入 token，供需要在首个事件里回报用量的协议使用。
+	promptTokens int64
+}
+
 // streamResult 是一次流式转发的用量结果。
 //
 // completionTokens 是本站自己按下发正文累计出的输出 token；
@@ -954,6 +989,9 @@ func finishTruncatedStream(w http.ResponseWriter, model string) {
 type streamResult struct {
 	completionTokens int64
 	upstream         Usage
+
+	// overLimit 表示上游无视 max_tokens，本站主动截断了输出。
+	overLimit bool
 }
 
 // pipeStream 把上游 SSE 转发给调用方，同时在本地累计输出 token。
@@ -963,7 +1001,10 @@ type streamResult struct {
 //
 // 输出 token 按「真正下发给调用方的正文」累计，因此与上游是否返回 usage 无关，
 // 中途截断也只会计到截断处，不会替上游多算钱。
-func (g *Gateway) pipeStream(w http.ResponseWriter, response *Response, provider *store.Provider, model string, spec inferenceSpec) (streamResult, error) {
+//
+// 声明了输出上限时，累计量一旦越过硬上限就停止转发并收尾：有些中转站完全忽略
+// max_tokens，不收口会让调用方的预算与展示全部失真，也会按多吐的部分计费。
+func (g *Gateway) pipeStream(w http.ResponseWriter, response *Response, provider *store.Provider, model string, spec inferenceSpec, options streamOptions) (streamResult, error) {
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(response.HTTP.Body)
 	result := streamResult{}
@@ -971,6 +1012,12 @@ func (g *Gateway) pipeStream(w http.ResponseWriter, response *Response, provider
 	converter := newAnthropicStreamConverter(model)
 	useAnthropic := spec.anthropic && provider.Type == store.TypeAnthropic
 	started := false
+	hardCap := outputHardCap(options.outputLimit)
+
+	var rewriter streamRewriter
+	if spec.newRewriter != nil {
+		rewriter = spec.newRewriter(model, options.promptTokens)
+	}
 
 	begin := func() {
 		if started {
@@ -984,19 +1031,45 @@ func (g *Gateway) pipeStream(w http.ResponseWriter, response *Response, provider
 		header.Set("X-Accel-Buffering", "no")
 		w.WriteHeader(http.StatusOK)
 	}
-	emit := func(chunk string) error {
+	write := func(text string) error {
 		begin()
-		if _, err := io.WriteString(w, chunk); err != nil {
-			return err
-		}
+		_, err := io.WriteString(w, text)
+		return err
+	}
+	// emit 只接受内部形态的 chunk：先按内部形态累计 token，再按出站协议改写下发，
+	// 这样计量口径与协议无关，新增出站协议不影响计费。
+	emit := func(chunk string) error {
 		if delta := spec.streamDelta(chunk); delta != "" {
 			counter.Add(delta)
+		}
+		if rewriter == nil {
+			return write(chunk)
+		}
+		for _, line := range rewriter.Rewrite(chunk) {
+			if err := write(line); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
 	finish := func(err error) (streamResult, error) {
 		result.completionTokens = counter.Total()
 		return result, err
+	}
+	// closeStream 补齐出站协议的收尾事件。
+	closeStream := func(stopReason string) error {
+		if rewriter == nil {
+			return nil
+		}
+		if stopReason != "" {
+			rewriter.SetStopReason(stopReason)
+		}
+		for _, line := range rewriter.Finish(counter.Total()) {
+			if err := write(line); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
 	for {
@@ -1026,6 +1099,23 @@ func (g *Gateway) pipeStream(w http.ResponseWriter, response *Response, provider
 			if started && flusher != nil {
 				flusher.Flush()
 			}
+			// 越过硬上限就地收口：继续读只会替忽略 max_tokens 的上游多计费。
+			if hardCap > 0 && counter.Total() > hardCap {
+				result.overLimit = true
+				if rewriter != nil {
+					if closeErr := closeStream("max_tokens"); closeErr != nil {
+						return finish(closeErr)
+					}
+				} else {
+					begin()
+					overLimit := spec.overLimit
+					if overLimit == nil {
+						overLimit = spec.truncate
+					}
+					overLimit(w, model)
+				}
+				return finish(nil)
+			}
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -1035,11 +1125,16 @@ func (g *Gateway) pipeStream(w http.ResponseWriter, response *Response, provider
 		}
 	}
 
-	if useAnthropic {
-		if err := emit("data: [DONE]\n\n"); err != nil {
+	if useAnthropic && rewriter == nil {
+		if err := write("data: [DONE]\n\n"); err != nil {
 			return finish(err)
 		}
+	}
+	if useAnthropic {
 		result.upstream = converter.usage
+	}
+	if closeErr := closeStream(""); closeErr != nil {
+		return finish(closeErr)
 	}
 	// 上游一个字节都没给（空流）时也要落地响应头，否则调用方收不到结束。
 	begin()

@@ -132,7 +132,7 @@ func SetCORS(w http.ResponseWriter, allowOrigin string) {
 	}
 	header := w.Header()
 	header.Set("Access-Control-Allow-Origin", allowOrigin)
-	header.Set("Access-Control-Allow-Headers", "authorization, content-type, x-api-key, x-admin-token, x-csrf-token")
+	header.Set("Access-Control-Allow-Headers", "authorization, content-type, x-api-key, x-admin-token, x-csrf-token, anthropic-version, anthropic-beta")
 	header.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
 	header.Set("Access-Control-Max-Age", "600")
 }

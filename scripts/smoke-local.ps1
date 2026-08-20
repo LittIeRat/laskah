@@ -652,6 +652,37 @@ Step 'POST /responses 与 /v1/responses 等价' {
   'HTTP 400（同一处理器）'
 }
 
+Step 'POST /v1/messages 无密钥返回 401（Anthropic 兼容路由已就位）' {
+  $r = Api POST '/v1/messages' @{ model = 'gpt-4o-mini'; max_tokens = 8; messages = @(@{ role = 'user'; content = 'hi' }) } -Expect 401
+  'HTTP 401'
+}
+
+Step 'POST /v1/messages 缺少 messages 返回 400' {
+  $r = Api POST '/v1/messages' @{ model = 'gpt-4o-mini'; max_tokens = 8 } -Bearer $gatewayKey -Expect 400
+  'HTTP 400'
+}
+
+Step 'POST /messages 与 /v1/messages 等价' {
+  $r = Api POST '/messages' @{ model = 'gpt-4o-mini'; max_tokens = 8 } -Bearer $gatewayKey -Expect 400
+  'HTTP 400（同一处理器）'
+}
+
+Step 'POST /v1/messages 支持 x-api-key 鉴权' {
+  # Anthropic 客户端默认用 x-api-key；这里用无效密钥确认它确实被当成密钥读取（401 而不是 400/404）。
+  $headers = @{ 'x-api-key' = 'sk-not-a-real-key'; 'anthropic-version' = '2023-06-01' }
+  $payload = [System.Text.Encoding]::UTF8.GetBytes((@{ model = 'gpt-4o-mini'; max_tokens = 8; messages = @(@{ role = 'user'; content = 'hi' }) } | ConvertTo-Json -Depth 6 -Compress))
+  $status = 0
+  try {
+    $r = Invoke-WebRequest -Uri ($base + '/v1/messages') -Method POST -Body $payload -ContentType 'application/json; charset=utf-8' -Headers $headers -UseBasicParsing -TimeoutSec 20
+    $status = [int]$r.StatusCode
+  } catch [System.Net.WebException] {
+    if ($null -eq $_.Exception.Response) { throw }
+    $status = [int]$_.Exception.Response.StatusCode
+  }
+  if ($status -ne 401) { throw ('x-api-key 未被当成网关密钥读取，HTTP ' + $status) }
+  'HTTP 401（x-api-key 已识别）'
+}
+
 Step 'GET /v1/models 返回准确模型列表' {
   $r = Api GET '/v1/models' -Bearer $gatewayKey -Expect 200
   if ($r.Data.object -ne 'list') { throw 'object 不是 list' }

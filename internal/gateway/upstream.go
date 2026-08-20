@@ -139,11 +139,31 @@ func ContentText(content any) string {
 	}
 }
 
+// anthropicDroppedFields 是不能原样带进 Anthropic 请求的 OpenAI 专有字段。
+//
+// 其余字段一律透传：白名单式转换会把 tools、thinking、metadata 这类参数静默丢掉，
+// 调用方就会看到「中转站忽略了我的参数」，而问题其实出在网关的转换层。
+var anthropicDroppedFields = map[string]bool{
+	"model": true, "stream": true, "messages": true, "system": true,
+	"max_tokens": true, "max_completion_tokens": true, "max_output_tokens": true,
+	"stop": true, "stop_sequences": true,
+	"frequency_penalty": true, "presence_penalty": true, "logit_bias": true,
+	"n": true, "logprobs": true, "top_logprobs": true, "seed": true,
+	"response_format": true, "stream_options": true, "user": true,
+	"parallel_tool_calls": true, "reasoning_effort": true,
+}
+
 // ToAnthropicBody 把 OpenAI 风格请求转换成 Anthropic messages 请求。
 func ToAnthropicBody(body map[string]any) map[string]any {
 	payload := map[string]any{
 		"model":  body["model"],
 		"stream": asBool(body["stream"]),
+	}
+	for key, value := range body {
+		if anthropicDroppedFields[key] {
+			continue
+		}
+		payload[key] = value
 	}
 
 	systemParts := []string{}
@@ -194,8 +214,55 @@ func ToAnthropicBody(body map[string]any) map[string]any {
 		case string:
 			payload["stop_sequences"] = []any{typed}
 		}
+	} else if stops, ok := body["stop_sequences"]; ok {
+		payload["stop_sequences"] = stops
+	}
+	if tools, ok := payload["tools"]; ok {
+		payload["tools"] = toAnthropicTools(tools)
 	}
 	return payload
+}
+
+// toAnthropicTools 把 OpenAI function 工具定义转成 Anthropic 的 tools 形态。
+//
+// 已经是 Anthropic 形态（带 input_schema）的条目原样保留，
+// 这样「Anthropic 进 → Anthropic 出」不会被来回翻译弄坏。
+func toAnthropicTools(value any) any {
+	list, ok := value.([]any)
+	if !ok {
+		return value
+	}
+	converted := []any{}
+	for _, item := range list {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, native := entry["input_schema"]; native {
+			converted = append(converted, entry)
+			continue
+		}
+		function, ok := entry["function"].(map[string]any)
+		if !ok {
+			converted = append(converted, entry)
+			continue
+		}
+		name, _ := function["name"].(string)
+		if name == "" {
+			continue
+		}
+		tool := map[string]any{"name": name}
+		if description, ok := function["description"].(string); ok && description != "" {
+			tool["description"] = description
+		}
+		if schema, ok := function["parameters"]; ok && schema != nil {
+			tool["input_schema"] = schema
+		} else {
+			tool["input_schema"] = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		converted = append(converted, tool)
+	}
+	return converted
 }
 
 // FromAnthropicResponse 把 Anthropic 响应转换成 OpenAI chat.completion 结构。

@@ -20,7 +20,7 @@ laskah.example.com {
     }
 
     # 网关端点：关掉缓冲保证 SSE 实时性。
-    @gateway path /v1/* /chat/* /completions /embeddings /models /models/*
+    @gateway path /v1/* /chat/* /completions /embeddings /models /models/* /responses /messages
     handle @gateway {
         reverse_proxy 127.0.0.1:8787 {
             flush_interval -1

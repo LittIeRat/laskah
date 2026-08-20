@@ -2785,3 +2785,299 @@ func TestSlowBalanceQueryDoesNotBlockRequest(t *testing.T) {
 		t.Fatal("应确实发起过额度查询")
 	}
 }
+
+// TestAnthropicMessagesCompatibility 验证 /v1/messages 走 Anthropic 协议双向转换。
+//
+// Claude Code 与 Anthropic SDK 只会用 x-api-key + /v1/messages 接入，
+// 缺了这个端点它们在连通性探测阶段就拿到 404；这里同时锁定请求转换
+// （system 字段必须变成 system 消息送给上游）与响应形态（type=message + content 块）。
+func TestAnthropicMessagesCompatibility(t *testing.T) {
+	h := newHarness(t)
+	quota, used := 5000000.0, 0.0
+	site := fakeSite(t, &quota, &used)
+
+	var seen atomic.Value
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models", "/models":
+			_, _ = fmt.Fprint(w, `{"data":[{"id":"gpt-4o-mini"}]}`)
+			return
+		case "/v1/chat/completions", "/chat/completions":
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		body := map[string]any{}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		seen.Store(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"cmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"你好"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	groupID := h.createGroup("团队 A")
+	if response, body := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":           "acct",
+		"groupId":        groupID,
+		"baseUrl":        upstream.URL + "/v1",
+		"siteUrl":        site.URL,
+		"userId":         "1",
+		"accessToken":    "tok",
+		"keys":           "sk-m1",
+		"selectedModels": []string{"gpt-4o-mini"},
+	}); response.StatusCode != http.StatusCreated {
+		t.Fatalf("创建账号失败: %d %#v", response.StatusCode, body)
+	}
+
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client"})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+
+	request := map[string]any{
+		"model":      "gpt-4o-mini",
+		"max_tokens": 64,
+		"system":     "只回复 OK",
+		"messages":   []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "hi"}}}},
+	}
+	response, body := h.do(http.MethodPost, "/v1/messages", request, secret)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("/v1/messages 应可用: %d %#v", response.StatusCode, body)
+	}
+	if body["type"] != "message" || body["role"] != "assistant" {
+		t.Fatalf("响应应是 Anthropic message 形态: %#v", body)
+	}
+	blocks, ok := body["content"].([]any)
+	if !ok || len(blocks) == 0 {
+		t.Fatalf("响应缺少 content 块: %#v", body)
+	}
+	first := blocks[0].(map[string]any)
+	if first["type"] != "text" || first["text"] != "你好" {
+		t.Fatalf("正文未正确转换: %#v", blocks)
+	}
+	if body["stop_reason"] != "end_turn" {
+		t.Fatalf("stop_reason 错误: %#v", body["stop_reason"])
+	}
+	usage, ok := body["usage"].(map[string]any)
+	if !ok || usage["output_tokens"].(float64) != float64(tokenizer.CountText("你好")) {
+		t.Fatalf("用量应是本地口径: %#v", body["usage"])
+	}
+
+	// system 必须以 system 消息的形式送到上游，不能被丢掉。
+	sent, _ := seen.Load().(map[string]any)
+	messages, ok := sent["messages"].([]any)
+	if !ok || len(messages) != 2 {
+		t.Fatalf("上游收到的消息数不对: %#v", sent)
+	}
+	head := messages[0].(map[string]any)
+	if head["role"] != "system" || head["content"] != "只回复 OK" {
+		t.Fatalf("system 指令未透传给上游: %#v", messages)
+	}
+	if sent["max_tokens"].(float64) != 64 {
+		t.Fatalf("max_tokens 未透传: %#v", sent)
+	}
+
+	// x-api-key 是 Anthropic 客户端的默认鉴权头，必须与 Bearer 等价。
+	raw, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("序列化失败: %v", err)
+	}
+	keyRequest, err := http.NewRequest(http.MethodPost, h.server.URL+"/v1/messages", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("构造请求失败: %v", err)
+	}
+	keyRequest.Header.Set("Content-Type", "application/json")
+	keyRequest.Header.Set("X-Api-Key", secret)
+	keyRequest.Header.Set("Anthropic-Version", "2023-06-01")
+	keyResponse, err := h.client.Do(keyRequest)
+	if err != nil {
+		t.Fatalf("x-api-key 请求失败: %v", err)
+	}
+	keyResponse.Body.Close()
+	if keyResponse.StatusCode != http.StatusOK {
+		t.Fatalf("x-api-key 应与 Bearer 等价: %d", keyResponse.StatusCode)
+	}
+
+	// 不带 /v1 前缀同样可用。
+	if response, bare := h.do(http.MethodPost, "/messages", request, secret); response.StatusCode != http.StatusOK {
+		t.Fatalf("/messages 应与 /v1/messages 等价: %d %#v", response.StatusCode, bare)
+	}
+}
+
+// TestAnthropicMessagesStreamEmitsNativeEvents 验证 /v1/messages 流式返回 Anthropic 事件序列。
+func TestAnthropicMessagesStreamEmitsNativeEvents(t *testing.T) {
+	h := newHarness(t)
+	quota, used := 5000000.0, 0.0
+	site := fakeSite(t, &quota, &used)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models", "/models":
+			_, _ = fmt.Fprint(w, `{"data":[{"id":"gpt-4o-mini"}]}`)
+			return
+		case "/v1/chat/completions", "/chat/completions":
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"世界\"},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+
+	groupID := h.createGroup("团队 A")
+	if response, body := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":           "acct",
+		"groupId":        groupID,
+		"baseUrl":        upstream.URL + "/v1",
+		"siteUrl":        site.URL,
+		"userId":         "1",
+		"accessToken":    "tok",
+		"keys":           "sk-m2",
+		"selectedModels": []string{"gpt-4o-mini"},
+	}); response.StatusCode != http.StatusCreated {
+		t.Fatalf("创建账号失败: %d %#v", response.StatusCode, body)
+	}
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client"})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+
+	response, raw := h.doRaw(http.MethodPost, "/v1/messages", map[string]any{
+		"model":      "gpt-4o-mini",
+		"max_tokens": 128,
+		"stream":     true,
+		"messages":   []any{map[string]any{"role": "user", "content": "hi"}},
+	}, secret)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("流式 /v1/messages 失败: %d %s", response.StatusCode, raw)
+	}
+	for _, marker := range []string{
+		"event: message_start",
+		"event: content_block_start",
+		"event: content_block_delta",
+		"event: content_block_stop",
+		"event: message_delta",
+		"event: message_stop",
+		"你好",
+		"世界",
+	} {
+		if !strings.Contains(raw, marker) {
+			t.Fatalf("流式输出缺少 %q: %s", marker, raw)
+		}
+	}
+	// Anthropic 客户端不认 OpenAI 的 chat.completion.chunk 与 [DONE]。
+	if strings.Contains(raw, "chat.completion.chunk") || strings.Contains(raw, "[DONE]") {
+		t.Fatalf("Anthropic 流里混入了 OpenAI 事件: %s", raw)
+	}
+
+	_, totals := h.admin(http.MethodGet, "/admin/accounts/totals", nil)
+	tokens := totals["data"].(map[string]any)["tokens"].(map[string]any)
+	if tokens["completion"].(float64) != float64(tokenizer.CountText("你好世界")) {
+		t.Fatalf("输出 token 应按下发正文累计: %#v", tokens)
+	}
+}
+
+// TestOutputTokenLimitIsEnforced 锁定「上游忽略 max_tokens 时本站兜底截断」。
+//
+// 实测有中转站声明上限 8 却返回几百 token：不收口会让调用方的预算与展示失真，
+// 也会按上游多吐的部分计费。
+func TestOutputTokenLimitIsEnforced(t *testing.T) {
+	h := newHarness(t)
+	quota, used := 5000000.0, 0.0
+	site := fakeSite(t, &quota, &used)
+
+	long := strings.Repeat("春天来了草长莺飞", 80)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models", "/models":
+			_, _ = fmt.Fprint(w, `{"data":[{"id":"gpt-4o-mini"}]}`)
+			return
+		case "/v1/chat/completions", "/chat/completions":
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		body := map[string]any{}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		if asBoolValue(body["stream"]) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			for i := 0; i < 40; i++ {
+				chunk, _ := json.Marshal(map[string]any{
+					"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": "春天来了草长莺飞"}}},
+				})
+				_, _ = io.WriteString(w, "data: "+string(chunk)+"\n\n")
+			}
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			return
+		}
+		payload, _ := json.Marshal(map[string]any{
+			"id":      "cmpl_1",
+			"object":  "chat.completion",
+			"choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": long}, "finish_reason": "stop"}},
+		})
+		_, _ = w.Write(payload)
+	}))
+	t.Cleanup(upstream.Close)
+
+	groupID := h.createGroup("团队 A")
+	if response, body := h.admin(http.MethodPost, "/admin/accounts", map[string]any{
+		"name":           "acct",
+		"groupId":        groupID,
+		"baseUrl":        upstream.URL + "/v1",
+		"siteUrl":        site.URL,
+		"userId":         "1",
+		"accessToken":    "tok",
+		"keys":           "sk-l1",
+		"selectedModels": []string{"gpt-4o-mini"},
+	}); response.StatusCode != http.StatusCreated {
+		t.Fatalf("创建账号失败: %d %#v", response.StatusCode, body)
+	}
+	_, keyBody := h.admin(http.MethodPost, "/admin/keys", map[string]any{"name": "client"})
+	secret := keyBody["data"].(map[string]any)["key"].(string)
+
+	response, body := h.do(http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":      "gpt-4o-mini",
+		"max_tokens": 8,
+		"messages":   []any{map[string]any{"role": "user", "content": "写一首长诗"}},
+	}, secret)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("请求失败: %d %#v", response.StatusCode, body)
+	}
+	usage := body["usage"].(map[string]any)
+	if usage["completion_tokens"].(float64) > 20 {
+		t.Fatalf("上游忽略 max_tokens 时应被截断, got %#v", usage)
+	}
+	choice := body["choices"].([]any)[0].(map[string]any)
+	if choice["finish_reason"] != "length" {
+		t.Fatalf("截断后 finish_reason 应为 length: %#v", choice)
+	}
+	text := choice["message"].(map[string]any)["content"].(string)
+	if text == long || text == "" {
+		t.Fatalf("正文应被裁短而非原样透传或清空: %d 字符", len([]rune(text)))
+	}
+
+	// 流式同样收口，且要给出正常的 SSE 收尾。
+	streamResponse, raw := h.doRaw(http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":      "gpt-4o-mini",
+		"max_tokens": 8,
+		"stream":     true,
+		"messages":   []any{map[string]any{"role": "user", "content": "写一首长诗"}},
+	}, secret)
+	if streamResponse.StatusCode != http.StatusOK {
+		t.Fatalf("流式请求失败: %d %s", streamResponse.StatusCode, raw)
+	}
+	if !strings.Contains(raw, "[DONE]") {
+		t.Fatalf("截断后仍需正常收尾: %s", raw)
+	}
+	if strings.Count(raw, "春天来了草长莺飞") > 8 {
+		t.Fatalf("流式输出未在上限处收口: %d 段", strings.Count(raw, "春天来了草长莺飞"))
+	}
+}
+
+// asBoolValue 是测试内的小工具：判断请求体里的 stream 是否为真。
+func asBoolValue(value any) bool {
+	flag, ok := value.(bool)
+	return ok && flag
+}

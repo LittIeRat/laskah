@@ -40,8 +40,35 @@ type inferenceSpec struct {
 	// truncate 在流式输出中途换号时给调用方一个明确收尾。
 	truncate func(http.ResponseWriter, string)
 
+	// overLimit 在本站按 max_tokens 主动截断时收尾，留空则回落 truncate。
+	overLimit func(http.ResponseWriter, string)
+
+	// inbound 把调用方的请求体转成本站内部的 OpenAI chat 形态，留空表示已经是该形态。
+	//
+	// 账号分配、模型匹配、限流、余额不足换号与本地计量全部建立在内部形态上，
+	// 因此不同入口协议只需在这里各写一次转换，主流程不必分叉。
+	inbound func(map[string]any) map[string]any
+
+	// outbound 把内部形态的响应转回调用方协议，留空表示直接下发。
+	outbound func(map[string]any, string) map[string]any
+
+	// newRewriter 构造流式改写器，把内部 SSE chunk 转成调用方协议的事件。
+	newRewriter func(model string, promptTokens int64) streamRewriter
+
 	// anthropic 表示该端点支持 Anthropic 协议双向转换。
 	anthropic bool
+}
+
+// streamRewriter 把内部 OpenAI chunk 改写成目标协议的 SSE 事件序列。
+type streamRewriter interface {
+	// Rewrite 处理一个内部 chunk，返回需要下发的事件行。
+	Rewrite(chunk string) []string
+
+	// Finish 补齐收尾事件，outputTokens 是本站自算的输出 token 数。
+	Finish(outputTokens int64) []string
+
+	// SetStopReason 覆盖收尾原因，用于本站主动截断。
+	SetStopReason(reason string)
 }
 
 // chatSpec 是 /v1/chat/completions 的差异定义。
@@ -84,7 +111,37 @@ func responsesSpec() inferenceSpec {
 		},
 		streamDelta: responsesStreamDelta,
 		truncate:    finishTruncatedResponses,
+		overLimit:   finishOverLimitResponses,
 		anthropic:   false,
+	}
+}
+
+// messagesSpec 是 /v1/messages 的差异定义（Anthropic Messages 兼容）。
+//
+// 请求进来先翻成内部 OpenAI 形态，出去再翻回 Anthropic 形态：
+// 这样上游是 OpenAI 兼容站还是 Anthropic 原生站都由既有逻辑决定，
+// 调用方用哪种协议接入都不会改变账号分配与计费口径。
+func messagesSpec() inferenceSpec {
+	return inferenceSpec{
+		endpoint: "/v1/messages",
+		validate: func(body map[string]any) string {
+			messages, ok := body["messages"].([]any)
+			if !ok || len(messages) == 0 {
+				return "messages 字段必须是非空数组"
+			}
+			return ""
+		},
+		send: func(u *Upstream, ctx context.Context, provider *store.Provider, body map[string]any) (*Response, error) {
+			return u.SendChat(ctx, provider, body)
+		},
+		streamDelta: chatStreamDelta,
+		truncate:    finishTruncatedMessages,
+		inbound:     FromAnthropicRequest,
+		outbound:    ToAnthropicMessage,
+		newRewriter: func(model string, promptTokens int64) streamRewriter {
+			return newAnthropicOutputRewriter(model, promptTokens)
+		},
+		anthropic: true,
 	}
 }
 
@@ -189,6 +246,153 @@ func finishTruncatedResponses(w http.ResponseWriter, model string) {
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
+}
+
+// finishOverLimitResponses 在 Responses 输出触及 max_output_tokens 时收尾。
+func finishOverLimitResponses(w http.ResponseWriter, model string) {
+	payload := map[string]any{
+		"type": "response.incomplete",
+		"response": map[string]any{
+			"id":                 fmt.Sprintf("resp_%d", time.Now().UnixNano()),
+			"object":             "response",
+			"created_at":         time.Now().Unix(),
+			"model":              model,
+			"status":             "incomplete",
+			"incomplete_details": map[string]any{"reason": "max_output_tokens"},
+		},
+	}
+	if encoded, err := json.Marshal(payload); err == nil {
+		_, _ = io.WriteString(w, "event: response.incomplete\ndata: "+string(encoded)+"\n\n")
+	}
+	_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// outputTokenLimit 读取请求里声明的输出上限，未声明时返回 0。
+//
+// 三个字段分别来自 chat（max_tokens）、新版 chat（max_completion_tokens）
+// 与 Responses（max_output_tokens）；Anthropic 的 max_tokens 在入站转换后也走同一字段。
+func outputTokenLimit(body map[string]any) int64 {
+	for _, field := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
+		if value, ok := asInt(body[field]); ok && value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+// outputHardCap 把声明的上限放宽成本站真正执行的硬上限。
+//
+// 本地 token 估算刻意偏保守（宁可高估），直接按声明值截断会把合规输出砍掉一截；
+// 放宽 25% 再加 8 个 token 的余量后，只有明显无视 max_tokens 的上游才会被截断。
+func outputHardCap(limit int64) int64 {
+	if limit <= 0 {
+		return 0
+	}
+	return limit + limit/4 + 8
+}
+
+// enforceOutputLimit 在非流式响应里裁掉超出上限的正文。
+//
+// 有些中转站完全忽略 max_tokens（实测声明 8 却返回几百 token），
+// 调用方按上限预算显示与计费就会失真，因此本站在下发前自己收口。
+// 返回值表示是否发生了截断。
+func enforceOutputLimit(payload map[string]any, limit int64) bool {
+	hardCap := outputHardCap(limit)
+	if hardCap <= 0 || payload == nil {
+		return false
+	}
+	if tokenizer.CountCompletionPayload(payload) <= hardCap {
+		return false
+	}
+
+	truncated := false
+	if choices, ok := payload["choices"].([]any); ok {
+		for _, item := range choices {
+			entry, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if message, ok := entry["message"].(map[string]any); ok {
+				if text, ok := message["content"].(string); ok && text != "" {
+					if trimmed, cut := trimToTokens(text, hardCap); cut {
+						message["content"] = trimmed
+						truncated = true
+					}
+				}
+			}
+			if text, ok := entry["text"].(string); ok && text != "" {
+				if trimmed, cut := trimToTokens(text, hardCap); cut {
+					entry["text"] = trimmed
+					truncated = true
+				}
+			}
+			if truncated {
+				entry["finish_reason"] = "length"
+			}
+		}
+	}
+	if text, ok := payload["output_text"].(string); ok && text != "" {
+		if trimmed, cut := trimToTokens(text, hardCap); cut {
+			payload["output_text"] = trimmed
+			truncated = true
+		}
+	}
+	// Responses 的正文在 output[].content[].text 里，与 output_text 是两份数据，
+	// 只裁其中一份会让客户端按未裁的那份渲染。
+	if output, ok := payload["output"].([]any); ok {
+		for _, item := range output {
+			entry, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			blocks, ok := entry["content"].([]any)
+			if !ok {
+				continue
+			}
+			for _, block := range blocks {
+				segment, ok := block.(map[string]any)
+				if !ok {
+					continue
+				}
+				text, ok := segment["text"].(string)
+				if !ok || text == "" {
+					continue
+				}
+				if trimmed, cut := trimToTokens(text, hardCap); cut {
+					segment["text"] = trimmed
+					truncated = true
+				}
+			}
+		}
+	}
+	if truncated {
+		if _, ok := payload["status"]; ok {
+			payload["status"] = "incomplete"
+			payload["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+		}
+	}
+	return truncated
+}
+
+// trimToTokens 把文本裁到不超过给定 token 数，按 rune 边界二分查找。
+func trimToTokens(text string, limit int64) (string, bool) {
+	if limit <= 0 || tokenizer.CountText(text) <= limit {
+		return text, false
+	}
+	runes := []rune(text)
+	low, high := 0, len(runes)
+	for low < high {
+		mid := (low + high + 1) / 2
+		if tokenizer.CountText(string(runes[:mid])) <= limit {
+			low = mid
+		} else {
+			high = mid - 1
+		}
+	}
+	return string(runes[:low]), true
 }
 
 // localUsage 用本站自己的估算组装用量，upstream 仅作对照保留。
